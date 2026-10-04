@@ -6,10 +6,13 @@
 #[path = "support/usbprint_windows.rs"]
 mod platform;
 
+#[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(windows)]
-    return platform::run();
-    #[cfg(not(windows))]
+    platform::run()
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "usbprint_probe requires Windows; the application still uses libusb for USB printing"
             .into(),
