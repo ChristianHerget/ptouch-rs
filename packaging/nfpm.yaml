@@ -34,11 +34,44 @@ contents:
 scripts:
   postinstall: ./packaging/postinstall.sh
 
-# Per-distro name for the libudev runtime library the vendored libusb needs.
+# Include libraries the GUI opens dynamically as well as libusb's libudev dependency.
 overrides:
   deb:
     depends:
       - libudev1
+      - libegl1
+      - libgl1
+      - libx11-6
+      - libx11-xcb1
+      - libxcursor1
+      - libxi6
+      - libxinerama1
+      - libxrandr2
+      - libxrender1
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-egl1
+      - libdbus-1-3
+    recommends:
+      - fonts-dejavu-core
   rpm:
     depends:
       - systemd-libs
+      - libglvnd-egl
+      - libglvnd-glx
+      - libX11
+      - libX11-xcb
+      - libXcursor
+      - libXi
+      - libXinerama
+      - libXrandr
+      - libXrender
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - wayland-libs
+      - dbus-libs
+    recommends:
+      - dejavu-sans-fonts

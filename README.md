@@ -120,8 +120,12 @@ The release workflow publishes downloads on the
   `ptouch-gui-windows-{arch}.exe` (the icon is embedded).
 - **Integrity**: `SHA256SUMS` covers every binary and package.
 
-Windows and Linux ARM64 assets are added after v0.8.3. macOS ARM64 assets
+Windows and Linux ARM64 assets are available from v0.8.4. macOS ARM64 assets
 already exist in v0.8.3. Check the selected release's asset list.
+
+The GUI requires OpenGL 2.0 or later. Windows CI uses a pinned Mesa software
+renderer because hosted machines lack a suitable graphics driver. That CI-only
+DLL is not shipped. Native CI rendering does not validate a physical host's GPU driver.
 
 | Platform | Rust target | Native CI runner | Hardware validation |
 | --- | --- | --- | --- |
@@ -342,6 +346,15 @@ An ARM64 executable does not change the printer's driver binding. Windows 11
 can emulate x64 applications, but kernel drivers need native ARM64 support.
 PT-P710BT (`04F9:20AF`) is already in the model table. A device bound to
 `usbprint` is not accessible through this project's existing libusb transport.
+
+The Brother printer driver and the Windows USB transport driver are separate.
+Windows can load its built-in `usbprint.sys` without the Brother package.
+See Microsoft's [USB printer driver documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/print/usb-printing).
+The current libusb backend still requires a compatible binding, normally WinUSB,
+as described in the [libusb Windows documentation](https://github.com/libusb/libusb/wiki/Windows).
+Zadig is one installation tool, not an application dependency. An existing
+WinUSB binding needs no Zadig installation. For a device already bound to
+`usbprint`, first test the separate USBPRINT probe below without changing drivers.
 
 Zadig 2.8 added ARM64 WinUSB installation support. Installation can still fail
 because Windows rejects a generated driver package's signature. See
