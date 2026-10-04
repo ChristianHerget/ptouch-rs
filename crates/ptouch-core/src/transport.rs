@@ -169,8 +169,8 @@ impl PtouchDevice {
         handle
             .claim_interface(USB_INTERFACE)
             .map_err(|e| connection_error("claim interface", e))?;
-        handle
-            .set_alternate_setting(USB_INTERFACE, endpoints.alternate)
+        endpoints
+            .activate(|alternate| handle.set_alternate_setting(USB_INTERFACE, alternate))
             .map_err(|e| connection_error("select alternate setting", e))?;
         info!("Opened {} at {}", dev_info.name, UsbLocation::of(&usb));
         debug!(
@@ -322,6 +322,20 @@ pub(crate) struct BulkEndpoints {
     pub alternate: u8,
     pub out: u8,
     pub input: u8,
+    #[serde(skip)]
+    requires_selection: bool,
+}
+
+impl BulkEndpoints {
+    fn activate(&self, select: impl FnOnce(u8) -> rusb::Result<()>) -> rusb::Result<()> {
+        // A sole setting zero is already active. Some printers reject SET_INTERFACE
+        // in this case. With multiple settings, explicitly select the chosen one,
+        // including zero, because a previous user could have activated another.
+        if self.requires_selection {
+            select(self.alternate)?;
+        }
+        Ok(())
+    }
 }
 
 /// Select a pair from one alternate setting, preferring setting zero.
@@ -345,6 +359,9 @@ pub(crate) fn find_bulk_endpoints(config: &rusb::ConfigDescriptor) -> Result<Bul
 fn select_bulk_endpoints(
     settings: impl IntoIterator<Item = (u8, Vec<u8>)>,
 ) -> Result<BulkEndpoints> {
+    // Count every setting, including those without a usable bulk endpoint pair.
+    let settings: Vec<_> = settings.into_iter().collect();
+    let setting_count = settings.len();
     settings
         .into_iter()
         .filter_map(|(alternate, addresses)| {
@@ -363,6 +380,7 @@ fn select_bulk_endpoints(
                 alternate,
                 out: out.next()?,
                 input: input.next()?,
+                requires_selection: setting_count != 1 || alternate != 0,
             };
             // Multiple pairs in one setting need an explicit model-specific policy.
             if out.next().is_some() || input.next().is_some() {
@@ -389,10 +407,65 @@ mod tests {
             BulkEndpoints {
                 alternate: 0,
                 out: 1,
-                input: 0x82
+                input: 0x82,
+                requires_selection: true,
             }
         );
         assert!(select_bulk_endpoints([(0, vec![1, 2, 0x81])]).is_err());
+    }
+
+    #[test]
+    fn sole_default_setting_does_not_send_set_interface() {
+        let endpoints = select_bulk_endpoints([(0, vec![0x02, 0x81])]).unwrap();
+        endpoints
+            .activate(|_| panic!("PT-D610BT must not receive SET_INTERFACE"))
+            .unwrap();
+    }
+
+    #[test]
+    fn multiple_settings_explicitly_activate_default_setting() {
+        for other_endpoints in [vec![], vec![0x03], vec![0x03, 0x84]] {
+            let endpoints =
+                select_bulk_endpoints([(0, vec![0x02, 0x81]), (1, other_endpoints)]).unwrap();
+            let mut requests = Vec::new();
+            endpoints
+                .activate(|alternate| {
+                    requests.push(alternate);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(requests, [0]);
+        }
+    }
+
+    #[test]
+    fn nondefault_setting_is_always_activated() {
+        for settings in [
+            vec![(1, vec![0x02, 0x81])],
+            vec![(0, vec![]), (1, vec![0x02, 0x81])],
+        ] {
+            let endpoints = select_bulk_endpoints(settings).unwrap();
+            let mut requests = Vec::new();
+            endpoints
+                .activate(|alternate| {
+                    requests.push(alternate);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(requests, [1]);
+        }
+    }
+
+    #[test]
+    fn alternate_selection_errors_are_preserved() {
+        let endpoints = select_bulk_endpoints([(0, vec![0x02, 0x81]), (1, vec![])]).unwrap();
+        for error in [
+            rusb::Error::Timeout,
+            rusb::Error::Pipe,
+            rusb::Error::NoDevice,
+        ] {
+            assert_eq!(endpoints.activate(|_| Err(error)), Err(error));
+        }
     }
 
     #[test]
