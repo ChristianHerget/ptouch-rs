@@ -47,7 +47,7 @@ fn property(
         }
         return Err(error);
     }
-    if ![1, 7].contains(&kind) || bytes as usize > data.len() * 2 || bytes % 2 != 0 {
+    if ![1, 7].contains(&kind) || bytes as usize > data.len() * 2 || !bytes.is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid PnP string property",
