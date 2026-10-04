@@ -294,8 +294,7 @@ committed rasters still match the SVG.
 
 Communication goes through libusb. WinUSB is the recommended Windows driver
 for this project. Other libusb backends have separate driver and DLL requirements. Out of the box Windows binds the printer to its
-own driver (and the official Brother driver does the same), so `ptouch info`
-reports `Device not found` until you switch it. See issue
+own driver (and the official Brother driver does the same), so opening the printer through libusb fails until you switch it. See issue
 [#4](https://github.com/vowstar/ptouch-rs/issues/4).
 
 1. Download [Zadig](https://zadig.akeo.ie/).
@@ -306,6 +305,36 @@ reports `Device not found` until you switch it. See issue
 
 After this the normal Brother software no longer sees the printer. Undo it any
 time by uninstalling or rolling back the driver in Device Manager.
+
+### USB diagnostics and device selection
+
+```sh
+ptouch doctor
+ptouch doctor --json
+ptouch doctor --probe --json
+ptouch info --usb 1:5
+ptouch print --usb 1:5 --job-timeout 900 "Label"
+```
+
+`doctor` reports the executable and native architectures, linked libusb version,
+USB locations, endpoint selection, and Windows PnP driver services. Default
+discovery does not open printers or send printer commands. `--probe` also tests
+open, claim, and release without detaching kernel drivers or changing alternate
+settings. Check each stage in the JSON report. Missing devices remain a valid
+report, and enumeration errors appear in `errors`.
+
+Use the actual `BUS:ADDRESS` from your report. USB addresses can change on
+reconnect. Multiple matching printers require explicit selection. The GUI lists
+USB locations in its Connection selector and preserves connection error messages.
+Windows instance IDs can include serial numbers; redact them before sharing.
+
+USB jobs have a ten-minute send/readiness limit. Override it with `--job-timeout`
+(`--timeout` remains an alias). The GUI's Cancel button stops further USB work;
+an in-flight transfer can take up to five seconds to return. Sent data cannot
+be recalled. A missing completion/readiness notification reports an unconfirmed
+outcome and stops a batch. Check the printer before retrying to avoid duplicates.
+This also applies to older models that previously treated completion timeouts
+as success. Reinitialize a library session after a failed or cancelled job.
 
 ### Windows ARM64 installation failures
 

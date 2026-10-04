@@ -23,7 +23,7 @@ use ptouch_core::device::{self, DeviceFlags, DeviceInfo};
 use ptouch_core::error::PtouchError;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_core::tape;
-use ptouch_core::transport::PtouchDevice;
+use ptouch_core::transport::{PtouchDevice, UsbLocation};
 
 use ptouch_render::bitmap::LabelBitmap;
 use ptouch_render::document::{self, LabelDocument};
@@ -53,6 +53,15 @@ enum Commands {
     Info(InfoArgs),
     /// List supported printer models
     List,
+    /// Diagnose USB discovery, architecture, and Windows driver bindings
+    Doctor {
+        /// Emit a versioned JSON report
+        #[arg(long)]
+        json: bool,
+        /// Also test open/claim/release without detaching drivers or sending commands
+        #[arg(long)]
+        probe: bool,
+    },
     /// List devices paired in macOS Bluetooth settings
     BluetoothList,
     /// Launch GUI mode
@@ -61,6 +70,10 @@ enum Commands {
 
 #[derive(clap::Args)]
 struct PrintArgs {
+    /// Select a USB bus/address from `ptouch doctor` (changes on reconnect)
+    #[arg(long, value_name = "BUS:ADDRESS", conflicts_with = "bluetooth")]
+    usb: Option<UsbLocation>,
+
     /// Use an already-paired PT-P300BT at this Bluetooth address (macOS only)
     #[arg(long, value_name = "ADDRESS")]
     bluetooth: Option<String>,
@@ -159,8 +172,8 @@ struct PrintArgs {
     #[arg(long, default_value = "1")]
     copies: u32,
 
-    /// Printer timeout in seconds
-    #[arg(long, default_value = "1")]
+    /// Maximum seconds for sending and waiting for one USB label
+    #[arg(long = "job-timeout", alias = "timeout", default_value = "600", value_parser = clap::value_parser!(u32).range(1..))]
     timeout: u32,
 
     /// Enable debug output
@@ -170,6 +183,10 @@ struct PrintArgs {
 
 #[derive(clap::Args)]
 struct InfoArgs {
+    /// Select a USB bus/address from `ptouch doctor` (changes on reconnect)
+    #[arg(long, value_name = "BUS:ADDRESS", conflicts_with = "bluetooth")]
+    usb: Option<UsbLocation>,
+
     /// Use an already-paired PT-P300BT at this Bluetooth address (macOS only)
     #[arg(long, value_name = "ADDRESS")]
     bluetooth: Option<String>,
@@ -191,7 +208,7 @@ enum CliDevice {
 }
 
 impl CliDevice {
-    fn open(bluetooth: Option<&str>) -> Result<Self, PtouchError> {
+    fn open(bluetooth: Option<&str>, usb: Option<UsbLocation>) -> Result<Self, PtouchError> {
         if let Some(address) = bluetooth {
             #[cfg(target_os = "macos")]
             {
@@ -205,7 +222,8 @@ impl CliDevice {
                 ));
             }
         }
-        PtouchDevice::open_first().map(Self::Usb)
+        usb.map_or_else(PtouchDevice::open_first, PtouchDevice::open_at)
+            .map(Self::Usb)
     }
 
     fn init(&mut self) -> Result<(), PtouchError> {
@@ -366,6 +384,66 @@ fn main() {
 
     match cli.command {
         Commands::List => execute_list(),
+        Commands::Doctor { json, probe } => {
+            let report = ptouch_core::diagnostics::doctor(probe);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(json) => println!("{json}"),
+                    Err(error) => {
+                        eprintln!("Cannot serialize diagnostic report: {error}");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                println!(
+                    "P-Touch {} | {} | executable {} | native {} | libusb {}",
+                    report.version,
+                    report.os,
+                    report.process_arch,
+                    report.native_arch.as_deref().unwrap_or("unknown"),
+                    report.libusb_version
+                );
+                for device in &report.devices {
+                    println!(
+                        "USB {} {}:{} {}",
+                        device.location,
+                        device.vid,
+                        device.pid,
+                        device.model.unwrap_or("Unknown Brother model")
+                    );
+                    if let Some(error) = &device.configuration_error {
+                        println!("  Configuration: {error}");
+                    }
+                    println!("  Open: {} {}", device.open.status, device.open.detail);
+                    println!("  Claim: {} {}", device.claim.status, device.claim.detail);
+                }
+                for binding in &report.windows_bindings {
+                    println!(
+                        "PnP {} | driver {}",
+                        binding.instance_id,
+                        binding.service.as_deref().unwrap_or("unknown")
+                    );
+                    if binding
+                        .service
+                        .as_deref()
+                        .is_some_and(|service| service.eq_ignore_ascii_case("usbprint"))
+                    {
+                        println!(
+                            "  The current libusb transport requires a compatible binding such as WinUSB. See README: Windows ARM64 installation failures."
+                        );
+                    }
+                }
+                for error in &report.errors {
+                    println!("Discovery error: {error}");
+                }
+                if report.devices.is_empty() && report.windows_bindings.is_empty() {
+                    println!("No Brother USB devices detected.");
+                }
+                println!(
+                    "No printer commands sent. Use --json for the full report; --probe also tests open/claim/release."
+                );
+            }
+        }
         Commands::BluetoothList => {
             if let Err(e) = execute_bluetooth_list() {
                 eprintln!("Error: {}", e);
@@ -584,7 +662,7 @@ fn execute_gui() {
 
 /// Open the printer and display status and tape information.
 fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
+    let mut dev = CliDevice::open(args.bluetooth.as_deref(), args.usb)?;
     dev.init()?;
 
     // init() already called get_status() internally; use that result.
@@ -690,7 +768,11 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         } else {
             // Connect to the printer
             debug!("Connecting to printer...");
-            let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
+            let mut dev = CliDevice::open(args.bluetooth.as_deref(), args.usb)?;
+            #[allow(irrefutable_let_patterns)]
+            if let CliDevice::Usb(usb) = &mut dev {
+                usb.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
+            }
             dev.init()?;
             // init() already called get_status() internally
             let width = dev.tape_width_px().ok_or_else(|| {
@@ -910,7 +992,11 @@ fn resolve_layout_target(
         })?;
         Ok((w, w as u16, None))
     } else {
-        let mut dev = CliDevice::open(args.bluetooth.as_deref())?;
+        let mut dev = CliDevice::open(args.bluetooth.as_deref(), args.usb)?;
+        #[allow(irrefutable_let_patterns)]
+        if let CliDevice::Usb(usb) = &mut dev {
+            usb.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
+        }
         dev.init()?;
         let printer_px = u32::from(dev.tape_width_px().ok_or_else(|| {
             PtouchError::StatusError("Could not determine tape width".to_string())
@@ -1105,6 +1191,44 @@ fn print_to_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_and_usb_selection_options_are_validated() {
+        assert!(matches!(
+            Cli::try_parse_from(["ptouch", "doctor", "--json", "--probe"])
+                .unwrap()
+                .command,
+            Commands::Doctor {
+                json: true,
+                probe: true
+            }
+        ));
+        assert!(Cli::try_parse_from(["ptouch", "info", "--usb", "1:5"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "ptouch",
+                "info",
+                "--usb",
+                "1:5",
+                "--bluetooth",
+                "AA:BB:CC:DD:EE:FF"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["ptouch", "print", "--job-timeout", "0", "label"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ptouch",
+                "print",
+                "--job-timeout",
+                "900",
+                "--usb",
+                "1:5",
+                "label"
+            ])
+            .is_ok()
+        );
+    }
 
     fn print_matches(argv: &[&str]) -> ArgMatches {
         Cli::command().get_matches_from(argv)

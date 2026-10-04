@@ -88,12 +88,15 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             let chain_print = !state.auto_cut;
             let auto_cut = state.auto_cut;
             if let Some(ref tx) = state.printer_cmd_tx {
+                let cancellation = ptouch_core::CancellationToken::default();
+                state.cancellation = Some(cancellation.clone());
                 let _ = tx.send(PrinterCommand::Print {
                     raster_lines,
                     chain_print,
                     auto_cut,
                     quality: state.print_quality,
                     target: state.printer_target.clone(),
+                    cancellation,
                 });
                 state.operation_in_progress = true;
                 state.status_message = "Printing...".to_string();
@@ -108,9 +111,23 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             .clicked()
             && let Some(ref tx) = state.printer_cmd_tx
         {
-            let _ = tx.send(PrinterCommand::FeedAndCut(state.printer_target.clone()));
+            let cancellation = ptouch_core::CancellationToken::default();
+            state.cancellation = Some(cancellation.clone());
+            let _ = tx.send(PrinterCommand::FeedAndCut {
+                target: state.printer_target.clone(),
+                cancellation,
+            });
             state.operation_in_progress = true;
             state.status_message = "Feeding & cutting...".to_string();
+        }
+
+        if state.operation_in_progress
+            && !state.printer_target.is_bluetooth()
+            && ui.button("Cancel").clicked()
+            && let Some(token) = &state.cancellation
+        {
+            token.cancel();
+            state.status_message = "Cancelling; sent data may still print".into();
         }
 
         if ui.button("Export Image").clicked() {

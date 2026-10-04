@@ -128,6 +128,9 @@ impl PtouchApp {
                 continue;
             }
             match event.response {
+                PrinterResponse::UsbDevices(devices) => {
+                    self.state.usb_targets = devices;
+                }
                 PrinterResponse::BluetoothDevices(devices) => {
                     self.state.bluetooth_targets = devices;
                 }
@@ -164,8 +167,8 @@ impl PtouchApp {
                         self.state.mark_dirty();
                     }
                 }
-                PrinterResponse::Disconnected => {
-                    self.state.printer_status = Some("Disconnected".to_string());
+                PrinterResponse::ConnectionError(message) => {
+                    self.state.printer_status = Some(message);
                     self.state.printer_model = None;
                     self.state.printer_connected = false;
                     self.state.connecting = false;
@@ -175,14 +178,17 @@ impl PtouchApp {
                 }
                 PrinterResponse::PrintDone => {
                     self.state.operation_in_progress = false;
+                    self.state.cancellation = None;
                     self.state.status_message = "Print complete".to_string();
                 }
                 PrinterResponse::FeedAndCutDone => {
                     self.state.operation_in_progress = false;
+                    self.state.cancellation = None;
                     self.state.status_message = "Feed & cut done".to_string();
                 }
                 PrinterResponse::Error(msg) => {
                     self.state.operation_in_progress = false;
+                    self.state.cancellation = None;
                     self.state.status_message = msg;
                 }
             }
@@ -327,7 +333,7 @@ mod tests {
         assert!(app.state.printer_model.is_none());
         tx.send(PrinterEvent {
             target: Some(PrinterTarget::Usb),
-            response: PrinterResponse::Disconnected,
+            response: PrinterResponse::ConnectionError("Device not found".into()),
         })
         .unwrap();
         app.drain_printer_responses();
@@ -371,11 +377,15 @@ mod tests {
         );
         tx.send(PrinterEvent {
             target: Some(PrinterTarget::Usb),
-            response: PrinterResponse::Disconnected,
+            response: PrinterResponse::ConnectionError("Device not found".into()),
         })
         .unwrap();
         app.drain_printer_responses();
         assert!(!app.state.printer_connected);
+        assert_eq!(
+            app.state.printer_status.as_deref(),
+            Some("Device not found")
+        );
         assert!(app.state.operation_in_progress);
         tx.send(PrinterEvent {
             target: Some(PrinterTarget::Usb),
@@ -384,5 +394,28 @@ mod tests {
         .unwrap();
         app.drain_printer_responses();
         assert!(!app.state.operation_in_progress);
+    }
+
+    #[test]
+    fn usb_selection_ignores_another_devices_poll_and_keeps_error_detail() {
+        let target =
+            PrinterTarget::UsbAt(ptouch_core::transport::UsbLocation { bus: 1, address: 5 });
+        let (mut app, tx) = app(AppState {
+            printer_target: target.clone(),
+            ..AppState::default()
+        });
+        tx.send(usb_status()).unwrap();
+        app.drain_printer_responses();
+        assert!(!app.state.printer_connected);
+        tx.send(PrinterEvent {
+            target: Some(target),
+            response: PrinterResponse::ConnectionError("USB open: Access denied".into()),
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert_eq!(
+            app.state.printer_status.as_deref(),
+            Some("USB open: Access denied")
+        );
     }
 }

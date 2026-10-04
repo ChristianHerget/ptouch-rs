@@ -16,7 +16,9 @@ mod session;
 #[cfg(all(feature = "bluetooth", target_os = "macos"))]
 pub mod bluetooth;
 
+pub mod control;
 pub mod device;
+pub mod diagnostics;
 pub mod error;
 pub mod protocol;
 pub mod status;
@@ -26,6 +28,7 @@ pub mod transport;
 // Re-export commonly used types at the crate root.
 #[cfg(all(feature = "bluetooth", target_os = "macos"))]
 pub use bluetooth::BluetoothDevice;
+pub use control::CancellationToken;
 pub use device::{DeviceFlags, DeviceInfo};
 pub use error::{PtouchError, Result};
 pub use protocol::PrintQuality;

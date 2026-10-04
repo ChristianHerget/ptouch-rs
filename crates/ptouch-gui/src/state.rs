@@ -14,6 +14,7 @@ pub use ptouch_render::document::LabelElement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterTarget {
     Usb,
+    UsbAt(ptouch_core::transport::UsbLocation),
     #[cfg(any(target_os = "macos", test))]
     Bluetooth {
         name: String,
@@ -25,14 +26,22 @@ impl PrinterTarget {
     pub fn label(&self) -> String {
         match self {
             Self::Usb => "USB (automatic)".to_string(),
+            Self::UsbAt(location) => format!("USB {location}"),
             #[cfg(any(target_os = "macos", test))]
             Self::Bluetooth { name, address } => format!("{name} ({address})"),
         }
     }
 
+    pub fn usb_location(&self) -> Option<ptouch_core::transport::UsbLocation> {
+        match self {
+            Self::UsbAt(location) => Some(*location),
+            _ => None,
+        }
+    }
+
     pub fn is_bluetooth(&self) -> bool {
         match self {
-            Self::Usb => false,
+            Self::Usb | Self::UsbAt(_) => false,
             #[cfg(any(target_os = "macos", test))]
             Self::Bluetooth { .. } => true,
         }
@@ -52,9 +61,13 @@ pub enum PrinterCommand {
         auto_cut: bool,
         quality: PrintQuality,
         target: PrinterTarget,
+        cancellation: ptouch_core::CancellationToken,
     },
     /// Feed tape forward and cut.
-    FeedAndCut(PrinterTarget),
+    FeedAndCut {
+        target: PrinterTarget,
+        cancellation: ptouch_core::CancellationToken,
+    },
 }
 
 /// A worker response and the printer it belongs to. Discovery is global.
@@ -67,6 +80,8 @@ pub struct PrinterEvent {
 pub enum PrinterResponse {
     /// Paired PT-P300BT printers found by macOS.
     BluetoothDevices(Vec<PrinterTarget>),
+    /// Detected USB locations for explicit selection.
+    UsbDevices(Vec<PrinterTarget>),
     /// A printer was found and its status queried.
     Connected {
         model_name: String,
@@ -78,7 +93,7 @@ pub enum PrinterResponse {
         tape_width_px: u16,
     },
     /// No printer found or previously connected printer lost.
-    Disconnected,
+    ConnectionError(String),
     /// Print job completed successfully.
     PrintDone,
     /// Feed and cut completed successfully.
@@ -137,6 +152,8 @@ pub struct AppState {
     pub bluetooth_targets: Vec<PrinterTarget>,
     /// Whether a printer operation (print, feed & cut) is in progress.
     pub operation_in_progress: bool,
+    pub cancellation: Option<ptouch_core::CancellationToken>,
+    pub usb_targets: Vec<PrinterTarget>,
     /// Whether the selected printer's status is being requested.
     pub connecting: bool,
     /// Maximum printable pixels of the last connected printer (0 initially).
@@ -180,6 +197,8 @@ impl Default for AppState {
             printer_target: PrinterTarget::Usb,
             bluetooth_targets: Vec::new(),
             operation_in_progress: false,
+            cancellation: None,
+            usb_targets: Vec::new(),
             connecting: false,
             printer_max_px: 0,
             printer_dpi: 180,

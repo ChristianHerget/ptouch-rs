@@ -3,6 +3,7 @@
 """Check Windows executable architecture, embedded icons, and native startup."""
 
 import argparse
+import json
 from pathlib import Path
 import struct
 import subprocess
@@ -51,6 +52,11 @@ if __name__ == "__main__":
     check_pe(gui, machine, require_icon=True)
     for option in ("--version", "--help"):
         subprocess.run([str(cli), option], check=True, timeout=30)
+    report = json.loads(subprocess.check_output([str(cli), "doctor", "--json"], timeout=30, text=True))
+    if report["schema_version"] != 1 or report["probe"]:
+        raise RuntimeError("Invalid read-only doctor report")
+    if report["process_arch"] != ("aarch64" if args.target.startswith("aarch64") else "x86_64"):
+        raise RuntimeError("Doctor architecture disagrees with the build target")
     result = subprocess.run([str(gui), "--smoke-test"], timeout=60, capture_output=True, text=True)
     print(result.stdout, end="")
     print(result.stderr, end="", file=sys.stderr)

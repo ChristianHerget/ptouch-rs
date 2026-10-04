@@ -28,11 +28,13 @@ pub fn printer_worker(
     info!("Printer worker started");
     let mut current_target = PrinterTarget::Usb;
     discover_bluetooth(&resp_tx, &ctx);
+    discover_usb(&resp_tx, &ctx);
 
     loop {
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
             Ok(PrinterCommand::DiscoverBluetooth) => discover_bluetooth(&resp_tx, &ctx),
             Ok(PrinterCommand::Poll(target)) => {
+                discover_usb(&resp_tx, &ctx);
                 current_target = target;
                 do_poll(&current_target, &resp_tx, &ctx);
             }
@@ -42,21 +44,25 @@ pub fn printer_worker(
                 auto_cut,
                 quality,
                 target,
+                cancellation,
             }) => {
                 current_target = target;
                 do_print(
                     &current_target,
-                    &resp_tx,
-                    &ctx,
+                    (&resp_tx, &ctx),
                     &raster_lines,
                     chain_print,
                     auto_cut,
                     quality,
+                    &cancellation,
                 );
             }
-            Ok(PrinterCommand::FeedAndCut(target)) => {
+            Ok(PrinterCommand::FeedAndCut {
+                target,
+                cancellation,
+            }) => {
                 current_target = target;
-                do_feed_and_cut(&current_target, &resp_tx, &ctx);
+                do_feed_and_cut(&current_target, &resp_tx, &ctx, cancellation);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !current_target.is_bluetooth() {
@@ -66,6 +72,20 @@ pub fn printer_worker(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn discover_usb(tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
+    let devices = ptouch_core::diagnostics::doctor(false)
+        .devices
+        .into_iter()
+        .filter(|device| device.model.is_some())
+        .map(|device| PrinterTarget::UsbAt(device.location))
+        .collect();
+    let _ = tx.send(PrinterEvent {
+        target: None,
+        response: PrinterResponse::UsbDevices(devices),
+    });
+    ctx.request_repaint();
 }
 
 fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
@@ -88,13 +108,13 @@ fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context)
 
 fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
     let response = match target {
-        PrinterTarget::Usb => poll_usb(),
+        PrinterTarget::Usb | PrinterTarget::UsbAt(_) => poll_usb(target.usb_location()),
         #[cfg(any(target_os = "macos", test))]
         PrinterTarget::Bluetooth { address, .. } => poll_bluetooth(address),
     }
     .unwrap_or_else(|message| {
         error!("Poll failed: {message}");
-        PrinterResponse::Disconnected
+        PrinterResponse::ConnectionError(message)
     });
     let _ = tx.send(PrinterEvent {
         target: Some(target.clone()),
@@ -103,8 +123,12 @@ fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::
     ctx.request_repaint();
 }
 
-fn poll_usb() -> Result<PrinterResponse, String> {
-    let mut dev = PtouchDevice::open_first().map_err(|e| e.to_string())?;
+fn poll_usb(
+    location: Option<ptouch_core::transport::UsbLocation>,
+) -> Result<PrinterResponse, String> {
+    let mut dev = location
+        .map_or_else(PtouchDevice::open_first, PtouchDevice::open_at)
+        .map_err(|e| e.to_string())?;
     let max_px = dev.max_px();
     let dpi = dev.device_info().dpi;
     let quality_modes = dev.flags().contains(DeviceFlags::LEGACY_HIRES);
@@ -173,15 +197,23 @@ fn parse_bluetooth_status(output: &str) -> Result<PrinterResponse, String> {
 
 fn do_print(
     target: &PrinterTarget,
-    tx: &mpsc::Sender<PrinterEvent>,
-    ctx: &egui::Context,
+    response: (&mpsc::Sender<PrinterEvent>, &egui::Context),
     raster_lines: &[Vec<u8>],
     chain_print: bool,
     auto_cut: bool,
     quality: PrintQuality,
+    cancellation: &ptouch_core::CancellationToken,
 ) {
+    let (tx, ctx) = response;
     let result = match target {
-        PrinterTarget::Usb => print_usb(raster_lines, chain_print, auto_cut, quality),
+        PrinterTarget::Usb | PrinterTarget::UsbAt(_) => print_usb(
+            raster_lines,
+            chain_print,
+            auto_cut,
+            quality,
+            target.usb_location(),
+            cancellation.clone(),
+        ),
         #[cfg(any(target_os = "macos", test))]
         PrinterTarget::Bluetooth { address, .. } => print_bluetooth(address, raster_lines),
     };
@@ -200,8 +232,13 @@ fn print_usb(
     chain_print: bool,
     auto_cut: bool,
     quality: PrintQuality,
+    location: Option<ptouch_core::transport::UsbLocation>,
+    cancellation: ptouch_core::CancellationToken,
 ) -> Result<(), String> {
-    let mut dev = PtouchDevice::open_first().map_err(|e| format!("Connect error: {e}"))?;
+    let mut dev = location
+        .map_or_else(PtouchDevice::open_first, PtouchDevice::open_at)
+        .map_err(|e| format!("Connect error: {e}"))?;
+    dev.set_cancellation_token(cancellation);
     dev.init().map_err(|e| format!("Init error: {e}"))?;
     let result = dev
         .print_raster(raster_lines, chain_print, auto_cut, quality)
@@ -224,10 +261,19 @@ fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String
     }
 }
 
-fn do_feed_and_cut(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
+fn do_feed_and_cut(
+    target: &PrinterTarget,
+    tx: &mpsc::Sender<PrinterEvent>,
+    ctx: &egui::Context,
+    cancellation: ptouch_core::CancellationToken,
+) {
     let result = match target {
-        PrinterTarget::Usb => (|| {
-            let mut dev = PtouchDevice::open_first().map_err(|e| format!("Connect error: {e}"))?;
+        PrinterTarget::Usb | PrinterTarget::UsbAt(_) => (|| {
+            let mut dev = target
+                .usb_location()
+                .map_or_else(PtouchDevice::open_first, PtouchDevice::open_at)
+                .map_err(|e| format!("Connect error: {e}"))?;
+            dev.set_cancellation_token(cancellation);
             dev.init().map_err(|e| format!("Init error: {e}"))?;
             let result = dev
                 .feed_and_cut()

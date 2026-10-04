@@ -40,7 +40,7 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
                     crate::state::PrinterTarget::Usb,
                     "USB (automatic)",
                 );
-                for target in &state.bluetooth_targets {
+                for target in state.usb_targets.iter().chain(&state.bluetooth_targets) {
                     ui.selectable_value(&mut state.printer_target, target.clone(), target.label());
                 }
             });

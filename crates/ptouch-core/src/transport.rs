@@ -9,13 +9,13 @@
 
 use crate::session::{PrinterSession, Transport};
 use crate::{
-    device::{self, BROTHER_VENDOR_ID, DeviceFlags, DeviceInfo},
+    device::{self, DeviceFlags, DeviceInfo},
     error::{PtouchError, Result},
     protocol,
     status::PrinterStatus,
 };
-use log::{debug, info, warn};
-use rusb::{Context, DeviceHandle, UsbContext};
+use log::{debug, info};
+use rusb::{Context, Device, DeviceHandle, UsbContext};
 use std::time::Duration;
 
 const USB_INTERFACE: u8 = 0;
@@ -94,48 +94,95 @@ impl PtouchDevice {
     /// [`PtouchError::UnsupportedRaster`] if the device does not support
     /// raster printing.
     pub fn open(vid: u16, pid: u16) -> Result<Self> {
-        let dev_info = device::find_device(vid, pid)
-            .ok_or(PtouchError::DeviceNotFound)?
-            .clone();
+        Self::open_matching(Some((vid, pid)), None)
+    }
 
+    /// Open a printer at the bus/address reported by `ptouch doctor`.
+    /// Addresses can change after reconnecting the printer.
+    pub fn open_at(location: UsbLocation) -> Result<Self> {
+        Self::open_matching(None, Some(location))
+    }
+
+    /// Open the only supported printer. Multiple matches require selection.
+    pub fn open_first() -> Result<Self> {
+        Self::open_matching(None, None)
+    }
+
+    fn open_matching(ids: Option<(u16, u16)>, location: Option<UsbLocation>) -> Result<Self> {
+        let context = Context::new()?;
+        let devices = context.devices()?;
+        let mut candidates = Vec::new();
+        for usb in devices.iter() {
+            if location.is_some_and(|where_| where_ != UsbLocation::of(&usb)) {
+                continue;
+            }
+            let desc = match usb.device_descriptor() {
+                Ok(desc) => desc,
+                Err(error) if location.is_some() => return Err(error.into()),
+                Err(_) => continue,
+            };
+            if ids.is_some_and(|pair| pair != (desc.vendor_id(), desc.product_id())) {
+                continue;
+            }
+            let Some(info) = device::find_device(desc.vendor_id(), desc.product_id()) else {
+                continue;
+            };
+            if ids.is_none()
+                && location.is_none()
+                && info
+                    .flags
+                    .intersects(DeviceFlags::PLITE | DeviceFlags::UNSUP_RASTER)
+            {
+                continue;
+            }
+            candidates.push((usb, info.clone()));
+        }
+        let (usb, info) = only_candidate(candidates)?;
+        Self::open_device(usb, info)
+    }
+
+    fn open_device(usb: Device<Context>, dev_info: DeviceInfo) -> Result<Self> {
         if dev_info.flags.contains(DeviceFlags::PLITE) {
             return Err(PtouchError::PLiteMode(dev_info.name.to_string()));
         }
-
         if dev_info.flags.contains(DeviceFlags::UNSUP_RASTER) {
             return Err(PtouchError::UnsupportedRaster(dev_info.name.to_string()));
         }
-
-        info!(
-            "Opening device: {} (VID={:#06x}, PID={:#06x})",
-            dev_info.name, vid, pid
-        );
-
-        let context = Context::new()?;
-        let handle = context
-            .open_device_with_vid_pid(vid, pid)
-            .ok_or(PtouchError::DeviceNotFound)?;
-
-        // Detach kernel driver if active (non-fatal)
+        let connection_error = |stage, source| PtouchError::UsbConnection {
+            stage,
+            vid: dev_info.vid,
+            pid: dev_info.pid,
+            source,
+        };
+        // Open the enumerated device itself, preserving the original error.
+        let handle = usb.open().map_err(|e| connection_error("open", e))?;
+        let config = usb
+            .active_config_descriptor()
+            .map_err(|e| connection_error("read configuration", e))?;
+        let endpoints = find_bulk_endpoints(&config)?;
         if handle.kernel_driver_active(USB_INTERFACE).unwrap_or(false) {
-            debug!("Detaching kernel driver from interface {}", USB_INTERFACE);
-            if let Err(e) = handle.detach_kernel_driver(USB_INTERFACE) {
-                warn!("Failed to detach kernel driver: {} (continuing)", e);
-            }
+            // libusb reattaches the kernel driver when the handle is dropped.
+            handle
+                .set_auto_detach_kernel_driver(true)
+                .map_err(|e| connection_error("enable kernel driver detach", e))?;
         }
-
-        handle.claim_interface(USB_INTERFACE)?;
-
-        // Find the bulk endpoints
-        let (ep_out, ep_in) = find_bulk_endpoints(&handle)?;
-        debug!("Endpoints: OUT={:#04x}, IN={:#04x}", ep_out, ep_in);
-
-        Ok(PtouchDevice {
+        handle
+            .claim_interface(USB_INTERFACE)
+            .map_err(|e| connection_error("claim interface", e))?;
+        handle
+            .set_alternate_setting(USB_INTERFACE, endpoints.alternate)
+            .map_err(|e| connection_error("select alternate setting", e))?;
+        info!("Opened {} at {}", dev_info.name, UsbLocation::of(&usb));
+        debug!(
+            "Endpoints: OUT={:#04x}, IN={:#04x}, alternate={}",
+            endpoints.out, endpoints.input, endpoints.alternate
+        );
+        Ok(Self {
             session: PrinterSession::new(
                 UsbTransport {
                     handle,
-                    ep_out,
-                    ep_in,
+                    ep_out: endpoints.out,
+                    ep_in: endpoints.input,
                 },
                 (&dev_info).into(),
             ),
@@ -143,36 +190,21 @@ impl PtouchDevice {
         })
     }
 
-    /// Open the first Brother P-Touch printer found on the USB bus.
-    ///
-    /// Scans all USB devices, looking for any with the Brother vendor ID
-    /// that matches an entry in the supported device table.
-    pub fn open_first() -> Result<Self> {
-        let context = Context::new()?;
-        let devices = context.devices()?;
+    /// Set a fresh cancellation token before initialization or a job.
+    /// A blocked USB transfer returns within its transfer timeout (at most five seconds).
+    pub fn set_cancellation_token(&mut self, token: crate::CancellationToken) {
+        self.session.cancellation = token;
+    }
 
-        for usb_dev in devices.iter() {
-            let desc = match usb_dev.device_descriptor() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            if desc.vendor_id() != BROTHER_VENDOR_ID {
-                continue;
-            }
-
-            if let Some(dev_info) = device::find_device(desc.vendor_id(), desc.product_id()) {
-                if dev_info.flags.contains(DeviceFlags::PLITE)
-                    || dev_info.flags.contains(DeviceFlags::UNSUP_RASTER)
-                {
-                    continue;
-                }
-
-                return Self::open(desc.vendor_id(), desc.product_id());
-            }
+    /// Set the maximum time for sending and waiting for one USB label (default: 600 seconds).
+    pub fn set_job_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if timeout < Duration::from_millis(1) {
+            return Err(PtouchError::UnsupportedOperation(
+                "Job timeout must be at least one millisecond",
+            ));
         }
-
-        Err(PtouchError::DeviceNotFound)
+        self.session.job_timeout = timeout;
+        Ok(())
     }
 
     /// Get a reference to the USB device info.
@@ -240,44 +272,152 @@ impl PtouchDevice {
     }
 }
 
-/// Find the bulk IN and OUT endpoints for the printer interface.
-fn find_bulk_endpoints(handle: &DeviceHandle<Context>) -> Result<(u8, u8)> {
-    let device = handle.device();
-    let config = device.active_config_descriptor()?;
+/// USB location within the current enumeration; reconnecting can change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct UsbLocation {
+    /// USB bus number.
+    pub bus: u8,
+    /// USB device address.
+    pub address: u8,
+}
 
-    let mut ep_out: Option<u8> = None;
-    let mut ep_in: Option<u8> = None;
-
-    for interface in config.interfaces() {
-        for desc in interface.descriptors() {
-            if desc.interface_number() != USB_INTERFACE {
-                continue;
-            }
-            for endpoint in desc.endpoint_descriptors() {
-                if endpoint.transfer_type() != rusb::TransferType::Bulk {
-                    continue;
-                }
-                match endpoint.direction() {
-                    rusb::Direction::Out => {
-                        ep_out = Some(endpoint.address());
-                    }
-                    rusb::Direction::In => {
-                        ep_in = Some(endpoint.address());
-                    }
-                }
-            }
+impl UsbLocation {
+    pub(crate) fn of<T: UsbContext>(device: &Device<T>) -> Self {
+        Self {
+            bus: device.bus_number(),
+            address: device.address(),
         }
     }
+}
 
-    match (ep_out, ep_in) {
-        (Some(out), Some(inp)) => Ok((out, inp)),
-        _ => Err(PtouchError::DeviceNotFound),
+impl std::fmt::Display for UsbLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.bus, self.address)
     }
+}
+
+impl std::str::FromStr for UsbLocation {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (bus, address) = value.split_once(':').ok_or("expected BUS:ADDRESS")?;
+        Ok(Self {
+            bus: bus.parse().map_err(|_| "invalid USB bus (0..255)")?,
+            address: address
+                .parse()
+                .map_err(|_| "invalid USB address (0..255)")?,
+        })
+    }
+}
+
+fn only_candidate<T>(mut candidates: Vec<T>) -> Result<T> {
+    match candidates.len() {
+        0 => Err(PtouchError::DeviceNotFound),
+        1 => Ok(candidates.remove(0)),
+        _ => Err(PtouchError::AmbiguousDevice),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BulkEndpoints {
+    pub alternate: u8,
+    pub out: u8,
+    pub input: u8,
+}
+
+/// Select a pair from one alternate setting, preferring setting zero.
+pub(crate) fn find_bulk_endpoints(config: &rusb::ConfigDescriptor) -> Result<BulkEndpoints> {
+    select_bulk_endpoints(config.interfaces().flat_map(|interface| {
+        interface
+            .descriptors()
+            .filter(|desc| desc.interface_number() == USB_INTERFACE)
+            .map(|desc| {
+                (
+                    desc.setting_number(),
+                    desc.endpoint_descriptors()
+                        .filter(|ep| ep.transfer_type() == rusb::TransferType::Bulk)
+                        .map(|ep| ep.address())
+                        .collect::<Vec<_>>(),
+                )
+            })
+    }))
+}
+
+fn select_bulk_endpoints(
+    settings: impl IntoIterator<Item = (u8, Vec<u8>)>,
+) -> Result<BulkEndpoints> {
+    settings
+        .into_iter()
+        .filter_map(|(alternate, addresses)| {
+            if addresses.iter().any(|ep| ep & 0x70 != 0 || ep & 0x0f == 0) {
+                return None;
+            }
+            let mut out = addresses
+                .iter()
+                .copied()
+                .filter(|ep| *ep != 0 && *ep & 0x80 == 0);
+            let mut input = addresses
+                .iter()
+                .copied()
+                .filter(|ep| *ep & 0x80 != 0 && *ep != 0x80);
+            let pair = BulkEndpoints {
+                alternate,
+                out: out.next()?,
+                input: input.next()?,
+            };
+            // Multiple pairs in one setting need an explicit model-specific policy.
+            if out.next().is_some() || input.next().is_some() {
+                None
+            } else {
+                Some(pair)
+            }
+        })
+        .min_by_key(|pair| pair.alternate)
+        .ok_or(PtouchError::InvalidUsbInterface)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn endpoint_pair_cannot_cross_alternate_settings() {
+        assert!(matches!(
+            select_bulk_endpoints([(0, vec![0x01]), (1, vec![0x82])]),
+            Err(PtouchError::InvalidUsbInterface)
+        ));
+        assert_eq!(
+            select_bulk_endpoints([(1, vec![0x02, 0x83]), (0, vec![0x01, 0x82])]).unwrap(),
+            BulkEndpoints {
+                alternate: 0,
+                out: 1,
+                input: 0x82
+            }
+        );
+        assert!(select_bulk_endpoints([(0, vec![1, 2, 0x81])]).is_err());
+    }
+
+    #[test]
+    fn duplicate_printers_require_explicit_selection() {
+        assert!(matches!(
+            only_candidate(vec![1, 2]),
+            Err(PtouchError::AmbiguousDevice)
+        ));
+        assert!(matches!(
+            only_candidate(Vec::<u8>::new()),
+            Err(PtouchError::DeviceNotFound)
+        ));
+        assert_eq!(only_candidate(vec![7]).unwrap(), 7);
+        assert_eq!(
+            "2:17".parse::<UsbLocation>().unwrap(),
+            UsbLocation {
+                bus: 2,
+                address: 17
+            }
+        );
+        for value in ["2", "2:17:3", "256:1", "1:-1"] {
+            assert!(value.parse::<UsbLocation>().is_err());
+        }
+    }
+
     #[test]
     fn usb_facade_preserves_send_and_sync() {
         fn assert_traits<T: Send + Sync>() {}

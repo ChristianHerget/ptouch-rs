@@ -7,6 +7,7 @@
 
 //! Transport-independent printer state and command lifecycle.
 
+use crate::CancellationToken;
 use crate::model::{Dialect, ModelProfile};
 use crate::p300bt;
 use crate::{
@@ -61,6 +62,8 @@ pub(crate) struct PrinterSession<T: Transport> {
     status: Option<PrinterStatus>,
     tape_width_px: Option<u16>,
     initialized: bool,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) job_timeout: Duration,
 }
 
 impl<T: Transport> PrinterSession<T> {
@@ -72,6 +75,8 @@ impl<T: Transport> PrinterSession<T> {
             status: None,
             tape_width_px: None,
             initialized: false,
+            cancellation: CancellationToken::default(),
+            job_timeout: Duration::from_secs(600),
         }
     }
     /// Get the device flags.
@@ -101,6 +106,7 @@ impl<T: Transport> PrinterSession<T> {
 
     /// Send raw bytes through the selected transport.
     pub fn send(&self, data: &[u8]) -> Result<()> {
+        self.cancellation.check()?;
         self.transport.send(data, TRANSFER_TIMEOUT)
     }
 
@@ -109,27 +115,20 @@ impl<T: Transport> PrinterSession<T> {
     }
 
     fn receive_with_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.cancellation.check()?;
         self.transport.receive(buf, timeout)
     }
 
-    fn flush_input(&mut self) {
-        // Discard cached prefixes together with their unread tails in the transport.
+    fn flush_input(&mut self) -> Result<()> {
         self.status_frames.clear();
-        let mut buf = [0u8; 64];
-        let start = Instant::now();
-        loop {
-            let timeout = match self.profile.dialect {
-                Dialect::Usb => FLUSH_TIMEOUT,
-                Dialect::P300Bt => match FLUSH_TIMEOUT.checked_sub(start.elapsed()) {
-                    Some(remaining) if !remaining.is_zero() => remaining,
-                    _ => break,
-                },
-            };
-            match self.transport.receive(&mut buf, timeout) {
-                Ok(n) if n > 0 => debug!("Flushed {} stale bytes", n),
-                _ => break,
-            }
-        }
+        drain_input(
+            |buf, timeout| {
+                self.cancellation.check()?;
+                self.transport.receive(buf, timeout)
+            },
+            FLUSH_TIMEOUT,
+            4096,
+        )
     }
 
     /// Initialize the printer.
@@ -137,8 +136,9 @@ impl<T: Transport> PrinterSession<T> {
     /// Sends the init sequence (100 zeros + ESC @) and queries the status.
     /// Raster start is sent per-job in `print_raster()`.
     pub fn init(&mut self) -> Result<()> {
+        self.initialized = false;
         // Flush any stale data from previous sessions
-        self.flush_input();
+        self.flush_input()?;
 
         // Send the init command (100 zeros + ESC @)
         match self.profile.dialect {
@@ -175,7 +175,7 @@ impl<T: Transport> PrinterSession<T> {
     /// [`init`](Self::init), this does not send the 100-zero + ESC @
     /// reset sequence, so it will not disturb the printer.
     pub fn query_status(&mut self) -> Result<&PrinterStatus> {
-        self.flush_input();
+        self.flush_input()?;
         self.get_status()
     }
 
@@ -204,6 +204,11 @@ impl<T: Transport> PrinterSession<T> {
                     debug!("Empty status read (attempt {})", attempt + 1);
                     continue;
                 }
+                Ok(n) if n > buf.len() => {
+                    return Err(PtouchError::StatusError(
+                        "Transport returned more bytes than the receive buffer".into(),
+                    ));
+                }
                 Ok(n) => {
                     frames.push(&buf[..n]);
                     response = frames.pop();
@@ -227,7 +232,7 @@ impl<T: Transport> PrinterSession<T> {
 
         let Some(response) = response else {
             // Flush junk data before returning error
-            self.flush_input();
+            self.flush_input()?;
             return Err(PtouchError::StatusError(format!(
                 "Status packet too short: {} bytes (expected {})",
                 frames.len(),
@@ -238,7 +243,7 @@ impl<T: Transport> PrinterSession<T> {
         let status = match parse_status_packet(&response, "Invalid status header") {
             Ok(status) => status,
             Err(error) => {
-                self.flush_input();
+                self.flush_input()?;
                 return Err(error);
             }
         };
@@ -324,17 +329,25 @@ impl<T: Transport> PrinterSession<T> {
         };
 
         let job = protocol::build_print_job(lines, self.profile.flags, &opts);
-        self.send_job(job)?;
+        let started = Instant::now();
+        if let Err(error) = self.send_job(job) {
+            self.initialized = false;
+            return Err(error);
+        }
 
-        if self
+        let result = if self
             .profile
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            self.wait_until_ready()
+            self.wait_until_ready(started)
         } else {
-            self.receive_print_completion()
+            self.receive_print_completion(started)
+        };
+        if result.is_err() {
+            self.initialized = false;
         }
+        result
     }
 
     /// Feed tape forward and cut.
@@ -360,77 +373,112 @@ impl<T: Transport> PrinterSession<T> {
         };
 
         let job = protocol::build_print_job(&lines, self.profile.flags, &opts);
-        self.send_job(job)?;
+        let started = Instant::now();
+        if let Err(error) = self.send_job(job) {
+            self.initialized = false;
+            return Err(error);
+        }
 
         if self
             .profile
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            self.wait_until_ready()?;
+            if let Err(error) = self.wait_until_ready(started) {
+                self.initialized = false;
+                return Err(error);
+            }
+        } else if let Err(error) = self.receive_print_completion(started) {
+            self.initialized = false;
+            return Err(error);
         }
-
         info!("Feed and cut");
         Ok(())
     }
 
     fn send_job(&self, job: Vec<Vec<u8>>) -> Result<()> {
+        let start = Instant::now();
         for chunk in job {
-            self.send(&chunk)?;
+            self.cancellation.check()?;
+            let remaining = self
+                .job_timeout
+                .checked_sub(start.elapsed())
+                .filter(|duration| *duration >= PRINT_STATUS_MIN_POLL_TIMEOUT)
+                .ok_or(PtouchError::Timeout)?;
+            self.transport
+                .send(&chunk, remaining.min(TRANSFER_TIMEOUT))?;
         }
-
         Ok(())
     }
 
-    fn wait_until_ready(&mut self) -> Result<()> {
-        match receive_print_status(|buf, timeout| self.receive_with_timeout(buf, timeout)) {
+    fn wait_until_ready(&mut self, started: Instant) -> Result<()> {
+        let remaining = self
+            .job_timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        let result = receive_print_status_bounded(
+            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            PRINT_STATUS_IDLE_TIMEOUT,
+            remaining,
+        );
+        match result {
             Ok(status) => {
                 self.status = Some(status);
                 Ok(())
             }
-            // The printer stopped talking without announcing the receiving
-            // phase. The page itself has most likely printed, so fall back to
-            // the best-effort contract instead of failing a finished job.
-            Err(PtouchError::Timeout) => {
-                warn!("Printer did not report the receiving phase, continuing anyway");
-                Ok(())
-            }
+            Err(PtouchError::Timeout) => Err(PtouchError::CompletionUnknown),
             Err(error) => Err(error),
         }
     }
 
-    /// Preserve the original best-effort completion read for models whose
-    /// readiness lifecycle has not been documented or tested.
-    fn receive_print_completion(&mut self) -> Result<()> {
-        let mut response = [0u8; STATUS_PACKET_SIZE];
-        match self.receive(&mut response) {
-            Ok(n) if n >= STATUS_PACKET_SIZE => {
-                if let Some(status) = PrinterStatus::from_bytes(&response) {
-                    if status.has_error() {
-                        return Err(PtouchError::StatusError(status.error_description()));
-                    }
-                    debug!("Print completed: status_type={}", status.status_type_name());
-                    self.status = Some(status);
+    /// Models without a readiness handshake still need a completion notification.
+    fn receive_print_completion(&mut self, job_started: Instant) -> Result<()> {
+        let started = Instant::now();
+        let completion_timeout = self
+            .job_timeout
+            .checked_sub(job_started.elapsed())
+            .unwrap_or_default()
+            .min(TRANSFER_TIMEOUT);
+        let mut frames = StatusFrameBuffer::new();
+        loop {
+            let remaining = completion_timeout
+                .checked_sub(started.elapsed())
+                .filter(|duration| *duration >= PRINT_STATUS_MIN_POLL_TIMEOUT)
+                .ok_or(PtouchError::CompletionUnknown)?;
+            let mut response = [0u8; STATUS_PACKET_SIZE];
+            match self.receive_with_timeout(&mut response, remaining.min(PRINT_STATUS_POLL_TIMEOUT))
+            {
+                Ok(n) if n > response.len() => {
+                    return Err(PtouchError::StatusError("Invalid transport length".into()));
                 }
+                Ok(0) => std::thread::sleep(ZERO_LENGTH_TRANSFER_DELAY),
+                Ok(n) => {
+                    frames.push(&response[..n]);
+                    if let Some(packet) = frames.pop() {
+                        let status = parse_status_packet(&packet, "Invalid completion header")?;
+                        let ready = print_status_is_ready(&status)?;
+                        if status.status_type == 1 || ready {
+                            self.status = Some(status);
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(PtouchError::Timeout) => {}
+                Err(error) => return Err(error),
             }
-            Ok(n) => {
-                debug!("Short status response after print: {} bytes", n);
-            }
-            Err(PtouchError::Timeout) => {
-                debug!("Timeout waiting for print completion status");
-            }
-            Err(error) => return Err(error),
         }
-
-        Ok(())
     }
 
     fn get_p300bt_status(&mut self) -> Result<&PrinterStatus> {
         self.send(&protocol::cmd_status_request())?;
         let transport = &self.transport;
+        let cancellation = &self.cancellation;
         let status = read_p300bt_status(
             &mut self.status_frames,
-            |buf, timeout| transport.receive(buf, timeout),
+            |buf, timeout| {
+                cancellation.check()?;
+                transport.receive(buf, timeout)
+            },
             Duration::from_secs(10),
             false,
         )?;
@@ -442,9 +490,13 @@ impl<T: Transport> PrinterSession<T> {
     fn receive_p300bt_completion(&mut self) -> Result<()> {
         // A fixed total deadline; phase changes alone never complete the job.
         let transport = &self.transport;
+        let cancellation = &self.cancellation;
         self.status = Some(read_p300bt_status(
             &mut self.status_frames,
-            |buf, timeout| transport.receive(buf, timeout),
+            |buf, timeout| {
+                cancellation.check()?;
+                transport.receive(buf, timeout)
+            },
             Duration::from_secs(60),
             true,
         )?);
@@ -508,21 +560,62 @@ where
     }
 }
 
-/// Receive the printer's automatic status after a print command.
-fn receive_print_status<F>(mut receive: F) -> Result<PrinterStatus>
+#[cfg(test)]
+fn receive_print_status<F>(receive: F) -> Result<PrinterStatus>
 where
     F: FnMut(&mut [u8], Duration) -> Result<usize>,
 {
-    receive_print_status_with_timeout(&mut receive, PRINT_STATUS_IDLE_TIMEOUT)
+    receive_print_status_bounded(receive, PRINT_STATUS_IDLE_TIMEOUT, Duration::from_secs(600))
 }
 
-fn receive_print_status_with_timeout<F>(
+/// Bounded drain shared by USB and Bluetooth. Non-timeout errors are preserved.
+fn drain_input<F>(mut receive: F, timeout: Duration, byte_limit: usize) -> Result<()>
+where
+    F: FnMut(&mut [u8], Duration) -> Result<usize>,
+{
+    let started = Instant::now();
+    let mut total = 0usize;
+    let mut bytes = [0u8; 64];
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|duration| *duration >= PRINT_STATUS_MIN_POLL_TIMEOUT)
+            .ok_or(PtouchError::InputNotIdle)?;
+        match receive(&mut bytes, remaining) {
+            Ok(0) | Err(PtouchError::Timeout) => return Ok(()),
+            Ok(n) if n > bytes.len() => {
+                return Err(PtouchError::StatusError(
+                    "Transport returned more bytes than the receive buffer".into(),
+                ));
+            }
+            Ok(n) => {
+                total += n;
+                if total >= byte_limit {
+                    return Err(PtouchError::InputNotIdle);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+fn receive_print_status_with_timeout<F>(receive: F, idle_timeout: Duration) -> Result<PrinterStatus>
+where
+    F: FnMut(&mut [u8], Duration) -> Result<usize>,
+{
+    receive_print_status_bounded(receive, idle_timeout, Duration::from_secs(600))
+}
+
+fn receive_print_status_bounded<F>(
     mut receive: F,
     idle_timeout: Duration,
+    total_timeout: Duration,
 ) -> Result<PrinterStatus>
 where
     F: FnMut(&mut [u8], Duration) -> Result<usize>,
 {
+    let started = Instant::now();
     let mut last_transfer = Instant::now();
     let mut frames = StatusFrameBuffer::new();
 
@@ -531,6 +624,11 @@ where
             return Err(PtouchError::Timeout);
         };
 
+        let total_remaining = total_timeout
+            .checked_sub(started.elapsed())
+            .filter(|duration| *duration >= PRINT_STATUS_MIN_POLL_TIMEOUT)
+            .ok_or(PtouchError::Timeout)?;
+        let remaining = remaining.min(total_remaining);
         let mut transfer = [0u8; STATUS_PACKET_SIZE];
         let read_timeout = remaining
             .min(PRINT_STATUS_POLL_TIMEOUT)
@@ -668,6 +766,85 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+
+    #[test]
+    fn drain_rejects_continuous_input_and_preserves_transport_errors() {
+        let mut reads = 0;
+        let result = drain_input(
+            |buf, timeout| {
+                assert!(!timeout.is_zero());
+                reads += 1;
+                buf.fill(0xff);
+                Ok(buf.len())
+            },
+            Duration::from_secs(1),
+            128,
+        );
+        assert!(matches!(result, Err(PtouchError::InputNotIdle)));
+        assert_eq!(reads, 2);
+        assert!(matches!(
+            drain_input(
+                |_, _| Err(PtouchError::UsbError(rusb::Error::NoDevice)),
+                Duration::from_secs(1),
+                128
+            ),
+            Err(PtouchError::UsbError(rusb::Error::NoDevice))
+        ));
+        assert!(drain_input(|buf, _| Ok(buf.len() + 1), Duration::from_secs(1), 128).is_err());
+    }
+
+    #[test]
+    fn repeated_printing_status_cannot_extend_total_job_deadline() {
+        let packet = status_packet(6, 1);
+        let mut reads = 0;
+        let result = receive_print_status_bounded(
+            |buf, _| {
+                reads += 1;
+                if reads > 1000 {
+                    return Err(PtouchError::UnsupportedOperation("test watchdog"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                buf.copy_from_slice(&packet);
+                Ok(packet.len())
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(PtouchError::Timeout)));
+    }
+
+    #[test]
+    fn cancellation_stops_initialization_before_any_write() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.cancellation.cancel();
+        assert!(matches!(session.init(), Err(PtouchError::Cancelled)));
+        assert!(session.transport.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_readiness_stops_later_pages() {
+        let mut session = usb_session(DeviceFlags::WAIT_FOR_RECEIVE_READY);
+        session.init().unwrap();
+        session.job_timeout = Duration::from_millis(5);
+        let result = session.print_raster(
+            &[vec![0; 16]],
+            true,
+            false,
+            protocol::PrintQuality::Standard,
+        );
+        assert!(matches!(result, Err(PtouchError::CompletionUnknown)));
+        let writes = session.transport.writes.borrow().len();
+        assert!(matches!(
+            session.print_raster(
+                &[vec![0; 16]],
+                false,
+                false,
+                protocol::PrintQuality::Standard
+            ),
+            Err(PtouchError::NotInitialized)
+        ));
+        assert_eq!(session.transport.writes.borrow().len(), writes);
+    }
 
     fn status_packet(status_type: u8, phase_type: u8) -> [u8; STATUS_PACKET_SIZE] {
         let mut packet = [0u8; STATUS_PACKET_SIZE];
@@ -921,19 +1098,20 @@ mod tests {
         assert!(session.is_initialized());
     }
     #[test]
-    fn usb_session_keeps_plain_job_and_best_effort_completion() {
+    fn usb_session_keeps_plain_job_and_reports_unknown_completion() {
         let mut session = usb_session(DeviceFlags::NONE);
         session.init().unwrap();
         session.transport.writes.borrow_mut().clear();
-        // The undocumented USB-model path still permits a completion timeout.
-        session
-            .print_raster(
-                &[vec![0; 16], vec![0x80; 16]],
-                false,
-                false,
-                protocol::PrintQuality::Standard,
-            )
-            .unwrap();
+        // Missing confirmation must not be reported as a completed label.
+        session.job_timeout = Duration::from_millis(5);
+        let result = session.print_raster(
+            &[vec![0; 16], vec![0x80; 16]],
+            false,
+            false,
+            protocol::PrintQuality::Standard,
+        );
+        assert!(matches!(result, Err(PtouchError::CompletionUnknown)));
+        assert!(!session.is_initialized());
         let mut raster = vec![0x47, 16, 0];
         raster.extend([0x80; 16]);
         assert_eq!(
