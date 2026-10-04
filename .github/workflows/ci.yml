@@ -119,6 +119,10 @@ jobs:
           python3 scripts/unix-smoke.py --target ${{ matrix.target }} --profile debug
         fi
 
+    - name: Enumerate experimental USBPRINT interfaces
+      if: runner.os == 'Windows'
+      run: cargo run -p ptouch-core --example usbprint_probe --locked --target ${{ matrix.target }} -- --list
+
     - name: Build and inspect Linux packages
       if: runner.os == 'Linux'
       env:

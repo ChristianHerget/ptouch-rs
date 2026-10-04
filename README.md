@@ -362,6 +362,57 @@ ARM64 acceptance requires status reads, single and chained labels, cutting,
 long labels, device removal, and reconnect tests on the actual printer.
 Keep driver-binding failures separate from application startup failures.
 
+### Experimental USBPRINT status probe
+
+The application still prints through libusb. The separate Windows example
+investigates PT-P710BT communication while the device remains bound to `usbprint`.
+It sends no labels, reset commands, or cut commands and changes no driver settings.
+
+```powershell
+cargo run -p ptouch-core --example usbprint_probe -- --list
+cargo run -p ptouch-core --example usbprint_probe -- --status 'DEVICE_PATH_FROM_LIST'
+```
+
+Copy the complete device path from `--list`. The probe checks it against currently
+present PT-P710BT interfaces before opening it exclusively. An occupied device
+reports an error. Close other printer applications before testing.
+
+Status I/O runs in a child process with a 15-second watchdog. On timeout, the
+parent terminates and reaps the child. The probe never retries a short write.
+A successful status query establishes only that one exchange worked. It does
+not establish printing, cancellation, or spooler coexistence support.
+
+### ARM64 hardware acceptance
+
+Run the following on actual Linux ARM64, Windows ARM64, and macOS ARM64 hosts.
+Record the commit, binary checksum, OS version, model, tape, connection type,
+driver binding, result, and relevant diagnostic output for each case.
+
+| Case | Required observation |
+| --- | --- |
+| Architecture and GUI | Native ARM64 executable starts and renders a label preview |
+| Discovery and access | `doctor` identifies the device; explicit selection opens the intended printer |
+| Status | Tape width and printer errors match the physical printer |
+| Single label | Text orientation, margins, output, and cut match the preview |
+| Chained labels | Multiple labels finish in order without duplicate or missing output |
+| Long label | Printing survives transient silence within the configured job limit |
+| Missing confirmation | UI reports an unknown outcome; no automatic retry or later batch page |
+| Cancel | Further transmission stops; UI recovers after the current bounded transfer |
+| Unplug and reconnect | Error is preserved; refreshed device selection reconnects successfully |
+| Multiple devices | Automatic selection refuses ambiguity; explicit selection remains isolated |
+| Driver coexistence | A busy device reports an error without driver replacement |
+
+Windows additionally requires testing with ordinary user permissions. Hosted
+Windows runners run as administrators and cannot establish this property.
+Retain the existing Linux udev and macOS USB access procedures. PT-P300BT
+Bluetooth validation remains specific to macOS and does not establish Windows
+or Linux Bluetooth support.
+
+No ARM64 PT-P710BT hardware acceptance result is recorded by this change.
+Do not run untrusted pull-request code on a runner connected to a printer.
+The Windows USBPRINT probe remains experimental until separate hardware evidence
+establishes bidirectional communication and resource cleanup under failure.
+
 ## USB Driver (macOS)
 
 No driver replacement is needed. Install libusb and it works directly:
