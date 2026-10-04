@@ -368,6 +368,17 @@ The application still prints through libusb. The separate Windows example
 investigates PT-P710BT communication while the device remains bound to `usbprint`.
 It sends no labels, reset commands, or cut commands and changes no driver settings.
 
+Download `usbprint-probe-windows-arm64.exe` for Windows ARM64 or
+`usbprint-probe-windows-amd64.exe` for Windows x64 from the release assets.
+For example, on Windows ARM64:
+
+```powershell
+.\usbprint-probe-windows-arm64.exe --list
+.\usbprint-probe-windows-arm64.exe --status 'DEVICE_PATH_FROM_LIST'
+```
+
+To build the same tool from source:
+
 ```powershell
 cargo run -p ptouch-core --example usbprint_probe -- --list
 cargo run -p ptouch-core --example usbprint_probe -- --status 'DEVICE_PATH_FROM_LIST'

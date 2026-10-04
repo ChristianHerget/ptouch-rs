@@ -44,12 +44,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True, choices=("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"))
     parser.add_argument("--profile", required=True, choices=("debug", "release"))
+    parser.add_argument("--probe", action="store_true", help="Also validate the experimental USBPRINT executable")
     args = parser.parse_args()
     directory = Path("target") / args.target / args.profile
     machine = 0xAA64 if args.target.startswith("aarch64") else 0x8664
     cli, gui = directory / "ptouch.exe", directory / "ptouch-gui.exe"
     check_pe(cli, machine)
     check_pe(gui, machine, require_icon=True)
+    if args.probe:
+        probe = directory / "examples" / "usbprint_probe.exe"
+        check_pe(probe, machine)
+        for option in ("--help", "--list"):
+            subprocess.run([str(probe), option], check=True, timeout=30)
     for option in ("--version", "--help"):
         subprocess.run([str(cli), option], check=True, timeout=30)
     report = json.loads(subprocess.check_output([str(cli), "doctor", "--json"], timeout=30, text=True))

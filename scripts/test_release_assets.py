@@ -19,7 +19,11 @@ class ReleaseAssetsTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(source.encode())
             release.assemble(root / "artifacts", root / "release", "0.8.3")
-            for name in ("ptouch-windows-arm64.exe", "ptouch-gui-windows-arm64.exe", "ptouch-windows-amd64.exe"):
+            for name in (
+                "ptouch-windows-arm64.exe", "ptouch-gui-windows-arm64.exe", "ptouch-windows-amd64.exe",
+                "ptouch-linux-arm64", "ptouch-gui-macos-arm64.app.zip",
+                "usbprint-probe-windows-arm64.exe", "usbprint-probe-windows-amd64.exe",
+            ):
                 self.assertTrue((root / "release" / name).is_file())
             for line in (root / "release" / "SHA256SUMS").read_text().splitlines():
                 digest, name = line.split("  ")

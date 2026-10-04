@@ -84,7 +84,17 @@ jobs:
 
       - name: Windows executable smoke tests
         if: runner.os == 'Windows'
-        run: python scripts/windows-smoke.py --target ${{ matrix.target }} --profile release
+        run: |
+          cargo build -p ptouch-core --example usbprint_probe --release --locked --target ${{ matrix.target }}
+          python scripts/windows-smoke.py --target ${{ matrix.target }} --profile release --probe
+
+      - name: Upload experimental USBPRINT probe
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: usbprint-probe-${{ matrix.asset_suffix }}
+          path: target/${{ matrix.target }}/release/examples/usbprint_probe.exe
+          if-no-files-found: error
 
       - name: Native Unix executable smoke tests
         if: runner.os != 'Windows'
