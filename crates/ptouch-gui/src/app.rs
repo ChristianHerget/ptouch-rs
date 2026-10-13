@@ -26,7 +26,11 @@ pub struct PtouchApp {
 
 impl PtouchApp {
     /// Create a new application instance.
-    pub fn new(cc: &eframe::CreationContext<'_>, smoke_test: bool) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        smoke_test: bool,
+        profiles_dir: std::path::PathBuf,
+    ) -> Self {
         setup_fallback_fonts(&cc.egui_ctx);
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -42,7 +46,7 @@ impl PtouchApp {
                 .expect("failed to spawn printer worker thread");
         }
 
-        Self {
+        let mut app = Self {
             state: AppState {
                 available_fonts: ptouch_render::font::list_fonts(),
                 printer_cmd_tx: (!smoke_test).then_some(cmd_tx),
@@ -51,7 +55,21 @@ impl PtouchApp {
             renderer: TextRenderer::new(),
             resp_rx,
             smoke_frames: smoke_test.then_some(0),
+        };
+        app.state.profiles = crate::profile_ui::ProfilesUi::load(profiles_dir);
+        app.state.profiles.open = smoke_test;
+        if let Some(error) = &app.state.profiles.error {
+            app.state.printer_target = crate::state::PrinterTarget::Unavailable(error.clone());
+        } else if let Some(profile) = app.state.profiles.default_profile() {
+            app.state.printer_target = crate::state::PrinterTarget::Profile(profile);
+            app.state.apply_target_preferences();
         }
+        if let Some(tx) = &app.state.printer_cmd_tx {
+            let _ = tx.send(crate::state::PrinterCommand::Poll(
+                app.state.printer_target.clone(),
+            ));
+        }
+        app
     }
 
     /// Re-render the preview bitmap from the current element list.
@@ -141,6 +159,8 @@ impl PtouchApp {
                     max_px,
                     dpi,
                     quality_modes,
+                    media_code,
+                    band_left,
                     tape_width_px,
                 } => {
                     self.state.printer_connected = true;
@@ -148,6 +168,9 @@ impl PtouchApp {
                     self.state.printer_max_px = max_px;
                     self.state.printer_dpi = dpi;
                     self.state.printer_quality_modes = quality_modes;
+                    self.state.printer_model_id = model_name.clone();
+                    self.state.media_code = media_code;
+                    self.state.band_left = band_left;
                     // A stale non-standard quality from a previous printer
                     // would make every print fail with the selector hidden.
                     if !quality_modes {
@@ -175,6 +198,13 @@ impl PtouchApp {
                     // Keep printer_max_px, printer_dpi, and quality state:
                     // the canvas must not resize on a transient disconnect,
                     // and printing is gated on printer_connected anyway.
+                }
+                PrinterResponse::SubmittedUnconfirmed => {
+                    self.state.operation_in_progress = false;
+                    self.state.cancellation = None;
+                    self.state.status_message =
+                        "Submitted, completion unconfirmed. Check the printer before retrying."
+                            .into();
                 }
                 PrinterResponse::PrintDone => {
                     self.state.operation_in_progress = false;
@@ -231,6 +261,8 @@ impl eframe::App for PtouchApp {
         egui::CentralPanel::default().show(ui, |ui| {
             panels::canvas::show_canvas(ui, &mut self.state);
         });
+
+        crate::profile_ui::show(&ctx, &mut self.state);
 
         // Re-render preview if dirty
         if self.state.needs_rerender {
@@ -311,6 +343,8 @@ mod tests {
                 max_px: 128,
                 dpi: 180,
                 quality_modes: false,
+                media_code: 1,
+                band_left: None,
                 tape_width_px: 128,
             },
         }
@@ -348,6 +382,8 @@ mod tests {
                 max_px: 128,
                 dpi: 180,
                 quality_modes: false,
+                media_code: 1,
+                band_left: None,
                 tape_width_px: 64,
             },
         })

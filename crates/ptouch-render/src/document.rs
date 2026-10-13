@@ -367,6 +367,43 @@ pub fn render_elements(
     Ok(result)
 }
 
+/// Render source content at twice the feed resolution, preserving tape height.
+pub fn render_elements_high_resolution(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+) -> Result<Option<LabelBitmap>> {
+    let mut elements = elements.to_vec();
+    for element in &mut elements {
+        match element {
+            LabelElement::Text { font_size, .. } => *font_size = font_size.map(|v| v * 2.0),
+            LabelElement::Image {
+                target_height,
+                bitmap,
+                image_data,
+                ..
+            } => {
+                *target_height = target_height.map(|v| v * 2);
+                if !image_data.is_empty() {
+                    *bitmap = None;
+                }
+            }
+            LabelElement::Padding { pixels } => *pixels *= 2,
+            LabelElement::CutMark => {}
+        }
+    }
+    Ok(render_elements(
+        &elements,
+        tape_width_px * 2,
+        font_name,
+        font_margin * 2,
+        renderer,
+    )?
+    .map(|bitmap| bitmap.halve_height()))
+}
+
 /// Render a single text element to a tape-height bitmap, or `None` to skip it.
 fn render_text_segment(
     renderer: &mut TextRenderer,
@@ -514,6 +551,33 @@ fn rotation_aware_font_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn high_resolution_preserves_height_and_renders_distinct_feed_columns() {
+        let elements = vec![
+            LabelElement::Text {
+                content: "Wi-Fi W".into(),
+                font_size: Some(36.0),
+                align: TextAlign::Left,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+            },
+            LabelElement::Padding { pixels: 10 },
+        ];
+        let mut renderer = TextRenderer::new();
+        let normal = render_elements(&elements, 70, "DejaVuSans", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        let high = render_elements_high_resolution(&elements, 70, "DejaVuSans", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(high.height(), normal.height());
+        assert!(high.width().abs_diff(normal.width() * 2) <= 2);
+        assert!(
+            (0..high.width() / 2)
+                .any(|x| (0..70).any(|y| high.get_pixel(2 * x, y) != high.get_pixel(2 * x + 1, y)))
+        );
+    }
 
     /// Encode a solid black image of the given size as PNG bytes.
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {

@@ -27,6 +27,21 @@ pub struct LabelBitmap {
 }
 
 impl LabelBitmap {
+    /// Reduce a render at twice the head DPI to the physical head height.
+    /// Feed columns remain distinct, preserving genuine horizontal detail.
+    pub fn halve_height(&self) -> Self {
+        let mut out = Self::new(self.width, self.height / 2);
+        for y in 0..out.height {
+            for x in 0..out.width {
+                out.set_pixel(
+                    x,
+                    y,
+                    self.get_pixel(x, y * 2) || self.get_pixel(x, y * 2 + 1),
+                );
+            }
+        }
+        out
+    }
     /// Number of bytes per row (each row is padded to whole bytes).
     #[inline]
     fn row_stride(width: u32) -> usize {

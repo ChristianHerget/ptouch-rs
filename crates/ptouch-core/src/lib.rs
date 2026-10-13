@@ -9,8 +9,11 @@
 //! transmission.
 
 mod model;
+pub mod network;
 mod p300bt;
+pub mod printer_model;
 mod session;
+mod snmp;
 
 /// Native macOS Bluetooth support, enabled with the `bluetooth` feature.
 #[cfg(all(feature = "bluetooth", target_os = "macos"))]

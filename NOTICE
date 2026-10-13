@@ -32,3 +32,21 @@ Original, independently written parts of this project (the egui GUI, the
 command-line front end, and the rendering code other than raster conversion)
 are additionally available under the MIT license. See README.md for the
 per-directory breakdown and LICENSE / LICENSE-MIT for the full texts.
+
+Network printing incorporates selected GPL-3.0-or-later code from:
+    nhimc0n/ptouch-yuri, feat/e850-network-printing
+    https://github.com/nhimc0n/ptouch-yuri
+    Commit 10e14876c35ef0e09889657d53bd8a9c34cd3808
+
+Adapted portions: SNMP BER encoding/decoding, LPR submission, P900/E850
+command builders, 560-pin media bands, and raster placement with tests.
+The E850-specific command remains limited to that model's dialect.
+
+PT-P750W capabilities and commands are also informed by:
+    Brother PT-E550W/PT-P750W/PT-P710BT Raster Command Reference v1.02
+    https://download.brother.com/welcome/docp100064/cv_pte550wp750wp710bt_eng_raster_102.pdf
+
+The new ptouch-profiles crate is independent of printer protocol code and
+available under MIT. The independently written printer_model.rs capability
+selection and GUI profile editor are also MIT. These additional permissions
+do not change the GPL license of the combined application.

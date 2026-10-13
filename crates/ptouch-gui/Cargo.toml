@@ -28,6 +28,7 @@ icon = ["../../data/macos/ptouch-gui.icns"]
 winresource = "0.1"
 
 [dependencies]
+ptouch-profiles = { path = "../ptouch-profiles" }
 ptouch-core = { path = "../ptouch-core" }
 ptouch-render = { path = "../ptouch-render" }
 egui = "0.36"

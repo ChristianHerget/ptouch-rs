@@ -42,6 +42,8 @@ bitflags! {
         const WAIT_FOR_RECEIVE_READY = 1 << 8;
         /// Device supports ESC i ! for configuring automatic status notification.
         const AUTO_STATUS_NOTIFICATION = 1 << 9;
+        /// PT-P750W 180 x 360 mode; input already has double feed resolution.
+        const P750_HIRES = 1 << 10;
     }
 }
 
@@ -232,7 +234,9 @@ static DEVICE_TABLE: &[DeviceInfo] = &[
         name: "PT-P750W",
         max_px: 128,
         dpi: 180,
-        flags: DeviceFlags::RASTER_PACKBITS.union(DeviceFlags::P700_INIT),
+        flags: DeviceFlags::P750_HIRES
+            .union(DeviceFlags::RASTER_PACKBITS)
+            .union(DeviceFlags::P700_INIT),
     },
     DeviceInfo {
         vid: 0x04f9,

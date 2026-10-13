@@ -284,6 +284,7 @@ impl<T: Transport> PrinterSession<T> {
     /// * `chain_print` - If true, don't cut the tape (chain mode).
     /// * `precut` - If true AND device supports precut, send precut command.
     /// * `quality` - Print quality mode (device must support non-standard).
+    ///   PT-P750W HighRes input must already use 360 dpi along the feed axis.
     ///
     /// # Errors
     ///
@@ -303,10 +304,16 @@ impl<T: Transport> PrinterSession<T> {
 
         if quality != protocol::PrintQuality::Standard
             && !self.profile.flags.contains(DeviceFlags::LEGACY_HIRES)
+            && !(self.profile.flags.contains(DeviceFlags::P750_HIRES)
+                && quality == protocol::PrintQuality::HighRes)
         {
             return Err(PtouchError::UnsupportedQuality(
                 self.profile.name.to_string(),
             ));
+        }
+
+        if let Some(model) = crate::printer_model::PrinterModel::find(self.profile.name) {
+            model.validate_quality(quality, self.status.as_ref().map_or(0, |s| s.media_type))?;
         }
 
         if self.profile.dialect == Dialect::P300Bt {
@@ -340,7 +347,7 @@ impl<T: Transport> PrinterSession<T> {
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            self.wait_until_ready(started)
+            self.wait_until_ready(started, self.quiet_timeout(lines.len(), quality))
         } else {
             self.receive_print_completion(started)
         };
@@ -384,7 +391,7 @@ impl<T: Transport> PrinterSession<T> {
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            if let Err(error) = self.wait_until_ready(started) {
+            if let Err(error) = self.wait_until_ready(started, PRINT_STATUS_IDLE_TIMEOUT) {
                 self.initialized = false;
                 return Err(error);
             }
@@ -411,14 +418,31 @@ impl<T: Transport> PrinterSession<T> {
         Ok(())
     }
 
-    fn wait_until_ready(&mut self, started: Instant) -> Result<()> {
+    // Some printers stay silent while feeding. Allow enough time for the
+    // rendered length at a conservative 5 mm/s plus cutting overhead, while
+    // retaining the caller's absolute job deadline.
+    fn quiet_timeout(&self, columns: usize, quality: protocol::PrintQuality) -> Duration {
+        let feed_dpi = if self.profile.flags.contains(DeviceFlags::P750_HIRES)
+            && quality == protocol::PrintQuality::HighRes
+        {
+            self.profile.dpi * 2
+        } else {
+            self.profile.dpi
+        };
+        Duration::from_secs_f64(
+            (columns as f64 / f64::from(feed_dpi) * 25.4 / 5.0 + 10.0).max(30.0),
+        )
+        .min(self.job_timeout)
+    }
+
+    fn wait_until_ready(&mut self, started: Instant, quiet_timeout: Duration) -> Result<()> {
         let remaining = self
             .job_timeout
             .checked_sub(started.elapsed())
             .unwrap_or_default();
         let result = receive_print_status_bounded(
             |buf, timeout| self.receive_with_timeout(buf, timeout),
-            PRINT_STATUS_IDLE_TIMEOUT,
+            quiet_timeout,
             remaining,
         );
         match result {
@@ -437,8 +461,7 @@ impl<T: Transport> PrinterSession<T> {
         let completion_timeout = self
             .job_timeout
             .checked_sub(job_started.elapsed())
-            .unwrap_or_default()
-            .min(TRANSFER_TIMEOUT);
+            .unwrap_or_default();
         let mut frames = StatusFrameBuffer::new();
         loop {
             let remaining = completion_timeout

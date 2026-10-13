@@ -4,6 +4,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ptouch-profiles",
     "crates/ptouch-core",
     "crates/ptouch-render",
     "crates/ptouch-cli",

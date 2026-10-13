@@ -20,7 +20,9 @@ use crate::device::DeviceFlags;
 /// On 360 dpi printers the head resolution is fixed at 360 dpi across the
 /// tape, but the feed resolution along the tape can be doubled (high
 /// resolution, 360x720) or halved (draft, 360x180). Physical label length
-/// is preserved by duplicating or dropping raster lines.
+/// is preserved by duplicating or dropping raster lines on the legacy backend.
+/// PT-P750W high resolution instead accepts source rasterized at 360 feed dpi;
+/// the protocol does not duplicate those columns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrintQuality {
     /// Normal 1:1 printing (e.g. 360x360 dpi).
@@ -259,6 +261,92 @@ pub fn cmd_page_flags(margin: u16) -> Vec<u8> {
     ]
 }
 
+/// Construct the 200 byte invalidate sequence followed by ESC @.
+///
+/// UNVERIFIED(E850): the PT-P900 reference asks for 200 bytes; the generic
+/// [`cmd_init`] sends 100.
+pub fn cmd_init_p900() -> Vec<u8> {
+    let mut buf = vec![0u8; 200];
+    buf.extend_from_slice(&[0x1B, 0x40]);
+    buf
+}
+
+/// Map a status media type (byte 11) to the media type for ESC i z.
+///
+/// Laminated and non-laminated tape report 0x01/0x03 in status but are 0x00 in
+/// ESC i z; heat-shrink tube uses the same code in both. `None` for media we
+/// must not print on (no media, incompatible, unknown).
+///
+/// UNVERIFIED(E850): PT-P900 reference; HGe is assumed to behave as tape.
+pub fn info_media_type(status_media_type: u8) -> Option<u8> {
+    match status_media_type {
+        0x01 | 0x03 => Some(0x00),
+        0x11 => Some(0x11),
+        _ => None,
+    }
+}
+
+/// Construct the PT-P900-style info command (ESC i z).
+///
+/// E850-verified for TZe 36 mm (P-touch Editor captures, 2026-10-06/07):
+/// - normal: valid flags 0x84 (media width + printer recovery, so the printer
+///   itself rejects a width mismatch), media type 0x00;
+/// - `quality_priority` ("give priority to print quality", slower): flag 0x40
+///   added (0xC4), raster unchanged;
+/// - `high_res` (360 x 720 dpi): flags 0x86 and media type 0x09, with twice
+///   the raster lines (see `cmd_advanced_mode` and `cmd_page_flags`).
+///
+/// Page byte 2 for a single/last page. UNVERIFIED(E850): for HSe (type != 0)
+/// we set the "media type valid" flag 0x02 as the PT-P900 reference describes,
+/// and a page byte other than 2 for pages that are followed by more.
+pub fn cmd_info_p900(
+    info_media_type: u8,
+    media_width: u8,
+    raster_lines: u32,
+    last_page: bool,
+    quality_priority: bool,
+    high_res: bool,
+) -> Vec<u8> {
+    let mut flags = if high_res || info_media_type != 0x00 {
+        0x86
+    } else {
+        0x84
+    };
+    if quality_priority {
+        flags |= 0x40;
+    }
+    let media_type = if high_res { 0x09 } else { info_media_type };
+    let mut buf = vec![0x1B, 0x69, 0x7A, flags, media_type, media_width, 0x00];
+    buf.extend_from_slice(&raster_lines.to_le_bytes());
+    buf.push(if last_page { 0x02 } else { 0x00 }); // n9: page
+    buf.push(0x00); // n10
+    buf
+}
+
+/// Construct the job tag command (ESC i U) that P-touch Editor sends before
+/// ESC i z: 15 payload bytes, constant for a given PC except byte 11, which
+/// equals the LPR job number. Meaning of the constant part is unknown and
+/// whether the printer needs it is unverified, so it is sent only on request.
+pub fn cmd_job_tag(job_number: u8) -> Vec<u8> {
+    let mut buf = vec![0x1B, 0x69, 0x55];
+    buf.extend_from_slice(&[
+        0x4A, 0x00, 0x0C, 0x04, 0x42, 0x1A, 0xB3, 0xD4, 0x9C, 0x00, 0x00,
+    ]);
+    buf.extend_from_slice(&[job_number, 0x00, 0x00, 0x00]);
+    buf
+}
+
+/// Construct `ESC i k 63 01 00`, which P-touch Editor sends in every job just
+/// before ESC i d. Purpose unknown (E850-seen, not in the PT-P900 reference).
+pub fn cmd_esc_i_k_lower() -> Vec<u8> {
+    vec![0x1B, 0x69, 0x6B, 0x63, 0x01, 0x00]
+}
+
+/// Construct the "cut every n labels" command (ESC i A).
+pub fn cmd_cut_every(n: u8) -> Vec<u8> {
+    vec![0x1B, 0x69, 0x41, n]
+}
+
 /// Create a blank raster line of the given width in pixels.
 ///
 /// Returns a zeroed byte buffer of length `ceil(max_px / 8)`.
@@ -300,13 +388,14 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
     // Quality modes change the feed resolution along the tape. Keep the
     // physical length by duplicating lines (high resolution) or dropping
     // every other line (draft).
-    let quality = if flags.contains(DeviceFlags::LEGACY_HIRES) {
+    let quality = if flags.intersects(DeviceFlags::LEGACY_HIRES | DeviceFlags::P750_HIRES) {
         opts.quality
     } else {
         PrintQuality::Standard
     };
     let (repeat, step) = match quality {
         PrintQuality::Standard => (1, 1),
+        PrintQuality::HighRes if flags.contains(DeviceFlags::P750_HIRES) => (1, 1),
         PrintQuality::HighRes => (2, 1),
         PrintQuality::Draft => (1, 2),
     };
@@ -323,6 +412,10 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
     if flags.contains(DeviceFlags::LEGACY_HIRES) && quality != PrintQuality::Standard {
         job.push(cmd_legacy_info(opts.media_width, quality));
         job.push(cmd_advanced_mode(quality, false, true, true));
+    }
+
+    if flags.contains(DeviceFlags::P750_HIRES) {
+        job.push(cmd_advanced_mode(quality, false, !opts.chain_print, false));
     }
 
     if flags.contains(DeviceFlags::USE_INFO_CMD) {

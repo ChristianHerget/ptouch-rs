@@ -13,6 +13,7 @@
 mod app;
 mod panels;
 mod printer_worker;
+mod profile_ui;
 mod state;
 mod widgets;
 
@@ -52,7 +53,31 @@ fn main() -> eframe::Result<()> {
         std::process::exit(exit_code);
     }
     env_logger::init();
-    let smoke_test = std::env::args().nth(1).as_deref() == Some("--smoke-test");
+    let mut smoke_test = false;
+    let mut profiles_dir = ptouch_profiles::default_directory();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--smoke-test" => smoke_test = true,
+            "--profiles-dir" => {
+                profiles_dir = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        eprintln!("--profiles-dir requires a directory");
+                        std::process::exit(1)
+                    })
+            }
+            "--help" | "-h" => {
+                println!("ptouch-gui [--profiles-dir DIRECTORY] [--smoke-test]");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("Unknown option: {arg}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // `with_app_id` sets the Wayland app_id / X11 WM_CLASS so the desktop entry
     // (StartupWMClass) associates its icon with the window.
@@ -72,6 +97,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "P-Touch Label Printer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::PtouchApp::new(cc, smoke_test)))),
+        Box::new(move |cc| Ok(Box::new(app::PtouchApp::new(cc, smoke_test, profiles_dir)))),
     )
 }

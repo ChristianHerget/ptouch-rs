@@ -13,6 +13,8 @@ pub use ptouch_render::document::LabelElement;
 /// Printer connection selected in the GUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterTarget {
+    Unavailable(String),
+    Profile(ptouch_profiles::PrinterProfile),
     Usb,
     UsbAt(ptouch_core::transport::UsbLocation),
     #[cfg(windows)]
@@ -29,6 +31,8 @@ pub enum PrinterTarget {
 impl PrinterTarget {
     pub fn label(&self) -> String {
         match self {
+            Self::Unavailable(_) => "Profile configuration error".into(),
+            Self::Profile(p) => format!("{} ({})", p.alias, p.model),
             Self::Usb => "USB (automatic)".to_string(),
             Self::UsbAt(location) => format!("USB {location}"),
             #[cfg(windows)]
@@ -45,9 +49,13 @@ impl PrinterTarget {
         }
     }
 
+    pub fn is_network(&self) -> bool {
+        matches!(self, Self::Profile(p) if matches!(p.connection, ptouch_profiles::Connection::Network { .. }))
+    }
+
     pub fn is_bluetooth(&self) -> bool {
         match self {
-            Self::Usb | Self::UsbAt(_) => false,
+            Self::Unavailable(_) | Self::Profile(_) | Self::Usb | Self::UsbAt(_) => false,
             #[cfg(windows)]
             Self::UsbPrint { .. } => false,
             #[cfg(any(target_os = "macos", test))]
@@ -65,8 +73,11 @@ pub enum PrinterCommand {
     /// Print raster data.
     Print {
         raster_lines: Vec<Vec<u8>>,
+        expected_media: (u8, u8),
+        job_timeout_secs: u32,
         chain_print: bool,
         auto_cut: bool,
+        precut: bool,
         quality: PrintQuality,
         target: PrinterTarget,
         cancellation: ptouch_core::CancellationToken,
@@ -98,12 +109,15 @@ pub enum PrinterResponse {
         max_px: u16,
         dpi: u16,
         quality_modes: bool,
+        media_code: u8,
+        band_left: Option<u16>,
         tape_width_px: u16,
     },
     /// No printer found or previously connected printer lost.
     ConnectionError(String),
     /// Print job completed successfully.
     PrintDone,
+    SubmittedUnconfirmed,
     /// Feed and cut completed successfully.
     FeedAndCutDone,
     /// An operation failed.
@@ -112,6 +126,11 @@ pub enum PrinterResponse {
 
 /// Central application state shared across all panels.
 pub struct AppState {
+    pub profiles: crate::profile_ui::ProfilesUi,
+    pub printer_model_id: String,
+    pub media_code: u8,
+    pub job_timeout_secs: u32,
+    pub band_left: Option<u16>,
     /// List of label elements in composition order.
     pub elements: Vec<LabelElement>,
     /// Index of the currently selected element, if any.
@@ -152,6 +171,7 @@ pub struct AppState {
     pub font_search: String,
     /// Auto-cut after printing. When false, chain print mode (no cut).
     pub auto_cut: bool,
+    pub precut: bool,
     /// Whether a printer is currently connected (detected by background poll).
     pub printer_connected: bool,
     /// Target selected for polling and printing.
@@ -181,6 +201,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            profiles: crate::profile_ui::ProfilesUi::default(),
+            printer_model_id: String::new(),
+            media_code: 0,
+            job_timeout_secs: 600,
+            band_left: None,
             elements: Vec::new(),
             selected_element: None,
             tape_width_mm: 12,
@@ -201,6 +226,7 @@ impl Default for AppState {
             rotation_input: String::new(),
             font_search: String::new(),
             auto_cut: true,
+            precut: true,
             printer_connected: false,
             printer_target: PrinterTarget::Usb,
             bluetooth_targets: Vec::new(),
@@ -218,6 +244,18 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn apply_target_preferences(&mut self) {
+        self.auto_cut = !self.printer_target.is_bluetooth();
+        self.print_quality = PrintQuality::Standard;
+        if let PrinterTarget::Profile(p) = &self.printer_target {
+            self.auto_cut = p.final_cut;
+            self.print_quality = match p.quality {
+                ptouch_profiles::Quality::Standard => PrintQuality::Standard,
+                ptouch_profiles::Quality::High => PrintQuality::HighRes,
+                ptouch_profiles::Quality::Draft => PrintQuality::Draft,
+            };
+        }
+    }
     pub fn is_printer_busy(&self) -> bool {
         self.operation_in_progress || self.connecting
     }

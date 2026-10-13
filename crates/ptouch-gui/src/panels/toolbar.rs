@@ -84,7 +84,35 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             .clicked()
             && let Some(ref bitmap) = state.preview_bitmap
         {
-            let raster_lines = raster::bitmap_to_raster_lines(bitmap, state.printer_max_px);
+            let high_bitmap;
+            let bitmap = if state.printer_model_id == "PT-P750W"
+                && state.print_quality == ptouch_core::PrintQuality::HighRes
+            {
+                let mut renderer = ptouch_render::text::TextRenderer::new();
+                match ptouch_render::document::render_elements_high_resolution(
+                    &state.elements,
+                    state.tape_width_px,
+                    &state.font_name,
+                    state.font_margin,
+                    &mut renderer,
+                ) {
+                    Ok(Some(rendered)) => {
+                        high_bitmap = rendered.mirrored(state.overall_flip_h, state.overall_flip_v)
+                    }
+                    _ => {
+                        state.status_message = "High-resolution render failed".into();
+                        return;
+                    }
+                }
+                &high_bitmap
+            } else {
+                bitmap
+            };
+            let raster_lines = if let Some(left) = state.band_left {
+                raster::bitmap_to_raster_lines_at(bitmap, state.printer_max_px, left)
+            } else {
+                raster::bitmap_to_raster_lines(bitmap, state.printer_max_px)
+            };
             let chain_print = !state.auto_cut;
             let auto_cut = state.auto_cut;
             if let Some(ref tx) = state.printer_cmd_tx {
@@ -92,8 +120,11 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                 state.cancellation = Some(cancellation.clone());
                 let _ = tx.send(PrinterCommand::Print {
                     raster_lines,
+                    expected_media: (state.tape_width_mm, state.media_code),
+                    job_timeout_secs: state.job_timeout_secs,
                     chain_print,
                     auto_cut,
+                    precut: state.precut,
                     quality: state.print_quality,
                     target: state.printer_target.clone(),
                     cancellation,
@@ -105,7 +136,10 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
 
         if ui
             .add_enabled(
-                connected && !busy && !state.printer_target.is_bluetooth(),
+                connected
+                    && !busy
+                    && !state.printer_target.is_bluetooth()
+                    && !state.printer_target.is_network(),
                 egui::Button::new("Feed & Cut"),
             )
             .clicked()

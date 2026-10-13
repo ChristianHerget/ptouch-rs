@@ -1,6 +1,6 @@
 # ptouch-rs
 
-Rust tool for Brother P-Touch USB label printers. CLI and GUI.
+Rust tool for Brother P-Touch USB and network label printers. CLI and GUI.
 Optional native macOS Bluetooth support is available in `ptouch-core` for the PT-P300BT.
 
 ![ptouch-gui screenshot](https://github.com/user-attachments/assets/b18ba04d-0526-43f8-ad40-8ca29b5cb280)
@@ -13,6 +13,9 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 - Save and reload designs as self-contained `.ptl` layout files (images
   embedded), then print them from the GUI or CLI
 - Template layouts with `{{name}}` placeholders and batch-print from a CSV
+- Portable printer profiles in one directory, split across any number of TOML files
+- Network printing with model-specific capabilities and media checks
+- PT-P750W standard 180×180 and high resolution 180×360 modes
 - Chain print and multi-copy support
 - Print quality modes on 360 dpi models (high resolution 360x720, draft 360x180)
 - GUI with live preview, zoom, and drag-and-drop element reordering
@@ -27,6 +30,42 @@ PT-P700, PT-P750W, PT-D410, PT-D450, PT-D460BT, PT-D600, PT-D610BT,
 PT-P710BT, PT-E310BT, PT-E560BT and more.
 
 Tape widths: 3.5mm, 6mm, 9mm, 12mm, 18mm, 24mm, 36mm.
+
+## Network printing and portable printer profiles
+
+Both apps use the same profile directory. On Linux the default is
+`~/.config/ptouch-rs/printers` (under `$XDG_CONFIG_HOME` when set).
+On macOS and Windows it is under the platform's user configuration directory.
+Pass `--profiles-dir DIRECTORY` to either app to use a portable folder.
+
+```sh
+# Direct connection: no saved profile needed
+ptouch info --model PT-P750W --host 192.168.20.150
+ptouch print --model PT-P750W --host 192.168.20.150 --quality high "Label"
+
+# Save the connection and choose it by alias
+ptouch printers add desk --model PT-P750W --host labelprinter.local
+ptouch printers default desk
+ptouch info --printer desk
+ptouch print --printer desk --quality high "Label"
+ptouch printers list
+ptouch printers validate
+ptouch gui
+```
+
+Explicit connection flags override the saved default. Explicit print quality
+and `--final-cut`/`--chain` override profile preferences. Without a default or
+explicit target, USB automatic selection still works. `--usb BUS:ADDRESS` is
+available for a one-time USB selection; portable USB profiles use a model and
+an optional serial number. Multiple matching USB devices are rejected.
+
+In the GUI, use **Manage printers…** to add/edit connections, choose the
+profile directory, set a default, or connect without saving. Saves update the
+printer's original file, preserving comments and other entries. Reload after
+external edits; stale edits are refused.
+
+See [printer profiles and network behavior](docs/printer-profiles.md) for the
+schema, capability matrix, cut options, completion semantics, and limitations.
 
 ## Building
 
@@ -502,9 +541,11 @@ Per-directory licensing (each source file carries an SPDX header):
 
 | Path | License | Notes |
 |------|---------|-------|
-| `crates/ptouch-core/` | GPL-3.0-or-later | Device table, flags, status protocol, command construction. Derived from ptouch-print. |
+| `crates/ptouch-core/` (except `printer_model.rs`) | GPL-3.0-or-later | Device table, flags, status protocol, command construction. Derived from ptouch-print. |
 | `crates/ptouch-render/src/raster.rs` | GPL-3.0-or-later | Raster bit-packing. Derived from ptouch-print. |
 | `crates/ptouch-render/` (other files) | MIT | Bitmap, text, image loading, composition. Original work. |
+| `crates/ptouch-core/src/printer_model.rs` | MIT | Independently written capability selection. |
+| `crates/ptouch-profiles/` | MIT | Independent portable configuration storage. |
 | `crates/ptouch-cli/` | MIT | Original work. |
 | `crates/ptouch-gui/` | MIT | Original work. |
 

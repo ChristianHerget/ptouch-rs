@@ -141,6 +141,36 @@ impl PtouchDevice {
         Self::open_matching(None, None)
     }
 
+    /// Select a portable model/serial identity. Ambiguous matches are rejected.
+    pub fn open_profile(model: &str, serial: Option<&str>) -> Result<Self> {
+        let context = Context::new()?;
+        let mut candidates = Vec::new();
+        for usb in context.devices()?.iter() {
+            let Ok(desc) = usb.device_descriptor() else {
+                continue;
+            };
+            let Some(info) = device::find_device(desc.vendor_id(), desc.product_id()) else {
+                continue;
+            };
+            if !info.name.eq_ignore_ascii_case(model)
+                || info
+                    .flags
+                    .intersects(DeviceFlags::PLITE | DeviceFlags::UNSUP_RASTER)
+            {
+                continue;
+            }
+            if let Some(serial) = serial {
+                let handle = usb.open()?;
+                if handle.read_serial_number_string_ascii(&desc)?.trim() != serial {
+                    continue;
+                }
+            }
+            candidates.push((usb, info.clone()));
+        }
+        let (usb, info) = only_candidate(candidates)?;
+        Self::open_device(usb, info)
+    }
+
     /// Open an explicitly selected PT-P710BT through the existing Windows driver.
     #[cfg(windows)]
     pub fn open_usbprint(instance_id: &str) -> Result<Self> {

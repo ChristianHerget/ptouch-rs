@@ -17,6 +17,7 @@ name = "ptouch"
 path = "src/main.rs"
 
 [dependencies]
+ptouch-profiles = { path = "../ptouch-profiles" }
 ptouch-core = { path = "../ptouch-core" }
 ptouch-render = { path = "../ptouch-render" }
 clap = { version = "4.5", features = ["derive"] }

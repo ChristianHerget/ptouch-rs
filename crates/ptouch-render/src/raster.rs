@@ -52,12 +52,33 @@ fn rasterline_setpixel(rasterline: &mut [u8], pixel: usize) {
 /// Within each column, pixels are read bottom-to-top from the bitmap
 /// (y is flipped) to match the Brother P-Touch raster orientation.
 pub fn bitmap_to_raster_lines(bitmap: &LabelBitmap, max_px: u16) -> Vec<Vec<u8>> {
+    // Center the image vertically on the tape
+    let offset = ((max_px as usize) / 2).saturating_sub(bitmap.height() as usize / 2);
+    raster_lines_with_offset(bitmap, max_px, offset)
+}
+
+/// Like [`bitmap_to_raster_lines`], but places the band explicitly instead of
+/// centring it: `left_px` is the number of unused pins before the band, counted
+/// from pin 0 (the MSB of the first byte), as in the PT-P900 geometry table.
+///
+/// The top row of the bitmap lands on pin `left_px`.
+///
+/// E850-verified: which end of the head is the top of the tape is
+/// confirmed by the P-touch Editor "F" capture (2026-10-06): top row at the
+/// lowest pin, first raster line at the left edge of the label.
+pub fn bitmap_to_raster_lines_at(bitmap: &LabelBitmap, max_px: u16, left_px: u16) -> Vec<Vec<u8>> {
+    // Pixel indices count from the last pin (see `rasterline_setpixel`), so the
+    // distance from the far end is head width - left margin - band height.
+    let offset = (max_px as usize)
+        .saturating_sub(left_px as usize)
+        .saturating_sub(bitmap.height() as usize);
+    raster_lines_with_offset(bitmap, max_px, offset)
+}
+
+fn raster_lines_with_offset(bitmap: &LabelBitmap, max_px: u16, offset: usize) -> Vec<Vec<u8>> {
     let raster_size = (max_px as usize) / 8;
     let bmp_height = bitmap.height() as usize;
     let bmp_width = bitmap.width() as usize;
-
-    // Center the image vertically on the tape
-    let offset = ((max_px as usize) / 2).saturating_sub(bmp_height / 2);
 
     let mut lines = Vec::with_capacity(bmp_width);
 
@@ -115,6 +136,61 @@ mod tests {
         // When i=7, bmp_y=0, which is set -> pixel at offset+7 = 11
         // pixel 11 -> byte index = 2-1-11/8 = 2-1-1 = 0, bit = 11%8 = 3
         assert_eq!(lines[0][0], 0b0000_1000); // bit 3 set in byte 0
+    }
+
+    /// Index of the first and last set pin (pin 0 = MSB of byte 0).
+    fn ink_span(line: &[u8]) -> Option<(usize, usize)> {
+        let pins: Vec<usize> = (0..line.len() * 8)
+            .filter(|p| line[p / 8] & (0x80 >> (p % 8)) != 0)
+            .collect();
+        Some((*pins.first()?, *pins.last()?))
+    }
+
+    #[test]
+    fn test_band_placed_at_left_offset_12mm() {
+        // Full-height column on a 560 pin head, TZe 12mm: pins 213..=362.
+        let mut bmp = LabelBitmap::new(1, 150);
+        for y in 0..150 {
+            bmp.set_pixel(0, y, true);
+        }
+        let lines = bitmap_to_raster_lines_at(&bmp, 560, 213);
+        assert_eq!(lines[0].len(), 70);
+        assert_eq!(ink_span(&lines[0]), Some((213, 362)));
+    }
+
+    #[test]
+    fn test_band_placed_at_left_offset_36mm_and_9mm() {
+        for (left, pins) in [(61u16, 454u32), (235, 106), (240, 96)] {
+            let mut bmp = LabelBitmap::new(1, pins);
+            for y in 0..pins {
+                bmp.set_pixel(0, y, true);
+            }
+            let lines = bitmap_to_raster_lines_at(&bmp, 560, left);
+            assert_eq!(
+                ink_span(&lines[0]),
+                Some((left as usize, left as usize + pins as usize - 1))
+            );
+        }
+    }
+
+    #[test]
+    fn test_top_row_lands_on_lowest_pin() {
+        let mut bmp = LabelBitmap::new(1, 106);
+        bmp.set_pixel(0, 0, true); // top row only
+        let lines = bitmap_to_raster_lines_at(&bmp, 560, 235);
+        assert_eq!(ink_span(&lines[0]), Some((235, 235)));
+    }
+
+    #[test]
+    fn test_centred_and_explicit_agree_for_a_centred_band() {
+        let mut bmp = LabelBitmap::new(2, 100);
+        bmp.set_pixel(0, 3, true);
+        bmp.set_pixel(1, 90, true);
+        // 128 pin head, 100 pin band centred: left margin = 14.
+        assert_eq!(
+            bitmap_to_raster_lines(&bmp, 128),
+            bitmap_to_raster_lines_at(&bmp, 128, 14)
+        );
     }
 
     #[test]
