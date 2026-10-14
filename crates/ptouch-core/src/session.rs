@@ -29,6 +29,11 @@ pub(crate) trait Transport {
 /// Default timeout for byte transfers.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PT-18RZ pauses USB reception while feeding an internal buffer. A five-second
+/// write deadline truncates long jobs; measured pauses fit within 30 seconds.
+/// The USB transport polls cancellation while waiting for buffer space.
+const PRINT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Short timeout for flushing stale input.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -146,8 +151,9 @@ impl<T: Transport> PrinterSession<T> {
             Dialect::P300Bt => self.send(&p300bt::cmd_init())?,
         }
 
-        // Request and read status
-        self.get_status()?;
+        // Retain diagnostics, but do not initialize a device reporting an
+        // error or power-off notification for a new print job.
+        print_status_is_ready(self.get_status()?)?;
 
         if self
             .profile
@@ -211,7 +217,25 @@ impl<T: Transport> PrinterSession<T> {
                 }
                 Ok(n) => {
                     frames.push(&buf[..n]);
-                    response = frames.pop();
+                    while let Some(packet) = frames.pop() {
+                        // A late phase/completion notification from an earlier
+                        // page is not a reply to this status request.
+                        let status = match parse_status_packet(&packet, "Invalid status header") {
+                            Ok(status) => status,
+                            Err(error) => {
+                                self.flush_input()?;
+                                return Err(error);
+                            }
+                        };
+                        if matches!(status.status_type, 0 | 2 | 4) || status.has_error() {
+                            response = Some(status);
+                            break;
+                        }
+                        debug!(
+                            "Ignoring {} while awaiting a status reply",
+                            status.status_type_name()
+                        );
+                    }
                 }
                 Err(PtouchError::Timeout) => {
                     debug!("Status read timeout (attempt {})", attempt + 1);
@@ -230,7 +254,7 @@ impl<T: Transport> PrinterSession<T> {
             );
         }
 
-        let Some(response) = response else {
+        let Some(status) = response else {
             // Flush junk data before returning error
             self.flush_input()?;
             return Err(PtouchError::StatusError(format!(
@@ -238,14 +262,6 @@ impl<T: Transport> PrinterSession<T> {
                 frames.len(),
                 STATUS_PACKET_SIZE
             )));
-        };
-
-        let status = match parse_status_packet(&response, "Invalid status header") {
-            Ok(status) => status,
-            Err(error) => {
-                self.flush_input()?;
-                return Err(error);
-            }
         };
 
         debug!(
@@ -301,6 +317,10 @@ impl<T: Transport> PrinterSession<T> {
             return Err(PtouchError::NotInitialized);
         }
 
+        if let Some(status) = &self.status {
+            print_status_is_ready(status)?;
+        }
+
         if quality != protocol::PrintQuality::Standard
             && !self.profile.flags.contains(DeviceFlags::LEGACY_HIRES)
         {
@@ -329,6 +349,17 @@ impl<T: Transport> PrinterSession<T> {
         };
 
         let job = protocol::build_print_job(lines, self.profile.flags, &opts);
+        info!(
+            "Print job: model={}, tape={}mm, input_lines={}, length={:.2}mm, dpi={}, quality={:?}, wire_bytes={}, final={:02x?}",
+            self.profile.name,
+            opts.media_width,
+            lines.len(),
+            lines.len() as f64 * 25.4 / f64::from(self.profile.dpi),
+            self.profile.dpi,
+            quality,
+            job.iter().map(Vec::len).sum::<usize>(),
+            job.last().unwrap_or(&Vec::new())
+        );
         let started = Instant::now();
         if let Err(error) = self.send_job(job) {
             self.initialized = false;
@@ -365,6 +396,10 @@ impl<T: Transport> PrinterSession<T> {
             return Err(PtouchError::NotInitialized);
         }
 
+        if let Some(status) = &self.status {
+            print_status_is_ready(status)?;
+        }
+
         // One blank line makes the printer engage the feed mechanism.
         let lines = vec![protocol::rasterline_blank(self.profile.raster_width_px)];
         let opts = protocol::JobOptions {
@@ -398,16 +433,54 @@ impl<T: Transport> PrinterSession<T> {
 
     fn send_job(&self, job: Vec<Vec<u8>>) -> Result<()> {
         let start = Instant::now();
-        for chunk in job {
+        let total_chunks = job.len();
+        let mut sent_bytes = 0usize;
+        let mut sent_lines = 0usize;
+        for (index, chunk) in job.into_iter().enumerate() {
             self.cancellation.check()?;
             let remaining = self
                 .job_timeout
                 .checked_sub(start.elapsed())
                 .filter(|duration| *duration >= PRINT_STATUS_MIN_POLL_TIMEOUT)
                 .ok_or(PtouchError::Timeout)?;
-            self.transport
-                .send(&chunk, remaining.min(TRANSFER_TIMEOUT))?;
+            let transfer_timeout = match self.profile.dialect {
+                Dialect::Usb => PRINT_TRANSFER_TIMEOUT,
+                Dialect::P300Bt => TRANSFER_TIMEOUT,
+            };
+            let command_started = Instant::now();
+            if let Err(error) = self.transport.send(&chunk, remaining.min(transfer_timeout)) {
+                warn!(
+                    "Print transfer stopped at command {}/{}, after {} raster lines and {} bytes: {}",
+                    index + 1,
+                    total_chunks,
+                    sent_lines,
+                    sent_bytes,
+                    error
+                );
+                return Err(error);
+            }
+            if command_started.elapsed() >= Duration::from_secs(1) {
+                debug!(
+                    "Command {} resumed after {:.3}s of USB flow control",
+                    index + 1,
+                    command_started.elapsed().as_secs_f64()
+                );
+            }
+            sent_bytes += chunk.len();
+            if chunk.first() == Some(&0x47) || chunk == [0x5a] {
+                sent_lines += 1;
+                if sent_lines.is_multiple_of(1024) {
+                    debug!("Sent {} raster lines, {} bytes", sent_lines, sent_bytes);
+                }
+            }
         }
+        debug!(
+            "Sent all {} commands, {} raster lines, {} bytes in {:.3}s; awaiting device status",
+            total_chunks,
+            sent_lines,
+            sent_bytes,
+            start.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -437,8 +510,7 @@ impl<T: Transport> PrinterSession<T> {
         let completion_timeout = self
             .job_timeout
             .checked_sub(job_started.elapsed())
-            .unwrap_or_default()
-            .min(TRANSFER_TIMEOUT);
+            .unwrap_or_default();
         let mut frames = StatusFrameBuffer::new();
         loop {
             let remaining = completion_timeout
@@ -456,8 +528,11 @@ impl<T: Transport> PrinterSession<T> {
                     frames.push(&response[..n]);
                     if let Some(packet) = frames.pop() {
                         let status = parse_status_packet(&packet, "Invalid completion header")?;
-                        let ready = print_status_is_ready(&status)?;
-                        if status.status_type == 1 || ready {
+                        // Streaming models can report a receiving phase between
+                        // internal buffers, before the final raster data prints.
+                        // Only a completion notification confirms this page.
+                        print_status_is_ready(&status)?;
+                        if status.status_type == 1 {
                             self.status = Some(status);
                             return Ok(());
                         }
@@ -731,6 +806,7 @@ fn parse_status_packet(
     response: &[u8; STATUS_PACKET_SIZE],
     invalid_header_message: &str,
 ) -> Result<PrinterStatus> {
+    debug!("Raw printer status: {:02x?}", response);
     let status = PrinterStatus::from_bytes(response)
         .ok_or_else(|| PtouchError::StatusError("Failed to parse status packet".to_string()))?;
 
@@ -859,6 +935,9 @@ mod tests {
         writes: std::cell::RefCell<Vec<Vec<u8>>>,
         fail_on_write: std::cell::Cell<Option<usize>>,
         reads: std::cell::RefCell<VecDeque<Vec<u8>>>,
+        first_read_delay: std::cell::Cell<Duration>,
+        write_timeouts: std::cell::RefCell<Vec<Duration>>,
+        status_reply: std::cell::Cell<Option<[u8; STATUS_PACKET_SIZE]>>,
         // Prove the session works with a transport that cannot cross threads.
         _owner: std::rc::Rc<()>,
     }
@@ -868,13 +947,17 @@ mod tests {
                 writes: Default::default(),
                 fail_on_write: Default::default(),
                 reads: Default::default(),
+                first_read_delay: Default::default(),
+                write_timeouts: Default::default(),
+                status_reply: Default::default(),
                 _owner: std::rc::Rc::new(()),
             }
         }
     }
     impl Transport for ScriptedTransport {
-        fn send(&self, data: &[u8], _timeout: Duration) -> Result<()> {
+        fn send(&self, data: &[u8], timeout: Duration) -> Result<()> {
             self.writes.borrow_mut().push(data.to_vec());
+            self.write_timeouts.borrow_mut().push(timeout);
             if self.fail_on_write.get() == Some(self.writes.borrow().len()) {
                 return Err(PtouchError::SendFailed("Injected transfer failure".into()));
             }
@@ -884,6 +967,7 @@ mod tests {
                 packet[3] = 0x30;
                 packet[4] = 0x72;
                 packet[10] = 12;
+                let packet = self.status_reply.take().unwrap_or(packet);
                 self.reads
                     .borrow_mut()
                     .extend([packet[..11].to_vec(), packet[11..].to_vec()]);
@@ -891,6 +975,7 @@ mod tests {
             Ok(())
         }
         fn receive(&self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
+            std::thread::sleep(self.first_read_delay.replace(Duration::ZERO));
             let bytes = self
                 .reads
                 .borrow_mut()
@@ -1119,15 +1204,161 @@ mod tests {
             vec![vec![0x1b, 0x69, 0x52, 1], vec![0x5a], raster, vec![0x1a]]
         );
     }
+
+    #[test]
+    fn usb_completion_uses_job_deadline_instead_of_five_second_transfer_timeout() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.initialized = true;
+        session.job_timeout = Duration::from_secs(8);
+        // The first notification arrives after the old five-second deadline.
+        // A printing phase is followed by the actual completion notification.
+        session
+            .transport
+            .first_read_delay
+            .set(Duration::from_millis(5100));
+        session
+            .transport
+            .reads
+            .borrow_mut()
+            .extend([status_packet(6, 1).to_vec(), status_packet(1, 1).to_vec()]);
+        session
+            .print_raster(
+                &[vec![0; 16]],
+                false,
+                false,
+                protocol::PrintQuality::Standard,
+            )
+            .unwrap();
+        assert_eq!(session.status().unwrap().status_type, 1);
+        assert!(session.is_initialized());
+    }
+
+    #[test]
+    fn usb_receiving_phase_does_not_hide_a_later_print_error() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.initialized = true;
+        let mut error = status_packet(2, 1);
+        error[9] = 4;
+        session
+            .transport
+            .reads
+            .borrow_mut()
+            .extend([status_packet(6, 0).to_vec(), error.to_vec()]);
+        assert!(matches!(
+            session.print_raster(&[vec![0; 16]], false, false, protocol::PrintQuality::Standard),
+            Err(PtouchError::StatusError(message)) if message == "Communication error"
+        ));
+        assert!(!session.is_initialized());
+    }
+
+    #[test]
+    fn usb_status_request_ignores_late_phase_notifications() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session
+            .transport
+            .reads
+            .borrow_mut()
+            .push_back(status_packet(6, 1).to_vec());
+        assert_eq!(session.get_status().unwrap().status_type, 0);
+        assert!(session.transport.reads.borrow().is_empty());
+    }
+
+    #[test]
+    fn usb_initialization_rejects_device_errors_but_retains_diagnostics() {
+        for (kind, error_bits, message) in [
+            (0, 4, "Communication error"),
+            (2, 0, "Printer reported an unspecified error"),
+            (4, 0, "Printer turned off"),
+        ] {
+            let mut session = usb_session(DeviceFlags::AUTO_STATUS_NOTIFICATION);
+            let mut packet = status_packet(kind, 0);
+            packet[9] = error_bits;
+            session.transport.status_reply.set(Some(packet));
+            assert!(
+                matches!(session.init(), Err(PtouchError::StatusError(actual)) if actual == message)
+            );
+            assert!(!session.is_initialized());
+            assert_eq!(session.status().unwrap().status_type, kind);
+            assert_eq!(session.status().unwrap().error_info_2, error_bits);
+            assert_eq!(
+                *session.transport.writes.borrow(),
+                [protocol::cmd_init(), protocol::cmd_status_request()]
+            );
+        }
+    }
+
+    #[test]
+    fn usb_print_and_feed_reject_errors_observed_after_initialization() {
+        for (kind, error_bits) in [(0, 4), (2, 0), (4, 0)] {
+            let mut session = usb_session(DeviceFlags::NONE);
+            session.init().unwrap();
+            let mut packet = status_packet(kind, 0);
+            packet[9] = error_bits;
+            session.transport.status_reply.set(Some(packet));
+            // Queries still return the device's diagnostic information.
+            assert_eq!(session.query_status().unwrap().status_type, kind);
+            session.transport.writes.borrow_mut().clear();
+            assert!(matches!(
+                session.print_raster(
+                    &[vec![0; 16]],
+                    false,
+                    false,
+                    protocol::PrintQuality::Standard
+                ),
+                Err(PtouchError::StatusError(_))
+            ));
+            assert!(matches!(
+                session.feed_and_cut(),
+                Err(PtouchError::StatusError(_))
+            ));
+            assert!(session.transport.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn usb_print_transfer_budget_allows_backpressure_and_respects_job_deadline() {
+        for seconds in [2, 60] {
+            let mut session = usb_session(DeviceFlags::NONE);
+            session.initialized = true;
+            session.job_timeout = Duration::from_secs(seconds);
+            session
+                .transport
+                .reads
+                .borrow_mut()
+                .push_back(status_packet(1, 1).to_vec());
+            session
+                .print_raster(
+                    &[vec![0; 16]],
+                    false,
+                    false,
+                    protocol::PrintQuality::Standard,
+                )
+                .unwrap();
+            for timeout in session.transport.write_timeouts.borrow().iter() {
+                assert!(*timeout >= Duration::from_millis(1));
+                assert!(*timeout <= Duration::from_secs(seconds.min(30)));
+                if seconds == 60 {
+                    assert_eq!(*timeout, Duration::from_secs(30));
+                }
+            }
+        }
+    }
     #[test]
     fn usb_session_query_does_not_reset_or_enable_notifications() {
-        let mut session = usb_session(DeviceFlags::AUTO_STATUS_NOTIFICATION);
-        session.query_status().unwrap();
-        assert_eq!(
-            *session.transport.writes.borrow(),
-            vec![vec![0x1b, 0x69, 0x53]]
-        );
-        assert!(!session.is_initialized());
+        for (kind, error_bits) in [(0, 0), (0, 4), (2, 0), (4, 0)] {
+            let mut session = usb_session(DeviceFlags::AUTO_STATUS_NOTIFICATION);
+            let mut packet = status_packet(kind, 0);
+            packet[9] = error_bits;
+            session.transport.status_reply.set(Some(packet));
+            let status = session.query_status().unwrap();
+            assert_eq!(status.status_type, kind);
+            assert_eq!(status.error_info_2, error_bits);
+            assert_eq!(
+                *session.transport.writes.borrow(),
+                vec![vec![0x1b, 0x69, 0x53]]
+            );
+            assert!(!session.is_initialized());
+        }
     }
 
     #[test]
