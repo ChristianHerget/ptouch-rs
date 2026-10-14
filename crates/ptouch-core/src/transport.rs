@@ -9,6 +9,7 @@
 
 use crate::session::{PrinterSession, Transport};
 use crate::{
+    CancellationToken,
     device::{self, DeviceFlags, DeviceInfo},
     error::{PtouchError, Result},
     protocol,
@@ -16,38 +17,31 @@ use crate::{
 };
 use log::{debug, info};
 use rusb::{Context, Device, DeviceHandle, UsbContext};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const USB_INTERFACE: u8 = 0;
+const USB_WRITE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+const USB_MIN_TIMEOUT: Duration = Duration::from_millis(1);
+const USB_ZERO_WRITE_DELAY: Duration = Duration::from_millis(10);
 
 struct UsbTransport {
     handle: DeviceHandle<Context>,
     ep_out: u8,
     ep_in: u8,
+    cancellation: CancellationToken,
 }
 
 impl Transport for UsbTransport {
     fn send(&self, data: &[u8], timeout: Duration) -> Result<()> {
-        let written = self
-            .handle
-            .write_bulk(self.ep_out, data, timeout)
-            .map_err(|e| {
-                if e == rusb::Error::Timeout {
-                    PtouchError::Timeout
-                } else {
-                    PtouchError::UsbError(e)
-                }
-            })?;
-
-        if written != data.len() {
-            return Err(PtouchError::SendFailed(format!(
-                "Expected to write {} bytes, wrote {}",
-                data.len(),
-                written
-            )));
-        }
-
-        Ok(())
+        let started = Instant::now();
+        send_usb_bytes(
+            data,
+            timeout,
+            &self.cancellation,
+            |remaining, poll_timeout| self.handle.write_bulk(self.ep_out, remaining, poll_timeout),
+            || started.elapsed(),
+            std::thread::sleep,
+        )
     }
 
     fn receive(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
@@ -69,6 +63,44 @@ impl Transport for UsbTransport {
         self.handle.release_interface(USB_INTERFACE)?;
         Ok(())
     }
+}
+
+/// Continue a USB byte stream through flow-control pauses without replaying bytes.
+///
+/// rusb 0.9 returns `Ok(n)` when libusb times out after a partial transfer, and
+/// `Err(Timeout)` only when no bytes were transferred. Keep that byte count here;
+/// retrying the transport-independent `send` operation could repeat a prefix.
+/// The clock and pause callbacks make deadline and cancellation tests deterministic.
+fn send_usb_bytes(
+    data: &[u8],
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    mut write: impl FnMut(&[u8], Duration) -> rusb::Result<usize>,
+    elapsed: impl Fn() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        cancellation.check()?;
+        let remaining = timeout
+            .checked_sub(elapsed())
+            .filter(|duration| *duration >= USB_MIN_TIMEOUT)
+            .ok_or(PtouchError::Timeout)?;
+        let pending = &data[offset..];
+        match write(pending, remaining.min(USB_WRITE_POLL_TIMEOUT)) {
+            Ok(written) if written > pending.len() => {
+                return Err(PtouchError::SendFailed(format!(
+                    "USB write reported {written} bytes for a {}-byte buffer",
+                    pending.len()
+                )));
+            }
+            Ok(0) => pause(timeout.saturating_sub(elapsed()).min(USB_ZERO_WRITE_DELAY)),
+            Ok(written) => offset += written,
+            Err(rusb::Error::Timeout) => {}
+            Err(error) => return Err(PtouchError::UsbError(error)),
+        }
+    }
+    Ok(())
 }
 
 enum UsbBackend {
@@ -302,6 +334,7 @@ impl PtouchDevice {
                     handle,
                     ep_out: endpoints.out,
                     ep_in: endpoints.input,
+                    cancellation: CancellationToken::default(),
                 }),
                 (&dev_info).into(),
             ),
@@ -310,11 +343,13 @@ impl PtouchDevice {
     }
 
     /// Set a fresh cancellation token before initialization or a job.
-    /// A blocked USB transfer returns within its transfer timeout (at most five seconds).
+    /// USB writes check cancellation between transfers bounded to 250 milliseconds.
+    /// A blocked status read returns within its transfer timeout.
     pub fn set_cancellation_token(&mut self, token: crate::CancellationToken) {
-        #[cfg(windows)]
-        if let UsbBackend::UsbPrint(transport) = &mut self.session.transport {
-            transport.set_cancellation(token.clone());
+        match &mut self.session.transport {
+            UsbBackend::Libusb(transport) => transport.cancellation = token.clone(),
+            #[cfg(windows)]
+            UsbBackend::UsbPrint(transport) => transport.set_cancellation(token.clone()),
         }
         self.session.cancellation = token;
     }
@@ -519,7 +554,188 @@ fn select_bulk_endpoints(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn usb_write_resumes_only_the_unwritten_suffix_after_partial_progress() {
+        let mut writes = Vec::new();
+        let mut results = [Ok(2), Err(rusb::Error::Timeout), Ok(4)].into_iter();
+        send_usb_bytes(
+            &[1, 2, 3, 4, 5, 6],
+            Duration::from_secs(30),
+            &CancellationToken::default(),
+            |data, timeout| {
+                assert_eq!(timeout, USB_WRITE_POLL_TIMEOUT);
+                writes.push(data.to_vec());
+                results.next().expect("unexpected replay")
+            },
+            || Duration::ZERO,
+            |_| panic!("nonzero writes do not need pacing"),
+        )
+        .unwrap();
+        assert_eq!(
+            writes,
+            [vec![1, 2, 3, 4, 5, 6], vec![3, 4, 5, 6], vec![3, 4, 5, 6]]
+        );
+    }
+
+    #[test]
+    fn usb_write_checks_cancellation_before_sending_and_after_a_partial_transfer() {
+        for cancel_before_write in [true, false] {
+            let token = CancellationToken::default();
+            if cancel_before_write {
+                token.cancel();
+            }
+            let mut writes = 0;
+            let result = send_usb_bytes(
+                &[1, 2, 3],
+                Duration::from_secs(30),
+                &token,
+                |_, _| {
+                    writes += 1;
+                    token.cancel();
+                    Ok(1)
+                },
+                || Duration::ZERO,
+                |_| {},
+            );
+            assert!(matches!(result, Err(PtouchError::Cancelled)));
+            assert_eq!(writes, usize::from(!cancel_before_write));
+        }
+    }
+
+    #[test]
+    fn usb_write_uses_one_deadline_across_progress_and_timeouts() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut poll_timeouts = Vec::new();
+        let mut writes = Vec::new();
+        let result = send_usb_bytes(
+            &[1, 2, 3],
+            Duration::from_millis(600),
+            &CancellationToken::default(),
+            |data, timeout| {
+                poll_timeouts.push(timeout);
+                writes.push(data.to_vec());
+                elapsed.set(elapsed.get() + timeout);
+                if writes.len() == 1 {
+                    Ok(1)
+                } else {
+                    Err(rusb::Error::Timeout)
+                }
+            },
+            || elapsed.get(),
+            |_| {},
+        );
+        assert!(matches!(result, Err(PtouchError::Timeout)));
+        assert_eq!(
+            poll_timeouts,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(250),
+                Duration::from_millis(100)
+            ]
+        );
+        assert_eq!(writes, [vec![1, 2, 3], vec![2, 3], vec![2, 3]]);
+    }
+
+    #[test]
+    fn usb_write_aborts_on_disconnect_or_other_non_timeout_errors() {
+        for error in [
+            rusb::Error::NoDevice,
+            rusb::Error::Pipe,
+            rusb::Error::Io,
+            rusb::Error::Interrupted,
+        ] {
+            let mut writes = 0;
+            let result = send_usb_bytes(
+                &[1, 2, 3],
+                Duration::from_secs(30),
+                &CancellationToken::default(),
+                |data, _| {
+                    writes += 1;
+                    match writes {
+                        1 => Ok(1),
+                        2 => {
+                            assert_eq!(data, [2, 3]);
+                            Err(error)
+                        }
+                        _ => panic!("must not retry a failed transfer"),
+                    }
+                },
+                || Duration::ZERO,
+                |_| {},
+            );
+            assert!(matches!(result, Err(PtouchError::UsbError(actual)) if actual == error));
+            assert_eq!(writes, 2);
+        }
+    }
+
+    #[test]
+    fn usb_write_never_passes_a_submillisecond_timeout_to_libusb() {
+        for already_elapsed in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut writes = 0;
+            let result = send_usb_bytes(
+                &[1],
+                already_elapsed + Duration::from_micros(999),
+                &CancellationToken::default(),
+                |_, _| {
+                    writes += 1;
+                    Ok(1)
+                },
+                || already_elapsed,
+                |_| {},
+            );
+            assert!(matches!(result, Err(PtouchError::Timeout)));
+            assert_eq!(writes, 0);
+        }
+    }
+
+    #[test]
+    fn usb_zero_length_writes_are_paced_and_still_obey_the_deadline() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut pauses = Vec::new();
+        let mut writes = 0;
+        let result = send_usb_bytes(
+            &[1],
+            Duration::from_millis(25),
+            &CancellationToken::default(),
+            |_, _| {
+                writes += 1;
+                Ok(0)
+            },
+            || elapsed.get(),
+            |duration| {
+                pauses.push(duration);
+                elapsed.set(elapsed.get() + duration);
+            },
+        );
+        assert!(matches!(result, Err(PtouchError::Timeout)));
+        assert_eq!(writes, 3);
+        assert_eq!(
+            pauses,
+            [
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(5)
+            ]
+        );
+    }
+
+    #[test]
+    fn usb_write_rejects_an_impossible_byte_count() {
+        let result = send_usb_bytes(
+            &[1],
+            Duration::from_secs(1),
+            &CancellationToken::default(),
+            |_, _| Ok(2),
+            || Duration::ZERO,
+            |_| {},
+        );
+        assert!(matches!(result, Err(PtouchError::SendFailed(_))));
+    }
+
     #[test]
     fn endpoint_pair_cannot_cross_alternate_settings() {
         assert!(matches!(

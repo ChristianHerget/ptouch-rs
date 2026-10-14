@@ -402,10 +402,17 @@ USB locations in its Connection selector and preserves connection error messages
 Windows instance IDs can include serial numbers; redact them before sharing.
 
 USB jobs have a ten-minute send/readiness limit. Override it with `--job-timeout`
-(`--timeout` remains an alias). The GUI's Cancel button stops further USB work;
-an in-flight transfer can take up to five seconds to return. Sent data cannot
-be recalled. A missing completion/readiness notification reports an unconfirmed
-outcome and stops a batch. Check the printer before retrying to avoid duplicates.
+(`--timeout` remains an alias). During printing, the libusb backend allows up to
+30 seconds per write for printer flow control, bounded by the remaining job
+budget. It checks cancellation every 250 milliseconds and resumes partial writes
+from the first unacknowledged byte. Initialization and status-query commands
+retain their five-second transfer limit.
+
+The GUI's Cancel button stops further USB work; sent data cannot be recalled.
+Completion uses the remaining job budget. A missing completion/readiness
+notification reports an unconfirmed outcome and stops a batch; an intermediate
+receiving phase alone does not confirm completion on printers without a separate
+readiness handshake. Check the printer before retrying to avoid duplicates.
 This also applies to older models that previously treated completion timeouts
 as success. Reinitialize a library session after a failed or cancelled job.
 
