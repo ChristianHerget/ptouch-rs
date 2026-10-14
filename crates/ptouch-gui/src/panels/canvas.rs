@@ -107,6 +107,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     );
     let texture_id = texture.id();
     let dpi = state.target_dpi();
+    // Outer None means no click; Some(None) explicitly clears selection.
     let mut selection = None;
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -196,7 +197,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             if response.clicked()
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                selection = hit(pos);
+                selection = Some(hit(pos));
             }
             if can_drag
                 && response.drag_started()
@@ -209,7 +210,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     hit(start)
                 };
                 if let Some(index) = index {
-                    selection = Some(index);
+                    selection = Some(Some(index));
                     if let Some(object) = state.elements[index].as_object() {
                         let left_mm = state
                             .element_rect_mm(index)
@@ -258,8 +259,8 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.ctx().data_mut(|data| data.remove::<CanvasDrag>(drag_id));
             }
         });
-    if let Some(index) = selection {
-        state.selected_element = Some(index);
+    if let Some(selection) = selection {
+        state.selected_element = selection;
     }
     if can_drag {
         keyboard_move(ui, state, dpi);
@@ -442,6 +443,79 @@ mod tests {
             flip_h: false,
             flip_v: false,
         }
+    }
+
+    #[test]
+    fn clicking_blank_canvas_deselects_and_arrow_keys_leave_objects_in_place() {
+        use ptouch_render::document::{LabelElement, LabelObject};
+        let context = egui::Context::default();
+        let mut state = AppState {
+            zoom_fit: false,
+            zoom: 2.0,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "A",
+                TextBox {
+                    x_mm: 5.0,
+                    ..TextBox::default()
+                },
+            ))],
+            selected_element: Some(0),
+            preview_bitmap: Some(ptouch_render::bitmap::LabelBitmap::new(200, 76)),
+            preview_bounds: vec![ElementBounds {
+                element_index: 0,
+                x: 35,
+                y: 0,
+                width: 71,
+                height: 57,
+            }],
+            ..AppState::default()
+        };
+        state.preview_texture = Some(context.load_texture(
+            "test_canvas",
+            egui::ColorImage::filled([200, 76], egui::Color32::WHITE),
+            Default::default(),
+        ));
+        let blank = egui::pos2(500.0, 400.0);
+        for events in [
+            vec![],
+            vec![
+                egui::Event::PointerMoved(blank),
+                egui::Event::PointerButton {
+                    pos: blank,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            vec![egui::Event::PointerButton {
+                pos: blank,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        ] {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_canvas(ui, &mut state),
+            );
+            output.textures_delta.clear();
+        }
+        assert_eq!(state.selected_element, None);
+        assert_eq!(state.elements[0].as_object().unwrap().frame.x_mm, 5.0);
     }
 
     #[test]

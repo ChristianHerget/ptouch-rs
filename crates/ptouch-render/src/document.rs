@@ -177,12 +177,14 @@ impl LabelDocument {
 
     /// Explicitly convert the current layout into editable physical objects.
     ///
-    /// Positions and occupied sizes are frozen at the supplied output DPI,
-    /// including padding. Text and image content stays editable; legacy auto
+    /// Existing physical geometry is preserved exactly; legacy pixel positions
+    /// and sizes (including padding) are frozen at the supplied output DPI.
+    /// Text and image content stays editable; legacy auto
     /// sizing and image cropping can change under the new fixed-frame fitting
     /// rules. Opening or saving an old document never invokes this conversion.
-    /// Empty legacy text receives a default frame and zero-width padding gets
-    /// a one-output-pixel frame so both remain selectable in an editor.
+    /// Empty legacy text and zero-width padding receive selectable frames
+    /// inside the existing extent, preserving whole-label mirror positions.
+    /// If the original label has no extent, empty text gets a default frame.
     pub fn convert_to_free_layout(
         &mut self,
         tape_width_px: u32,
