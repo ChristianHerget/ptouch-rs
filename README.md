@@ -10,6 +10,8 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 - Print text labels with custom font, size, alignment and rotation
 - Print images (PNG, JPEG, GIF, BMP, TIFF, WebP, SVG, and more)
 - Compose multi-element labels (text + image + cut mark + padding)
+- Position fixed text boxes in millimeters, with absolute coordinates or gaps
+  after the previous box; preview with a millimeter ruler
 - Save and reload designs as self-contained `.ptl` layout files (images
   embedded), then print them from the GUI or CLI
 - Template layouts with `{{name}}` placeholders and batch-print from a CSV
@@ -149,6 +151,9 @@ printer worker. This mode requires a working display and OpenGL context.
 ptouch-gui
 ```
 
+Use `ptouch-gui --offline` to edit and export without opening or polling USB or
+Bluetooth devices. The preview uses the layout's saved design DPI.
+
 - Live label preview with zoom
 - Add/edit/reorder text, images, cut marks, padding
 - Free-angle text rotation with auto font sizing
@@ -196,10 +201,84 @@ ptouch info
 ptouch list
 ```
 
+### Free layout and precise patch-panel labels
+
+New GUI layouts use physical objects for text, images, and cut marks. Each has a
+millimeter frame with width, height, X/Y position, rotation, and mirroring. Drag
+an object on the canvas to move it, or drag its square handle to resize it. The
+optional 0.1 mm snap and arrow keys allow fine adjustments (Shift moves 1 mm).
+Turn off whole-label horizontal mirroring before dragging; numeric properties
+and each object's own mirroring remain available. This avoids an ambiguous drag
+origin when the mirrored label's total length changes.
+The ruler follows the original print pixels even when a long preview texture
+is reduced for display.
+
+New text starts as a 10 mm wide box with automatic font size; its height is
+8 mm or the printable height, whichever is smaller. The first object starts at
+X=0, Y=0. Subsequent objects start 3 mm after the rightmost object, using absolute
+coordinates. Images keep their aspect ratio and fit inside their frames.
+
+Choose **After previous** to position a frame after the previous element's right
+edge with a specified gap. Empty text still reserves the whole box, so template
+values do not shift later ports. Dragging a relative frame changes its gap; if
+it crosses to the left of its predecessor's right edge, it becomes absolute to
+allow overlap. Dragging list rows or using Up/Down changes composition order:
+absolute coordinates stay fixed, while relative objects follow their new
+predecessors. Black pixels combine at overlaps; white pixels do not erase other
+objects. The list order also determines which overlapping object is selected.
+
+Text rotates inside its fixed frame. Auto font size fits both dimensions without
+stretching letters; an explicit size uses points and clipped text raises a
+warning. Images rotate and then fit proportionally inside their frames. Rotation
+does not change the frame's position or move a following relative object.
+
+The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
+at 5, 18, and 31 mm, with 3 mm gaps:
+
+```sh
+# Offline preview at the saved design DPI; an empty second port retains its box
+ptouch print --layout examples/patch-panel.ptl \
+  --set port1=LAN1 --set port2= --set port3=UPLINK -o patch-panel.png
+
+# Print the complete layout as one label, with no cuts between ports
+ptouch print --layout examples/patch-panel.ptl \
+  --set port1=LAN1 --set port2=LAN2 --set port3=UPLINK
+```
+
+Coordinates start at the **printable area's top-left**, not the physical tape
+edge or cut. Printer feed and cutter offsets can add leading tape; verify those
+on the device before using the first coordinate as a cut-edge measurement.
+Box width and height describe the final container after text rotation. Text is
+rotated, aligned, clipped, and then mirrored inside that container. Overlapping
+elements combine their black pixels. Each element sets the next relative start
+to its own right edge, even if it was moved backwards with absolute positioning.
+Negative/non-finite coordinates, zero or excessive dimensions, and boxes beyond
+the printable tape height are errors. Bounds are rounded from absolute physical
+positions, so repeated ports do not accumulate pixel-rounding drift.
+
+New free layouts use format version 3, which older builds reject. Versions 1
+and 2 remain readable and retain their original layout behavior; opening and
+saving an unchanged legacy layout preserves its version. **Convert to free
+layout** explicitly freezes the current positions into physical frames. Review
+the result before saving: legacy automatic text sizing and rotated images may
+fit differently in fixed frames. Conversion keeps Padding as an empty physical
+frame, preserving its occupied space. New free layouts use coordinates/gaps and
+do not offer a Padding insertion button; legacy layouts retain it.
+
+Legacy unboxed text, padding, image sizes, and font margins keep their existing
+pixel units. Fixed text frame font sizes use points (1/72 inch).
+Offline export uses the saved `dpi`; printing uses the device DPI to preserve
+millimeter positions. The GUI saves a separate design DPI and shows the current
+preview DPI. A printer disconnect keeps the last printer preview until **Use
+design DPI** is selected. `--tape-width` changes the exported printable height in
+pixels, not the layout DPI or its millimeter coordinates.
+
 ### Layout templates and batch printing
 
-Text in a layout may contain `{{name}}` placeholders. Fill them per print, or
-drive a batch from a CSV file.
+Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
+per print, or drive a batch from a CSV file. The GUI edits and saves placeholders
+but does not have a variable-value form; its preview shows the literal tokens.
+CLI substitution changes only text content, preserving object geometry.
 
 By default, USB CSV batches print as one continuous strip, including all
 `--copies`, with final feed/cut only after the last row. `--chain` skips that final step. Printers

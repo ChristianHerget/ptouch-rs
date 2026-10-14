@@ -12,6 +12,7 @@ pub mod compose;
 pub mod document;
 pub mod font;
 pub mod image_loader;
+pub mod layout;
 pub mod raster;
 pub mod text;
 

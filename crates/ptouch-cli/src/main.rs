@@ -842,7 +842,8 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
 
     // Whole-label mirroring applies once, after the label is composed.
     let bitmap = build_label(args, print_width)?.mirrored(args.flip_h, args.flip_v);
-    emit_label(&bitmap, args, max_px, device.as_mut())?;
+    let dpi = device.as_ref().map_or(180, |dev| dev.dpi());
+    emit_label(&bitmap, args, max_px, dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -898,8 +899,9 @@ fn print_layout(args: &PrintArgs, layout_path: &str) -> Result<(), Box<dyn std::
     doc.apply_values(&values);
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
-    let bitmap = render_layout(&doc, print_width)?;
-    emit_label(&bitmap, args, max_px, device.as_mut())?;
+    let target_dpi = device.as_ref().map_or(doc.dpi, |dev| dev.dpi());
+    let bitmap = render_layout(&doc, print_width, target_dpi)?;
+    emit_label(&bitmap, args, max_px, target_dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -937,6 +939,7 @@ fn print_layout_batch(
     validate_vars(&doc.placeholders(), &provided, args.allow_missing)?;
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
+    let target_dpi = device.as_ref().map_or(doc.dpi, |dev| dev.dpi());
 
     let labels = rdr.records().map(|record| {
         let record = record?;
@@ -944,7 +947,7 @@ fn print_layout_batch(
         let values = build_row_values(&base, &headers, &row);
         let mut row_doc = doc.clone();
         row_doc.apply_values(&values);
-        render_layout(&row_doc, print_width)
+        render_layout(&row_doc, print_width, target_dpi)
     });
     let count = emit_batch(labels, args, max_px, device.as_mut())?;
 
@@ -1010,18 +1013,16 @@ fn build_row_values(
 fn render_layout(
     doc: &LabelDocument,
     print_width: u32,
+    target_dpi: u16,
 ) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
     let mut renderer = TextRenderer::new();
-    let bitmap = document::render_elements(
-        &doc.elements,
-        print_width,
-        &doc.font_name,
-        doc.font_margin,
-        &mut renderer,
-    )?
-    .ok_or_else(|| PtouchError::SendFailed("layout produced no output".to_string()))?;
-    // The layout's saved whole-label flip is applied after composition.
-    Ok(bitmap.mirrored(doc.flip_h, doc.flip_v))
+    let rendered = document::render_document(doc, print_width, target_dpi, &mut renderer)?;
+    for diagnostic in rendered.diagnostics {
+        eprintln!("WARN: {diagnostic}");
+    }
+    Ok(rendered
+        .bitmap
+        .ok_or_else(|| PtouchError::SendFailed("layout produced no output".to_string()))?)
 }
 
 /// Resolve the print width, max pixels, and optional device for a layout.
@@ -1087,11 +1088,11 @@ fn emit_label(
     bitmap: &LabelBitmap,
     args: &PrintArgs,
     max_px: u16,
+    dpi: u16,
     device: Option<&mut CliDevice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref output_path) = args.output {
         bitmap.save(Path::new(output_path))?;
-        let dpi = device.as_ref().map_or(180, |d| d.dpi());
         let tape_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
         println!(
             "Saved to '{}' ({}x{} px, {:.1} mm of tape)",
@@ -1252,6 +1253,221 @@ fn print_to_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use document::{LabelElement, LabelObject, ObjectContent, PositionMode, TextBox};
+
+    fn free_layout_fixture(dir: &Path, dpi: u16) -> LabelDocument {
+        let image_path = dir.join("original.png");
+        let mut image = LabelBitmap::new(16, 8);
+        for y in 1..7 {
+            for x in 1..4 {
+                image.set_pixel(x, y, true);
+            }
+        }
+        image.set_pixel(10, 2, true);
+        image.save(&image_path).unwrap();
+        let image_data = std::fs::read(&image_path).unwrap();
+        std::fs::remove_file(&image_path).unwrap();
+
+        let mut text = LabelObject::text(
+            "{{port}}{{suffix}}",
+            TextBox {
+                x_mm: 2.0,
+                y_mm: 0.5,
+                width_mm: 8.0,
+                height_mm: 4.0,
+                ..TextBox::default()
+            },
+        );
+        text.rotation = 90.0;
+        text.flip_h = true;
+        let mut image = LabelObject::image_from_bytes(
+            Some(image_path),
+            image_data,
+            TextBox {
+                position: PositionMode::Relative,
+                gap_mm: 2.0,
+                y_mm: 1.0,
+                width_mm: 6.0,
+                height_mm: 4.0,
+                ..TextBox::default()
+            },
+        );
+        image.rotation = 90.0;
+        image.flip_v = true;
+
+        LabelDocument {
+            version: 3,
+            tape_width_mm: 12,
+            dpi,
+            font_name: String::new(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![
+                LabelElement::Object(text),
+                LabelElement::Object(image),
+                LabelElement::Object(LabelObject {
+                    frame: TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 1.0,
+                        width_mm: 3.0,
+                        height_mm: 4.0,
+                        ..TextBox::default()
+                    },
+                    rotation: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                    content: ObjectContent::Padding,
+                }),
+                LabelElement::Object(LabelObject {
+                    frame: TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 2.0,
+                        y_mm: 1.0,
+                        width_mm: 3.0,
+                        height_mm: 4.0,
+                        ..TextBox::default()
+                    },
+                    rotation: 90.0,
+                    flip_h: false,
+                    flip_v: false,
+                    content: ObjectContent::CutMark,
+                }),
+            ],
+        }
+    }
+
+    fn load_export(path: &Path) -> LabelBitmap {
+        image_loader::load_image(
+            path,
+            &image_loader::ImageLoadOptions {
+                auto_invert: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v3_saved_layout_set_export_preserves_objects_and_design_dpi() {
+        let dir = std::env::temp_dir().join(format!("ptouch-v3-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (dpi, height, length) in [(180, 76, 191), (360, 150, 383)] {
+            let mut doc = free_layout_fixture(&dir, dpi);
+            let layout = dir.join(format!("objects-{dpi}.ptl"));
+            let output = dir.join(format!("objects-{dpi}.png"));
+            std::fs::write(&layout, doc.to_toml_string().unwrap()).unwrap();
+            let args = batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--set",
+                "port=LAN1",
+                "--set",
+                "suffix=-A",
+                "--output",
+                output.to_str().unwrap(),
+            ]);
+            execute_print(&args, &[]).unwrap();
+
+            let ObjectContent::Text { content, .. } =
+                &mut doc.elements[0].as_object_mut().unwrap().content
+            else {
+                unreachable!();
+            };
+            *content = "LAN1-A".into();
+            let expected = document::render_document(&doc, height, dpi, &mut TextRenderer::new())
+                .unwrap()
+                .bitmap
+                .unwrap();
+            let exported = load_export(&output);
+            assert_eq!((exported.width(), exported.height()), (length, height));
+            assert_eq!(exported.data(), expected.data());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v3_csv_export_keeps_later_objects_fixed_when_text_is_empty() {
+        let dir = std::env::temp_dir().join(format!("ptouch-v3-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc = free_layout_fixture(&dir, 360);
+        let layout = dir.join("objects.ptl");
+        let csv = dir.join("ports.csv");
+        let output = dir.join("port-{n}.png");
+        std::fs::write(&layout, doc.to_toml_string().unwrap()).unwrap();
+        std::fs::write(&csv, "port\nLAN1\n\"\"\n").unwrap();
+        let args = batch_args(&[
+            "--layout",
+            layout.to_str().unwrap(),
+            "--csv",
+            csv.to_str().unwrap(),
+            "--set",
+            "port=must-be-overridden",
+            "--set",
+            "suffix=",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        execute_print(&args, &[]).unwrap();
+
+        let mut exports = Vec::new();
+        for (row, value) in [(1, "LAN1"), (2, "")] {
+            let ObjectContent::Text { content, .. } =
+                &mut doc.elements[0].as_object_mut().unwrap().content
+            else {
+                unreachable!();
+            };
+            *content = value.into();
+            let expected =
+                document::render_document(&doc, 150, 360, &mut TextRenderer::new()).unwrap();
+            // Relative positions depend on each occupied frame, including the
+            // blank text and padding, rather than the preceding object's ink.
+            assert_eq!(
+                expected.bounds.iter().map(|b| b.x).collect::<Vec<_>>(),
+                [28, 170, 269, 340]
+            );
+            let exported = load_export(&dir.join(format!("port-{row}.png")));
+            assert_eq!((exported.width(), exported.height()), (383, 150));
+            assert_eq!(exported.data(), expected.bitmap.unwrap().data());
+            exports.push(exported);
+        }
+        assert!(!dir.join("port-3.png").exists());
+        for y in 0..150 {
+            for x in 0..170 {
+                assert!(!exports[1].get_pixel(x, y));
+            }
+            for x in 170..383 {
+                assert_eq!(exports[0].get_pixel(x, y), exports[1].get_pixel(x, y));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn positioned_layout_export_matches_shared_renderer_at_target_dpi() {
+        let mut doc =
+            LabelDocument::from_toml_str(include_str!("../../../examples/patch-panel.ptl"))
+                .unwrap();
+        doc.apply_values(&BTreeMap::from([
+            ("port1".into(), "LAN1".into()),
+            ("port2".into(), String::new()),
+            ("port3".into(), "UPLINK".into()),
+        ]));
+        for dpi in [180, 360] {
+            let height = u32::from(dpi) / 180 * 76;
+            let cli = render_layout(&doc, height, dpi).unwrap();
+            let shared =
+                document::render_document(&doc, height, dpi, &mut TextRenderer::new()).unwrap();
+            let expected = shared.bitmap.unwrap();
+            assert_eq!(
+                cli.width(),
+                (41.0 * f64::from(dpi) / 25.4_f64).round() as u32
+            );
+            assert_eq!(cli.width(), expected.width());
+            assert_eq!(cli.height(), expected.height());
+            assert_eq!(cli.data(), expected.data());
+        }
+    }
 
     #[test]
     fn diagnostic_and_usb_selection_options_are_validated() {
@@ -1514,7 +1730,7 @@ mod tests {
                         rotation = 0.0"#,
                 )?;
                 doc.apply_values(&BTreeMap::from([("name".into(), record[0].into())]));
-                render_layout(&doc, 76)
+                render_layout(&doc, 76, 180)
             })
     }
 
