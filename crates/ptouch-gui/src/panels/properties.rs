@@ -7,6 +7,7 @@ use log::{error, info};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use ptouch_render::document::{LabelObject, ObjectContent, PositionMode, TextBox, VerticalAlign};
 use ptouch_render::image_loader;
 use ptouch_render::text::TextAlign;
 
@@ -30,6 +31,9 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
     let mut changed = false;
 
     match &mut element {
+        LabelElement::Object(object) => {
+            changed |= show_object_properties(ui, object, state);
+        }
         LabelElement::Text {
             content,
             font_size,
@@ -37,6 +41,7 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
             rotation,
             flip_h,
             flip_v,
+            text_box,
         } => {
             changed |= show_text_properties(
                 ui,
@@ -47,6 +52,7 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
                     rotation,
                     flip_h,
                     flip_v,
+                    text_box,
                 },
                 state,
             );
@@ -98,6 +104,7 @@ struct TextProps<'a> {
     rotation: &'a mut f32,
     flip_h: &'a mut bool,
     flip_v: &'a mut bool,
+    text_box: &'a mut Option<TextBox>,
 }
 
 /// Mutable references to an image element's editable fields.
@@ -137,6 +144,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
         rotation,
         flip_h,
         flip_v,
+        text_box,
     } = props;
     let mut changed = false;
 
@@ -152,105 +160,50 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
 
     ui.add_space(8.0);
 
-    // Font name (searchable dropdown)
-    ui.label("Font:");
-    ui.add(
-        egui::TextEdit::singleline(&mut state.font_search)
-            .desired_width(f32::INFINITY)
-            .hint_text("Search fonts..."),
-    );
-    let query = state.font_search.to_lowercase();
-    egui::ComboBox::from_id_salt("font_selector")
-        .selected_text(&state.font_name)
-        .width(150.0)
-        .height(300.0)
-        .show_ui(ui, |ui| {
-            for font in &state.available_fonts {
-                if !query.is_empty() && !font.to_lowercase().contains(&query) {
-                    continue;
-                }
-                if ui
-                    .selectable_label(state.font_name == *font, font)
-                    .clicked()
-                {
-                    state.font_name = font.clone();
-                    state.font_search.clear();
-                    changed = true;
-                }
+    let mut fixed_box = text_box.is_some();
+    if ui.checkbox(&mut fixed_box, "Fixed text box (mm)").changed() {
+        *text_box = fixed_box.then(|| {
+            let x_mm = state
+                .preview_bounds
+                .iter()
+                .find(|bound| Some(bound.element_index) == state.selected_element)
+                .map_or(0.0, |bound| {
+                    let x = if state.overall_flip_h {
+                        state.preview_bitmap.as_ref().map_or(bound.x, |bitmap| {
+                            bitmap.width().saturating_sub(bound.x + bound.width)
+                        })
+                    } else {
+                        bound.x
+                    };
+                    f64::from(x) * 25.4 / f64::from(state.target_dpi())
+                });
+            TextBox {
+                x_mm,
+                height_mm: 8.0_f64
+                    .min(f64::from(state.tape_width_px) * 25.4 / f64::from(state.target_dpi())),
+                ..TextBox::default()
             }
         });
-
-    ui.add_space(4.0);
-
-    // Font size
-    let mut use_auto = font_size.is_none();
-    if ui.checkbox(&mut use_auto, "Auto font size").changed() {
-        if use_auto {
-            *font_size = None;
-        } else {
-            *font_size = Some(24.0);
+        if fixed_box {
+            state.document_version = state.document_version.max(2);
+        }
+        if let Some(size) = font_size {
+            *size *= if fixed_box {
+                72.0 / f32::from(state.target_dpi())
+            } else {
+                f32::from(state.target_dpi()) / 72.0
+            };
         }
         changed = true;
     }
-
-    if let Some(size) = font_size {
-        ui.horizontal(|ui| {
-            ui.label("Size:");
-            if ui
-                .add(egui::DragValue::new(size).speed(0.5).range(4.0..=200.0))
-                .changed()
-            {
-                changed = true;
-            }
-        });
+    if let Some(bounds) = text_box {
+        changed |= show_text_box(ui, bounds, state);
+    } else {
+        ui.small("Natural width; follows the previous element.");
     }
+    ui.separator();
 
-    ui.add_space(4.0);
-
-    // Font margin
-    ui.horizontal(|ui| {
-        ui.label("Margin:");
-        if ui
-            .add(
-                egui::DragValue::new(&mut state.font_margin)
-                    .speed(1.0)
-                    .range(0..=50),
-            )
-            .changed()
-        {
-            changed = true;
-        }
-        ui.label("px");
-    });
-
-    ui.add_space(4.0);
-
-    // Alignment
-    ui.label("Alignment:");
-    ui.horizontal(|ui| {
-        if ui
-            .selectable_label(matches!(align, TextAlign::Left), "Left")
-            .clicked()
-        {
-            *align = TextAlign::Left;
-            changed = true;
-        }
-        if ui
-            .selectable_label(matches!(align, TextAlign::Center), "Center")
-            .clicked()
-        {
-            *align = TextAlign::Center;
-            changed = true;
-        }
-        if ui
-            .selectable_label(matches!(align, TextAlign::Right), "Right")
-            .clicked()
-        {
-            *align = TextAlign::Right;
-            changed = true;
-        }
-    });
-
+    changed |= show_font_properties(ui, font_size, align, text_box.is_some(), state);
     ui.add_space(4.0);
 
     // Rotation
@@ -260,6 +213,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
             .add(
                 egui::DragValue::new(rotation)
                     .speed(1.0)
+                    .clamp_existing_to_range(false)
                     .range(-360.0..=360.0)
                     .suffix(" deg"),
             )
@@ -304,6 +258,307 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     ui.add_space(4.0);
     changed |= show_flip_controls(ui, flip_h, flip_v);
 
+    changed
+}
+
+/// Text appearance is shared by legacy text and free-layout text. The font
+/// family and margin belong to the document, while size/alignment are local.
+fn show_font_properties(
+    ui: &mut egui::Ui,
+    font_size: &mut Option<f32>,
+    align: &mut TextAlign,
+    points: bool,
+    state: &mut AppState,
+) -> bool {
+    let mut changed = false;
+    ui.label("Font (whole label):");
+    ui.add(
+        egui::TextEdit::singleline(&mut state.font_search)
+            .desired_width(f32::INFINITY)
+            .hint_text("Search fonts..."),
+    );
+    let query = state.font_search.to_lowercase();
+    egui::ComboBox::from_id_salt("font_selector")
+        .selected_text(&state.font_name)
+        .width(150.0)
+        .height(300.0)
+        .show_ui(ui, |ui| {
+            for font in &state.available_fonts {
+                if !query.is_empty() && !font.to_lowercase().contains(&query) {
+                    continue;
+                }
+                if ui
+                    .selectable_label(state.font_name == *font, font)
+                    .clicked()
+                {
+                    state.font_name = font.clone();
+                    state.font_search.clear();
+                    changed = true;
+                }
+            }
+        });
+    let mut auto = font_size.is_none();
+    if ui.checkbox(&mut auto, "Auto font size").changed() {
+        *font_size = (!auto).then_some(if points { 12.0 } else { 24.0 });
+        changed = true;
+    }
+    if let Some(size) = font_size {
+        ui.horizontal(|ui| {
+            ui.label(if points { "Size (pt):" } else { "Size (px):" });
+            changed |= ui
+                .add(
+                    egui::DragValue::new(size)
+                        .speed(0.5)
+                        .clamp_existing_to_range(false)
+                        .range(1.0..=200.0),
+                )
+                .changed();
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label("Alignment:");
+        for (value, label) in [
+            (TextAlign::Left, "Left"),
+            (TextAlign::Center, "Center"),
+            (TextAlign::Right, "Right"),
+        ] {
+            changed |= ui.selectable_value(align, value, label).changed();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Font margin (px):");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut state.font_margin)
+                    .clamp_existing_to_range(false)
+                    .range(0..=50),
+            )
+            .changed();
+    });
+    changed
+}
+
+/// Change the positioning mode without moving the frame. Relative layouts
+/// intentionally use nonnegative gaps; overlapping frames remain absolute.
+fn switch_position_mode(
+    frame: &mut TextBox,
+    mode: PositionMode,
+    previous_right_mm: f64,
+) -> Result<bool, &'static str> {
+    if frame.position == mode {
+        return Ok(false);
+    }
+    let x = match frame.position {
+        PositionMode::Absolute => frame.x_mm,
+        PositionMode::Relative => previous_right_mm + frame.gap_mm,
+    };
+    match mode {
+        PositionMode::Absolute => frame.x_mm = x,
+        PositionMode::Relative => {
+            let gap = x - previous_right_mm;
+            if gap < -1e-9 {
+                return Err(
+                    "This object overlaps or precedes the previous object. Keep Absolute positioning or move it after the previous right edge.",
+                );
+            }
+            frame.gap_mm = gap.max(0.0);
+        }
+    }
+    frame.position = mode;
+    Ok(true)
+}
+
+fn show_text_box(ui: &mut egui::Ui, bounds: &mut TextBox, state: &mut AppState) -> bool {
+    let mut changed = false;
+    let previous_right = (0..state.selected_element.unwrap_or(0))
+        .rev()
+        .find_map(|index| state.element_rect_mm(index))
+        .map_or(0.0, |(x, _, width, _)| x + width);
+    ui.horizontal(|ui| {
+        for (mode, label) in [
+            (PositionMode::Absolute, "Absolute"),
+            (PositionMode::Relative, "After previous"),
+        ] {
+            if ui
+                .selectable_label(bounds.position == mode, label)
+                .clicked()
+            {
+                match switch_position_mode(bounds, mode, previous_right) {
+                    Ok(did_change) => changed |= did_change,
+                    Err(message) => state.status_message = message.into(),
+                }
+            }
+        }
+    });
+    let minimum = 25.4 / f64::from(state.target_dpi());
+    let printable_height = state.printable_height_mm();
+    let mut height_changed = false;
+    egui::Grid::new("object_frame_dimensions")
+        .num_columns(2)
+        .show(ui, |ui| {
+            for (label, value, maximum) in [
+                ("Width", &mut bounds.width_mm, 10_000.0),
+                ("Height", &mut bounds.height_mm, printable_height),
+            ] {
+                ui.label(label);
+                let edited = ui
+                    .add(
+                        egui::DragValue::new(value)
+                            .speed(0.1)
+                            .clamp_existing_to_range(false)
+                            .range(minimum..=maximum)
+                            .suffix(" mm"),
+                    )
+                    .changed();
+                changed |= edited;
+                height_changed |= label == "Height" && edited;
+                ui.end_row();
+            }
+            let (label, value) = match bounds.position {
+                PositionMode::Absolute => ("X", &mut bounds.x_mm),
+                PositionMode::Relative => ("Gap", &mut bounds.gap_mm),
+            };
+            ui.label(label);
+            changed |= ui
+                .add(
+                    egui::DragValue::new(value)
+                        .speed(0.1)
+                        .clamp_existing_to_range(false)
+                        .range(0.0..=10_000.0)
+                        .suffix(" mm"),
+                )
+                .changed();
+            ui.end_row();
+            ui.label("Y");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut bounds.y_mm)
+                        .speed(0.1)
+                        .clamp_existing_to_range(false)
+                        .range(0.0..=(printable_height - bounds.height_mm).max(0.0))
+                        .suffix(" mm"),
+                )
+                .changed();
+            ui.end_row();
+        });
+    if height_changed {
+        bounds.y_mm = bounds
+            .y_mm
+            .min((printable_height - bounds.height_mm).max(0.0));
+    }
+    ui.horizontal(|ui| {
+        ui.label("Vertical:");
+        for (value, label) in [
+            (VerticalAlign::Top, "Top"),
+            (VerticalAlign::Center, "Center"),
+            (VerticalAlign::Bottom, "Bottom"),
+        ] {
+            changed |= ui
+                .selectable_value(&mut bounds.vertical_align, value, label)
+                .changed();
+        }
+    });
+    ui.small("Origin: printable top-left, not the cut edge. Rotation keeps this frame fixed.");
+    if bounds.position == PositionMode::Relative {
+        ui.small(
+            "Gap follows the previous object's right edge. Reordering changes its predecessor.",
+        );
+    }
+    changed
+}
+
+/// Free-layout properties share geometry and transforms across every type.
+fn show_object_properties(
+    ui: &mut egui::Ui,
+    object: &mut LabelObject,
+    state: &mut AppState,
+) -> bool {
+    let mut changed = show_text_box(ui, &mut object.frame, state);
+    ui.separator();
+    match &mut object.content {
+        ObjectContent::Text {
+            content,
+            font_size,
+            align,
+        } => {
+            ui.label("Text Content:");
+            changed |= ui
+                .add(
+                    egui::TextEdit::multiline(content)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3),
+                )
+                .changed();
+            ui.small("Template variables such as {{port}} keep this frame in place.");
+            changed |= show_font_properties(ui, font_size, align, true, state);
+        }
+        ObjectContent::Image {
+            path,
+            image_data,
+            bitmap,
+        } => {
+            ui.label("Image");
+            let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
+                || "embedded".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            ui.label(format!("File: {filename}"));
+            if let Some(bitmap) = bitmap {
+                ui.small(format!(
+                    "Original: {} x {} px",
+                    bitmap.width(),
+                    bitmap.height()
+                ));
+            }
+            ui.small("Image keeps its aspect ratio and fits inside the frame after rotation.");
+            if let Some(path) = path.clone()
+                && ui.button("Reload").clicked()
+            {
+                if load_image_into(&path, image_data, bitmap) {
+                    changed = true;
+                } else {
+                    state.status_message = format!("Image load error: {}", path.display());
+                }
+            }
+            if ui.button("Change File...").clicked()
+                && let Some(new_path) = crate::widgets::image_file_dialog().pick_file()
+            {
+                if load_image_into(&new_path, image_data, bitmap) {
+                    *path = Some(new_path);
+                    changed = true;
+                } else {
+                    state.status_message = format!("Image load error: {}", new_path.display());
+                }
+            }
+        }
+        ObjectContent::CutMark => {
+            ui.label("Cut mark");
+            ui.small("A printed guide only; it does not trigger the cutter.");
+        }
+        ObjectContent::Padding => {
+            ui.label("Blank frame (converted padding)");
+            ui.small("Keeps its extent and can anchor relative objects. Use positions or gaps for new spacing.");
+        }
+    }
+    ui.separator();
+    ui.label("Rotation:");
+    changed |= ui
+        .add(
+            egui::DragValue::new(&mut object.rotation)
+                .speed(1.0)
+                .clamp_existing_to_range(false)
+                .range(-360.0..=360.0)
+                .suffix(" deg"),
+        )
+        .changed();
+    ui.horizontal(|ui| {
+        for degrees in [0.0_f32, 45.0, 90.0, 180.0, 270.0] {
+            changed |= ui
+                .selectable_value(&mut object.rotation, degrees, format!("{}", degrees as i32))
+                .changed();
+        }
+    });
+    changed |= show_flip_controls(ui, &mut object.flip_h, &mut object.flip_v);
     changed
 }
 
@@ -400,7 +655,12 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
         ui.horizontal(|ui| {
             ui.label("Height:");
             if ui
-                .add(egui::DragValue::new(h).speed(1.0).range(1..=1000))
+                .add(
+                    egui::DragValue::new(h)
+                        .speed(1.0)
+                        .clamp_existing_to_range(false)
+                        .range(1..=1000),
+                )
                 .changed()
             {
                 changed = true;
@@ -418,6 +678,7 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
             .add(
                 egui::DragValue::new(rotation)
                     .speed(1.0)
+                    .clamp_existing_to_range(false)
                     .range(-360.0..=360.0)
                     .suffix(" deg"),
             )
@@ -475,7 +736,12 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
     ui.horizontal(|ui| {
         ui.label("Pixels:");
         if ui
-            .add(egui::DragValue::new(pixels).speed(1.0).range(1..=500))
+            .add(
+                egui::DragValue::new(pixels)
+                    .speed(1.0)
+                    .clamp_existing_to_range(false)
+                    .range(1..=500),
+            )
             .changed()
         {
             changed = true;
@@ -495,4 +761,78 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
     });
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewing_properties_does_not_clamp_an_existing_design() {
+        let frame = TextBox {
+            width_mm: 0.08,
+            height_mm: 20.0,
+            y_mm: 3.0,
+            ..TextBox::default()
+        };
+        let mut object = LabelObject::text("Text", frame.clone());
+        object.rotation = 370.0;
+        if let ObjectContent::Text { font_size, .. } = &mut object.content {
+            *font_size = Some(300.0);
+        }
+        for (version, element) in [
+            (3, LabelElement::Object(object)),
+            (
+                2,
+                LabelElement::Text {
+                    content: "Legacy".into(),
+                    font_size: Some(300.0),
+                    align: TextAlign::Left,
+                    rotation: 370.0,
+                    flip_h: false,
+                    flip_v: false,
+                    text_box: Some(frame),
+                },
+            ),
+        ] {
+            let mut state = AppState {
+                document_version: version,
+                elements: vec![element],
+                selected_element: Some(0),
+                needs_rerender: false,
+                ..AppState::default()
+            };
+            let before = state.document().to_toml_string().unwrap();
+            let context = egui::Context::default();
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                show_properties(ui, &mut state);
+            });
+            output.textures_delta.clear();
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(!state.needs_rerender);
+        }
+    }
+
+    #[test]
+    fn changing_position_modes_keeps_exact_physical_position() {
+        let mut frame = TextBox {
+            x_mm: 18.0,
+            ..TextBox::default()
+        };
+        assert!(switch_position_mode(&mut frame, PositionMode::Relative, 15.0).unwrap());
+        assert_eq!(frame.gap_mm, 3.0);
+        assert!(switch_position_mode(&mut frame, PositionMode::Absolute, 15.0).unwrap());
+        assert_eq!(frame.x_mm, 18.0);
+    }
+
+    #[test]
+    fn overlapping_frame_cannot_silently_jump_when_made_relative() {
+        let mut frame = TextBox {
+            x_mm: 12.0,
+            ..TextBox::default()
+        };
+        let original = frame.clone();
+        assert!(switch_position_mode(&mut frame, PositionMode::Relative, 15.0).is_err());
+        assert_eq!(frame, original);
+    }
 }

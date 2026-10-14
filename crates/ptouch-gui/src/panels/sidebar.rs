@@ -47,6 +47,9 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
     });
     if state.printer_target != old_target {
         state.printer_connected = false;
+        state.preview_uses_printer = false;
+        state.update_tape_pixels();
+        state.mark_dirty();
         state.printer_model = None;
         state.printer_status = Some("Connecting...".to_string());
         state.connecting = true;
@@ -64,7 +67,10 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
     if ui
-        .add_enabled(!state.is_printer_busy(), egui::Button::new("Refresh"))
+        .add_enabled(
+            !state.is_printer_busy() && state.printer_cmd_tx.is_some(),
+            egui::Button::new("Refresh"),
+        )
         .clicked()
         && let Some(ref tx) = state.printer_cmd_tx
     {
@@ -80,26 +86,59 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Tape");
     ui.add_space(4.0);
 
-    let tapes = tape::supported_tapes(state.printer_dpi);
+    let tapes = tape::supported_tapes(state.target_dpi());
     let current_label = format!("{} mm ({} px)", state.tape_width_mm, state.tape_width_px);
 
-    ui.add_enabled_ui(!state.printer_target.is_bluetooth(), |ui| {
-        egui::ComboBox::from_label("Width")
-            .selected_text(&current_label)
-            .show_ui(ui, |ui| {
-                for t in tapes {
-                    let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
-                    if ui
-                        .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
-                        .clicked()
-                    {
-                        state.update_tape_pixels();
-                        state.mark_dirty();
-                        info!("Tape changed: {} mm", t.width_mm);
+    ui.add_enabled_ui(
+        !state.printer_target.is_bluetooth() || !state.printer_connected,
+        |ui| {
+            egui::ComboBox::from_label("Width")
+                .selected_text(&current_label)
+                .show_ui(ui, |ui| {
+                    for t in tapes {
+                        let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
+                        if ui
+                            .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
+                            .clicked()
+                        {
+                            state.update_tape_pixels();
+                            state.mark_dirty();
+                            info!("Tape changed: {} mm", t.width_mm);
+                        }
                     }
+                });
+        },
+    );
+
+    egui::ComboBox::from_label("Design DPI")
+        .selected_text(state.design_dpi.to_string())
+        .show_ui(ui, |ui| {
+            for dpi in [180, 360] {
+                if ui.selectable_value(&mut state.design_dpi, dpi, dpi.to_string()).changed()
+                    && !state.printer_connected
+                {
+                    state.preview_uses_printer = false;
+                    state.update_tape_pixels();
+                    state.mark_dirty();
                 }
-            });
-    });
+            }
+        }).response.on_hover_text("Saved with the layout; used for offline preview and export. Connected printers use their own DPI.");
+    let source = if state.printer_connected {
+        "printer"
+    } else if state.preview_uses_printer {
+        "last printer"
+    } else {
+        "design"
+    };
+    ui.label(format!("Preview: {} DPI ({source})", state.target_dpi()));
+    if !state.printer_connected
+        && state.preview_uses_printer
+        && ui.button("Use design DPI").clicked()
+    {
+        state.preview_uses_printer = false;
+        state.update_tape_pixels();
+        state.mark_dirty();
+    }
 }
 
 /// Print options: auto-cut toggle and quality selection.
@@ -164,6 +203,7 @@ fn show_mirror_section(ui: &mut egui::Ui, state: &mut AppState) {
 /// Element list section with reorder and delete controls.
 fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Elements");
+    ui.small("Drag rows to reorder. Relative objects follow their new predecessor.");
     ui.add_space(4.0);
 
     if state.elements.is_empty() {
@@ -177,11 +217,24 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         let is_selected = state.selected_element == Some(idx);
         let label = format!("{}. {}", idx + 1, element.display_name());
 
-        ui.horizontal(|ui| {
-            if ui.selectable_label(is_selected, &label).clicked() {
-                state.selected_element = Some(idx);
-            }
-        });
+        let response = ui.add(
+            egui::Button::selectable(is_selected, &label).sense(egui::Sense::click_and_drag()),
+        );
+        if response.clicked() || response.drag_started() {
+            state.selected_element = Some(idx);
+        }
+        response.dnd_set_drag_payload(ElementDrag(idx));
+        if response.dnd_hover_payload::<ElementDrag>().is_some() {
+            ui.painter().rect_stroke(
+                response.rect,
+                0.0,
+                egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if let Some(source) = response.dnd_release_payload::<ElementDrag>() {
+            action = Some(ElementAction::MoveTo(source.0, idx));
+        }
     }
 
     ui.add_space(4.0);
@@ -229,18 +282,15 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         match act {
             ElementAction::MoveUp(idx) => {
                 if idx > 0 {
-                    state.elements.swap(idx, idx - 1);
-                    state.selected_element = Some(idx - 1);
-                    state.mark_dirty();
+                    move_element(state, idx, idx - 1);
                 }
             }
             ElementAction::MoveDown(idx) => {
                 if idx + 1 < state.elements.len() {
-                    state.elements.swap(idx, idx + 1);
-                    state.selected_element = Some(idx + 1);
-                    state.mark_dirty();
+                    move_element(state, idx, idx + 1);
                 }
             }
+            ElementAction::MoveTo(from, to) => move_element(state, from, to),
             ElementAction::Delete(idx) => {
                 state.elements.remove(idx);
                 state.validate_selection();
@@ -250,9 +300,66 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ElementDrag(usize);
+
+fn move_element(state: &mut AppState, from: usize, to: usize) {
+    if from == to || from >= state.elements.len() || to >= state.elements.len() {
+        return;
+    }
+    let element = state.elements.remove(from);
+    state.elements.insert(to, element);
+    state.selected_element = Some(to);
+    state.mark_dirty();
+}
+
 /// Deferred actions for element list manipulation.
 enum ElementAction {
     MoveUp(usize),
     MoveDown(usize),
+    MoveTo(usize, usize),
     Delete(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ptouch_render::document::{LabelElement, LabelObject, PositionMode, TextBox};
+
+    #[test]
+    fn reordering_keeps_absolute_coordinates_and_rebinds_relative_followers() {
+        let mut state = AppState {
+            elements: vec![
+                LabelElement::Object(LabelObject::text(
+                    "A",
+                    TextBox {
+                        x_mm: 5.0,
+                        ..TextBox::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        x_mm: 30.0,
+                        ..TextBox::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "C",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 3.0,
+                        ..TextBox::default()
+                    },
+                )),
+            ],
+            ..AppState::default()
+        };
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
+        move_element(&mut state, 0, 1);
+        assert_eq!(state.selected_element, Some(1));
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 30.0);
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 18.0);
+    }
 }

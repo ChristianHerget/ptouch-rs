@@ -21,7 +21,12 @@ pub fn show_status_bar(ui: &mut egui::Ui, state: &AppState) {
 
         // Label dimensions
         if let Some(ref bmp) = state.preview_bitmap {
-            ui.label(format!("{}x{} px", bmp.width(), bmp.height()));
+            ui.label(format!(
+                "{}x{} px | {:.1} mm long",
+                bmp.width(),
+                bmp.height(),
+                f64::from(bmp.width()) * 25.4 / f64::from(state.target_dpi())
+            ));
         } else {
             ui.label("-- x -- px");
         }
