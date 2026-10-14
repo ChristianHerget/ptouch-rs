@@ -218,6 +218,10 @@ New text starts as a 10 mm wide box with automatic font size; its height is
 X=0, Y=0. Subsequent objects start 3 mm after the rightmost object, using absolute
 coordinates. Images keep their aspect ratio and fit inside their frames.
 
+Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
+The source bytes are embedded in the saved `.ptl`, so reopening does not require
+the original image file. SVG sources should embed any linked images as well.
+
 Choose **After previous** to position a frame after the previous element's right
 edge with a specified gap. Empty text still reserves the whole box, so template
 values do not shift later ports. Dragging a relative frame changes its gap; if
@@ -259,11 +263,16 @@ positions, so repeated ports do not accumulate pixel-rounding drift.
 New free layouts use format version 3, which older builds reject. Versions 1
 and 2 remain readable and retain their original layout behavior; opening and
 saving an unchanged legacy layout preserves its version. **Convert to free
-layout** explicitly freezes the current positions into physical frames. Review
-the result before saving: legacy automatic text sizing and rotated images may
-fit differently in fixed frames. Conversion keeps Padding as an empty physical
-frame, preserving its occupied space. New free layouts use coordinates/gaps and
-do not offer a Padding insertion button; legacy layouts retain it.
+layout** preserves the exact dimensions of existing millimeter frames and
+resolves their positions without rounding through preview pixels. Legacy
+natural dimensions are frozen into physical frames at the selected preview DPI.
+Review the result before saving: legacy automatic text sizing and rotated
+images may fit differently in fixed frames. Conversion keeps Padding as an
+empty physical frame, preserving its occupied space. On labels with existing
+content, zero-width padding and empty natural text receive selectable blank
+frames inside the original label length; an entirely empty label receives a
+default frame. New free layouts use coordinates/gaps and do not offer a Padding
+insertion button; legacy layouts retain it.
 
 Legacy unboxed text, padding, image sizes, and font margins keep their existing
 pixel units. Fixed text frame font sizes use points (1/72 inch).

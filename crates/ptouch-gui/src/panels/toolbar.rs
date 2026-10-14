@@ -201,9 +201,11 @@ fn do_open_layout(state: &mut AppState) {
         }
     };
 
-    match LabelDocument::from_toml_str(&text) {
-        Ok(document) => {
-            apply_layout(state, document);
+    match LabelDocument::from_toml_str(&text)
+        .map_err(|error| error.to_string())
+        .and_then(|document| apply_layout(state, document))
+    {
+        Ok(()) => {
             state.status_message = format!("Opened {}", path.display());
             info!("Opened layout: {}", path.display());
         }
@@ -214,7 +216,15 @@ fn do_open_layout(state: &mut AppState) {
     }
 }
 
-fn apply_layout(state: &mut AppState, document: LabelDocument) {
+fn apply_layout(state: &mut AppState, document: LabelDocument) -> Result<(), String> {
+    // Reject before touching the current design: an unknown width must not
+    // inherit the previous document's raster height or differ from CLI export.
+    if ptouch_core::tape::find_tape(document.tape_width_mm, document.dpi).is_none() {
+        return Err(format!(
+            "Unknown saved tape width: {} mm",
+            document.tape_width_mm
+        ));
+    }
     state.document_version = document.version;
     state.design_dpi = document.dpi;
     if !state.printer_connected {
@@ -231,6 +241,7 @@ fn apply_layout(state: &mut AppState, document: LabelDocument) {
     state.elements = document.elements;
     state.selected_element = None;
     state.mark_dirty();
+    Ok(())
 }
 
 /// Export the current label preview as an image file.
@@ -292,13 +303,31 @@ mod tests {
     }
 
     #[test]
+    fn opening_unknown_tape_width_rejects_without_changing_the_current_design() {
+        let mut state = AppState::default();
+        state.add_text();
+        state.needs_rerender = false;
+        let before = state.document().to_toml_string().unwrap();
+        let mut document = layout(15);
+        document.dpi = 360;
+        assert_eq!(
+            apply_layout(&mut state, document).unwrap_err(),
+            "Unknown saved tape width: 15 mm"
+        );
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.tape_width_px, 76);
+        assert_eq!(state.selected_element, Some(0));
+        assert!(!state.needs_rerender);
+    }
+
+    #[test]
     fn opening_and_saving_legacy_layout_keeps_version_and_flow() {
         for version in [1, 2] {
             let mut document = layout(12);
             document.version = version;
             document.elements = vec![LabelElement::Padding { pixels: 20 }];
             let mut state = AppState::default();
-            apply_layout(&mut state, document);
+            apply_layout(&mut state, document).unwrap();
             state.add_text();
             assert!(!state.is_free_layout());
             let saved = state.document();
@@ -318,11 +347,11 @@ mod tests {
         document.version = 1;
         document.elements = vec![LabelElement::Padding { pixels: 20 }, LabelElement::CutMark];
         let mut state = AppState::default();
-        apply_layout(&mut state, document);
+        apply_layout(&mut state, document).unwrap();
         state.convert_to_free_layout().unwrap();
         let saved = state.document().to_toml_string().unwrap();
         let mut reopened = AppState::default();
-        apply_layout(&mut reopened, LabelDocument::from_toml_str(&saved).unwrap());
+        apply_layout(&mut reopened, LabelDocument::from_toml_str(&saved).unwrap()).unwrap();
         assert!(reopened.is_free_layout());
         assert!(
             reopened
@@ -347,7 +376,7 @@ mod tests {
                 tape_width_px: 64,
                 ..AppState::default()
             };
-            apply_layout(&mut state, layout(width));
+            apply_layout(&mut state, layout(width)).unwrap();
             assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 64));
             let bitmap = ptouch_render::document::render_elements(
                 &state.elements,
@@ -374,7 +403,7 @@ mod tests {
             tape_width_px: 128,
             ..AppState::default()
         };
-        apply_layout(&mut state, layout(12));
+        apply_layout(&mut state, layout(12)).unwrap();
         assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 76));
     }
 
@@ -388,7 +417,7 @@ mod tests {
         };
         let mut document = layout(24);
         document.dpi = 360;
-        apply_layout(&mut state, document);
+        apply_layout(&mut state, document).unwrap();
         assert_eq!(state.design_dpi, 360);
         assert_eq!(state.target_dpi(), 360);
         assert_eq!(state.tape_width_px, 320);
@@ -405,14 +434,14 @@ mod tests {
         };
         let mut document = layout(24);
         document.dpi = 360;
-        apply_layout(&mut state, document);
+        apply_layout(&mut state, document).unwrap();
         assert_eq!(state.target_dpi(), 180);
         assert_eq!(state.tape_width_px, 128);
         let saved = state.document();
         assert_eq!(saved.dpi, 360);
         let reopened = LabelDocument::from_toml_str(&saved.to_toml_string().unwrap()).unwrap();
         let mut offline = AppState::default();
-        apply_layout(&mut offline, reopened);
+        apply_layout(&mut offline, reopened).unwrap();
         assert_eq!(offline.target_dpi(), 360);
         assert_eq!(offline.tape_width_px, 320);
     }
@@ -431,7 +460,7 @@ mod tests {
         };
         let mut document = layout(24);
         document.dpi = 360;
-        apply_layout(&mut state, document);
+        apply_layout(&mut state, document).unwrap();
         assert_eq!(state.target_dpi(), 360);
         assert_eq!((state.tape_width_mm, state.tape_width_px), (24, 320));
     }

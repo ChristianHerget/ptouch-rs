@@ -94,6 +94,38 @@ fn check_size(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Use the same quadrant snapping and bounds calculation as LabelBitmap::rotate,
+/// but reject an oversized intermediate image before allocating or scanning it.
+fn checked_rotate(source: &LabelBitmap, rotation: f32) -> Result<LabelBitmap> {
+    if !rotation.is_finite() {
+        return Err(RenderError::Layout("rotation must be finite".into()));
+    }
+    let norm = ((rotation % 360.0) + 360.0) % 360.0;
+    let (width, height) =
+        if norm.abs() < 0.5 || (norm - 180.0).abs() < 0.5 || (norm - 360.0).abs() < 0.5 {
+            (source.width(), source.height())
+        } else if (norm - 90.0).abs() < 0.5 || (norm - 270.0).abs() < 0.5 {
+            (source.height(), source.width())
+        } else {
+            let radians = norm.to_radians();
+            let width = source.width() as f32;
+            let height = source.height() as f32;
+            (
+                (width * radians.cos().abs() + height * radians.sin().abs()).ceil() as u32,
+                (width * radians.sin().abs() + height * radians.cos().abs()).ceil() as u32,
+            )
+        };
+    check_size(width, height).map_err(|_| {
+        // Auto text sizing treats this as a failed size candidate and can try
+        // smaller sizes; fixed text/images get an actionable error instead.
+        RenderError::DimensionMismatch(
+            "rotated content raster is too large; reduce the font size or source image dimensions"
+                .into(),
+        )
+    })?;
+    Ok(source.rotate(rotation))
+}
+
 fn boundary(mm: f64, dpi: u16) -> Result<u32> {
     let px = (mm * f64::from(dpi) / 25.4).round();
     if !px.is_finite() || !(0.0..=f64::from(MAX_LENGTH_PX)).contains(&px) {
@@ -132,6 +164,7 @@ pub fn render_document(
     let mut bounds = Vec::new();
     let mut diagnostics = Vec::new();
     let mut total_width = 0;
+    let mut segment_pixels = 0_u64;
 
     for (index, element) in doc.elements.iter().enumerate() {
         let framed = match element {
@@ -269,6 +302,15 @@ pub fn render_document(
             )
         };
         total_width = total_width.max(rect.x + rect.width);
+        segment_pixels += u64::from(segment.width()) * u64::from(segment.height());
+        // Limit the actual retained working set as well as each bitmap. Many
+        // overlapping objects can have a small union but huge cached rasters.
+        let canvas_pixels = u64::from(total_width) * u64::from(tape_width_px);
+        if segment_pixels + canvas_pixels > MAX_LAYOUT_PIXELS {
+            return Err(RenderError::Layout(
+                "layout working set is too large; reduce object count or frame dimensions".into(),
+            ));
+        }
         segments.push(segment);
         bounds.push(rect);
     }
@@ -315,36 +357,84 @@ pub fn convert_to_objects(
     let mut converted = doc.clone();
     converted.version = DOCUMENT_VERSION;
     let mut cursor_mm = 0.0;
+    let mut occupied_right_mm = 0.0_f64;
+    let mut new_empty_frames = Vec::new();
     for (index, element) in converted.elements.iter_mut().enumerate() {
-        let mut frame =
-            if let Some(rect) = rendered.bounds.iter().find(|r| r.element_index == index) {
-                let x = if doc.flip_h {
-                    total_width - rect.x - rect.width
-                } else {
-                    rect.x
-                };
-                let y = if doc.flip_v {
-                    tape_width_px - rect.y - rect.height
-                } else {
-                    rect.y
-                };
-                cursor_mm = f64::from(x + rect.width) * mm_per_pixel;
-                TextBox {
-                    x_mm: f64::from(x) * mm_per_pixel,
-                    y_mm: f64::from(y) * mm_per_pixel,
-                    width_mm: f64::from(rect.width.max(1)) * mm_per_pixel,
-                    height_mm: f64::from(rect.height) * mm_per_pixel,
-                    ..TextBox::default()
-                }
-            } else {
-                // Empty natural text had no occupied width. Give it an editable
-                // frame without shifting any subsequent element's frozen position.
-                TextBox {
-                    x_mm: cursor_mm,
-                    height_mm: 8.0_f64.min(f64::from(tape_width_px) * mm_per_pixel),
-                    ..TextBox::default()
-                }
+        let physical_frame = match element {
+            LabelElement::Object(object) => Some(&object.frame),
+            LabelElement::Text { text_box, .. } => text_box.as_ref(),
+            _ => None,
+        };
+        let rendered_rect = rendered.bounds.iter().find(|r| r.element_index == index);
+        let occupied_before =
+            physical_frame.is_some() || rendered_rect.is_some_and(|rect| rect.width > 0);
+        let mut frame = if let Some(physical_frame) = physical_frame {
+            // A v2/v3 frame already has exact physical geometry. Resolving its
+            // relative X must not round through the current preview's pixels.
+            let x_mm = match physical_frame.position {
+                PositionMode::Absolute => physical_frame.x_mm,
+                PositionMode::Relative => cursor_mm + physical_frame.gap_mm,
             };
+            cursor_mm = x_mm + physical_frame.width_mm;
+            TextBox {
+                position: PositionMode::Absolute,
+                x_mm,
+                ..physical_frame.clone()
+            }
+        } else if let Some(rect) = rendered_rect {
+            let x = if doc.flip_h {
+                total_width - rect.x - rect.width
+            } else {
+                rect.x
+            };
+            let y = if doc.flip_v {
+                tape_width_px - rect.y - rect.height
+            } else {
+                rect.y
+            };
+            // Match the compositor's exact physical cursor, which adds a
+            // legacy raster width without quantizing the preceding frame.
+            cursor_mm += f64::from(rect.width) * mm_per_pixel;
+            TextBox {
+                // A zero-width spacer must become selectable without
+                // extending the label: changing total width would move
+                // every existing object under whole-label mirroring.
+                x_mm: f64::from(if rect.width == 0 && total_width > 0 {
+                    x.min(total_width - 1)
+                } else {
+                    x
+                }) * mm_per_pixel,
+                y_mm: f64::from(y) * mm_per_pixel,
+                width_mm: f64::from(rect.width.max(1)) * mm_per_pixel,
+                height_mm: f64::from(rect.height) * mm_per_pixel,
+                ..TextBox::default()
+            }
+        } else {
+            // Empty natural text had no occupied width. Keep its editable
+            // frame within the old extent so whole-label mirroring cannot
+            // shift the original content. All-empty labels have no old
+            // geometry to preserve and receive a default frame.
+            let width_mm = if total_width > 0 {
+                10.0_f64.min(f64::from(total_width) * mm_per_pixel)
+            } else {
+                10.0
+            };
+            TextBox {
+                x_mm: if total_width > 0 {
+                    cursor_mm.min((f64::from(total_width) * mm_per_pixel - width_mm).max(0.0))
+                } else {
+                    0.0
+                },
+                width_mm,
+                height_mm: 8.0_f64.min(f64::from(tape_width_px) * mm_per_pixel),
+                ..TextBox::default()
+            }
+        };
+        if occupied_before {
+            occupied_right_mm = occupied_right_mm.max(frame.x_mm + frame.width_mm);
+        } else {
+            new_empty_frames.push(index);
+        }
         let object = match element {
             LabelElement::Object(object) => {
                 frame.vertical_align = object.frame.vertical_align;
@@ -427,6 +517,19 @@ pub fn convert_to_objects(
         };
         *element = LabelElement::Object(object);
     }
+    if occupied_right_mm > 0.0 {
+        for index in new_empty_frames {
+            let frame = &mut converted.elements[index].as_object_mut().unwrap().frame;
+            // The raster extent can extend beyond an exact physical edge by
+            // half a pixel. Do not let new blank frames freeze that rounding
+            // surplus into the layout: another DPI could gain a column and
+            // shift every object under whole-label mirroring.
+            frame.width_mm = frame.width_mm.min(occupied_right_mm);
+            frame.x_mm = frame
+                .x_mm
+                .min((occupied_right_mm - frame.width_mm).max(0.0));
+        }
+    }
     // Conversion is atomic: if the new fitting rules cannot render this
     // content, return an error and leave the caller's original document intact.
     render_document(&converted, tape_width_px, target_dpi, renderer)?;
@@ -477,17 +580,22 @@ fn render_object(
                     object.frame.vertical_align,
                     width,
                     height,
+                    false,
                 )?,
                 false,
             ))
         }
         ObjectContent::CutMark => {
-            // Keep the historical 9-pixel / 3-pixel pattern's physical size at
-            // its 180 DPI design resolution, then fit like any other content.
-            let reference_height = (f64::from(height) * 180.0 / f64::from(dpi))
-                .round()
-                .max(1.0) as u32;
-            let source = crate::compose::cutmark(reference_height);
+            // A cut guide spans its frame rather than inheriting the legacy
+            // 9-pixel image's aspect ratio. Retain the historical one-pixel
+            // stroke and 3-on/3-off raster pattern, including at 360 DPI.
+            let mut source = LabelBitmap::new(width, height);
+            let line_x = ((u64::from(width) * 5 / 9) as u32).min(width - 1);
+            for y in 0..height {
+                if y % 6 < 3 {
+                    source.set_pixel(line_x, y, true);
+                }
+            }
             Ok((
                 render_contained(
                     &source,
@@ -495,6 +603,7 @@ fn render_object(
                     object.frame.vertical_align,
                     width,
                     height,
+                    true,
                 )?,
                 false,
             ))
@@ -511,21 +620,14 @@ fn render_contained(
     vertical_align: VerticalAlign,
     width: u32,
     height: u32,
+    preserve_ink: bool,
 ) -> Result<LabelBitmap> {
     if source.width() == 0 || source.height() == 0 {
         return Err(RenderError::Layout(
             "object image dimensions must be positive".into(),
         ));
     }
-    let angle = f64::from(rotation.rem_euclid(360.0)).to_radians();
-    let rotated_w = (f64::from(source.width()) * angle.cos().abs()
-        + f64::from(source.height()) * angle.sin().abs())
-    .ceil() as u32;
-    let rotated_h = (f64::from(source.width()) * angle.sin().abs()
-        + f64::from(source.height()) * angle.cos().abs())
-    .ceil() as u32;
-    check_size(rotated_w, rotated_h)?;
-    let rotated = source.rotate(rotation);
+    let rotated = checked_rotate(source, rotation)?;
     let scale = (f64::from(width) / f64::from(rotated.width()))
         .min(f64::from(height) / f64::from(rotated.height()));
     let scaled_w = (f64::from(rotated.width()) * scale)
@@ -545,10 +647,26 @@ fn render_contained(
         let source_y = (u64::from(y) * u64::from(rotated.height()) / u64::from(scaled_h)) as u32;
         for x in 0..scaled_w {
             let source_x = (u64::from(x) * u64::from(rotated.width()) / u64::from(scaled_w)) as u32;
-            if rotated.get_pixel(source_x, source_y) {
+            let black = if preserve_ink {
+                // A logical cut guide must not vanish between nearest-neighbor
+                // samples when its frame is narrow or rotated.
+                let end_x = (u64::from(x + 1) * u64::from(rotated.width()))
+                    .div_ceil(u64::from(scaled_w)) as u32;
+                let end_y = (u64::from(y + 1) * u64::from(rotated.height()))
+                    .div_ceil(u64::from(scaled_h)) as u32;
+                (source_y..end_y).any(|sy| (source_x..end_x).any(|sx| rotated.get_pixel(sx, sy)))
+            } else {
+                rotated.get_pixel(source_x, source_y)
+            };
+            if black {
                 frame.set_pixel(left + x, top + y, true);
             }
         }
+    }
+    if preserve_ink && !frame.data().iter().any(|byte| *byte != 0) {
+        // Even a one-pixel guide rotated by 45 degrees needs one visible
+        // output dot; inverse rotation can otherwise miss its sole pixel.
+        frame.set_pixel(width / 2, height / 2, true);
     }
     Ok(frame)
 }
@@ -595,9 +713,8 @@ fn render_box(
         .filter(|h| *h > 0)
         .ok_or_else(|| RenderError::Layout("font margin leaves no space in the text box".into()))?;
     let mut render = |size: f32| -> Result<LabelBitmap> {
-        Ok(renderer
-            .render_unbounded(content, font_name, size, align)?
-            .rotate(rotation))
+        let source = renderer.render_unbounded(content, font_name, size, align)?;
+        checked_rotate(&source, rotation)
     };
     let text = if let Some(size) = font_size_pt {
         render(size * f32::from(dpi) / 72.0)?
@@ -641,6 +758,12 @@ fn render_box(
         }
         best
     };
+    if !text.data().iter().any(|byte| *byte != 0) {
+        return Err(RenderError::Text(
+            "nonempty text produces no visible pixels at this output DPI; enlarge the frame or font size"
+                .into(),
+        ));
+    }
     let clipped = text.width() > width || text.height() > available_h;
     let remaining_x = i64::from(width) - i64::from(text.width());
     let left = match align {
@@ -1339,5 +1462,282 @@ mod tests {
             assert!(render_document(&doc, 76, 180, &mut renderer).is_err());
         }
         assert!(render_elements(&doc.elements, 76, "", 0, &mut renderer).is_err());
+    }
+
+    #[test]
+    fn rotated_text_checks_intermediate_area_before_allocating_it() {
+        // The source is only 6 KiB, but a 45-degree bounding box would exceed
+        // a billion pixels. Neither fixed text nor auto-size candidates may
+        // allocate that intermediate image.
+        let thin = LabelBitmap::new(50_000, 1);
+        assert!(matches!(
+            checked_rotate(&thin, 45.0),
+            Err(RenderError::DimensionMismatch(_))
+        ));
+        assert!(checked_rotate(&thin, 90.0).is_ok());
+        let mut item = LabelObject::text("汉".repeat(1000), TextBox::default());
+        item.rotation = 45.0;
+        if let ObjectContent::Text { font_size, .. } = &mut item.content {
+            *font_size = Some(10.0);
+        }
+        let mut doc = document(vec![LabelElement::Object(item)]);
+        doc.version = 3;
+        let error = render_document(&doc, 76, 180, &mut TextRenderer::with_test_font())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("rotated content raster is too large")
+        );
+    }
+
+    #[test]
+    fn nonempty_text_cannot_silently_render_as_a_blank_frame() {
+        let mut item = LabelObject::text("汉字", TextBox::default());
+        if let ObjectContent::Text { font_size, .. } = &mut item.content {
+            *font_size = Some(0.1);
+        }
+        let mut doc = document(vec![LabelElement::Object(item)]);
+        doc.version = 3;
+        let error = render_document(&doc, 76, 180, &mut TextRenderer::with_test_font())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("no visible pixels"));
+        if let ObjectContent::Text { content, .. } =
+            &mut doc.elements[0].as_object_mut().unwrap().content
+        {
+            *content = String::new();
+        }
+        let empty = render(&doc, 180);
+        assert_eq!(empty.bounds.len(), 1);
+        assert!(empty.bitmap.unwrap().data().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn empty_tail_and_zero_padding_conversion_preserve_mirrored_extent_and_ink() {
+        for flip_h in [false, true] {
+            let mut doc = document(vec![
+                LabelElement::CutMark,
+                LabelElement::Padding { pixels: 0 },
+                LabelElement::Text {
+                    content: String::new(),
+                    font_size: None,
+                    text_box: None,
+                    align: TextAlign::Left,
+                    rotation: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                },
+            ]);
+            doc.version = 1;
+            doc.flip_h = flip_h;
+            let before = render(&doc, 180);
+            doc.convert_to_free_layout(76, 180, &mut TextRenderer::with_test_font())
+                .unwrap();
+            let after = render(&doc, 180);
+            assert_eq!(before.bounds[0], after.bounds[0]);
+            let before = before.bitmap.unwrap();
+            let after = after.bitmap.unwrap();
+            assert_eq!(before.width(), after.width());
+            assert_eq!(before.data(), after.data());
+            assert!(
+                doc.elements
+                    .iter()
+                    .all(|element| element.as_object().is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn cut_guides_survive_narrow_frames_and_legacy_conversion_at_both_dpis() {
+        for (dpi, height) in [(180, 76), (360, 150)] {
+            let mut legacy = document(vec![LabelElement::CutMark]);
+            legacy.version = 1;
+            legacy.dpi = dpi;
+            let mut renderer = TextRenderer::with_test_font();
+            let before = render_document(&legacy, height, dpi, &mut renderer).unwrap();
+            legacy
+                .convert_to_free_layout(height, dpi, &mut renderer)
+                .unwrap();
+            let after = render_document(&legacy, height, dpi, &mut renderer).unwrap();
+            assert_eq!(before.bounds, after.bounds);
+            assert_eq!(before.bitmap.unwrap().data(), after.bitmap.unwrap().data());
+            let object = legacy.elements[0].as_object_mut().unwrap();
+            object.frame.width_mm = 25.4 / f64::from(dpi);
+            for height_mm in [25.4 / f64::from(dpi), 8.0] {
+                legacy.elements[0].as_object_mut().unwrap().frame.height_mm = height_mm;
+                for rotation in [0.0, 45.0, 90.0, 135.0, 270.0] {
+                    legacy.elements[0].as_object_mut().unwrap().rotation = rotation;
+                    let rendered = render_document(&legacy, height, dpi, &mut renderer).unwrap();
+                    assert!(
+                        rendered
+                            .bitmap
+                            .unwrap()
+                            .data()
+                            .iter()
+                            .any(|byte| *byte != 0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn converting_physical_frames_preserves_exact_millimeters_at_both_dpis() {
+        let mut original = panel(&["汉字", "字", ""]);
+        original.flip_h = true;
+        for element in &mut original.elements {
+            if let LabelElement::Text {
+                text_box: Some(frame),
+                ..
+            } = element
+            {
+                frame.y_mm = 1.0;
+                frame.vertical_align = VerticalAlign::Bottom;
+            }
+        }
+        let mut converted = original.clone();
+        let mut renderer = TextRenderer::with_test_font();
+        converted
+            .convert_to_free_layout(76, 180, &mut renderer)
+            .unwrap();
+        for (index, element) in converted.elements.iter().enumerate() {
+            let frame = &element.as_object().unwrap().frame;
+            assert_eq!(frame.x_mm, [5.0, 18.0, 31.0][index]);
+            assert_eq!(
+                (frame.y_mm, frame.width_mm, frame.height_mm),
+                (1.0, 10.0, 8.0)
+            );
+            assert_eq!(frame.vertical_align, VerticalAlign::Bottom);
+        }
+        for (dpi, height) in [(180, 76), (360, 150)] {
+            let before = render_document(&original, height, dpi, &mut renderer).unwrap();
+            let after = render_document(&converted, height, dpi, &mut renderer).unwrap();
+            assert_eq!(before.bounds, after.bounds);
+            assert_eq!(before.bitmap.unwrap().data(), after.bitmap.unwrap().data());
+        }
+        // Converting an already physical v3 object must not quantize it either.
+        let frame = &mut converted.elements[0].as_object_mut().unwrap().frame;
+        frame.x_mm = 5.031;
+        frame.y_mm = 0.531;
+        frame.width_mm = 10.017;
+        frame.height_mm = 8.019;
+        let exact = frame.clone();
+        converted
+            .convert_to_free_layout(150, 360, &mut renderer)
+            .unwrap();
+        assert_eq!(converted.elements[0].as_object().unwrap().frame, exact);
+    }
+
+    #[test]
+    fn conversion_resolves_mixed_legacy_flow_without_rounding_the_mm_cursor() {
+        let mut original = document(vec![
+            element(
+                "汉字",
+                TextBox {
+                    x_mm: 5.031,
+                    width_mm: 10.017,
+                    ..TextBox::default()
+                },
+            ),
+            LabelElement::Padding { pixels: 7 },
+            element(
+                "字",
+                TextBox {
+                    position: PositionMode::Relative,
+                    gap_mm: 3.071,
+                    width_mm: 10.019,
+                    height_mm: 8.017,
+                    y_mm: 0.531,
+                    ..TextBox::default()
+                },
+            ),
+        ]);
+        original.flip_h = true;
+        let mut renderer = TextRenderer::with_test_font();
+        for (dpi, height) in [(180, 76), (360, 150)] {
+            let mut converted = original.clone();
+            converted
+                .convert_to_free_layout(height, dpi, &mut renderer)
+                .unwrap();
+            let frame = &converted.elements[2].as_object().unwrap().frame;
+            let expected_x = 5.031 + 10.017 + 7.0 * 25.4 / f64::from(dpi) + 3.071;
+            assert!((frame.x_mm - expected_x).abs() < 1e-12);
+            assert_eq!(
+                (frame.y_mm, frame.width_mm, frame.height_mm),
+                (0.531, 10.019, 8.017)
+            );
+            let before = render_document(&original, height, dpi, &mut renderer).unwrap();
+            let after = render_document(&converted, height, dpi, &mut renderer).unwrap();
+            assert_eq!(before.bounds, after.bounds);
+            assert_eq!(before.bitmap.unwrap().data(), after.bitmap.unwrap().data());
+        }
+    }
+
+    #[test]
+    fn overlapping_objects_cannot_bypass_the_raster_working_set_limit() {
+        let frame = TextBox {
+            width_mm: 10_000.0,
+            ..TextBox::default()
+        };
+        // Every object shares the same extent. A union-only check would allow
+        // all of these intermediate bitmaps to remain allocated together.
+        let mut doc = document(
+            (0..32)
+                .map(|_| object(ObjectContent::Padding, frame.clone()))
+                .collect(),
+        );
+        doc.version = 3;
+        let error = render_document(&doc, 76, 180, &mut TextRenderer::with_test_font())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("working set is too large"));
+    }
+
+    #[test]
+    fn new_empty_frames_do_not_extend_exact_physical_edges_at_another_dpi() {
+        let mut original = document(vec![
+            element(
+                "汉字",
+                TextBox {
+                    width_mm: 19.97,
+                    ..TextBox::default()
+                },
+            ),
+            LabelElement::Text {
+                content: String::new(),
+                font_size: None,
+                text_box: None,
+                align: TextAlign::Left,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+            },
+        ]);
+        let mut renderer = TextRenderer::with_test_font();
+        for flip_h in [false, true] {
+            original.flip_h = flip_h;
+            for (conversion_dpi, conversion_height) in [(180, 76), (360, 150)] {
+                let mut converted = original.clone();
+                converted
+                    .convert_to_free_layout(conversion_height, conversion_dpi, &mut renderer)
+                    .unwrap();
+                for element in &converted.elements {
+                    let frame = &element.as_object().unwrap().frame;
+                    assert!(frame.x_mm + frame.width_mm <= 19.97);
+                }
+                for (dpi, height, expected_width) in [(180, 76, 142), (360, 150, 283)] {
+                    let before = render_document(&original, height, dpi, &mut renderer).unwrap();
+                    let after = render_document(&converted, height, dpi, &mut renderer).unwrap();
+                    assert_eq!(before.bounds[0], after.bounds[0]);
+                    let before = before.bitmap.unwrap();
+                    let after = after.bitmap.unwrap();
+                    assert_eq!(before.width(), expected_width);
+                    assert_eq!(after.width(), expected_width);
+                    assert_eq!(before.data(), after.data());
+                }
+            }
+        }
     }
 }
