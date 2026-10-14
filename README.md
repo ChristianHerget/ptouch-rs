@@ -205,13 +205,18 @@ ptouch list
 
 New GUI layouts use physical objects for text, images, and cut marks. Each has a
 millimeter frame with width, height, X/Y position, rotation, and mirroring. Drag
-an object on the canvas to move it, or drag its square handle to resize it. The
-optional 0.1 mm snap and arrow keys allow fine adjustments (Shift moves 1 mm).
-Turn off whole-label horizontal mirroring before dragging; numeric properties
-and each object's own mirroring remain available. This avoids an ambiguous drag
-origin when the mirrored label's total length changes.
-The ruler follows the original print pixels even when a long preview texture
-is reduced for display.
+an object on the canvas to move it, drag its square handle to resize it, or drag
+the round handle above its top-right corner to rotate its content. Hold Shift
+while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow
+keys allow fine position adjustments (Shift moves 1 mm).
+Turn off whole-label horizontal mirroring before moving or resizing with the
+mouse; the round rotation handle, numeric properties, and each object's own
+mirroring remain available. This avoids an ambiguous movement origin when the
+mirrored label's total length changes.
+The X and Y millimeter rulers remain visible while scrolling and follow the
+original print pixels even when a long preview texture is reduced for display.
+The Y endpoint shows the actual printable height at the current DPI, which can
+be smaller than the nominal tape width.
 
 New text starts as a 10 mm wide box with automatic font size; its height is
 8 mm or the printable height, whichever is smaller. The first object starts at
