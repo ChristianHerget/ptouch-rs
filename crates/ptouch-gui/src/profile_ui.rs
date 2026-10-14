@@ -12,6 +12,10 @@ pub struct ProfilesUi {
     draft: PrinterProfile,
     editing: Option<String>,
     filename: String,
+    usb_devices: Vec<ptouch_core::usb_profiles::UsbCandidate>,
+    usb_error: Option<String>,
+    usb_loading: bool,
+    usb_refresh: bool,
 }
 
 impl Default for ProfilesUi {
@@ -24,6 +28,10 @@ impl Default for ProfilesUi {
             draft: new_profile(),
             editing: None,
             filename: String::new(),
+            usb_devices: Vec::new(),
+            usb_error: None,
+            usb_loading: false,
+            usb_refresh: true,
         }
     }
 }
@@ -62,6 +70,60 @@ impl ProfilesUi {
             }
         }
     }
+    pub fn usb_discovered(
+        &mut self,
+        result: Result<Vec<ptouch_core::usb_profiles::UsbCandidate>, String>,
+    ) {
+        self.usb_loading = false;
+        match result {
+            Ok(devices) => {
+                self.usb_devices = devices;
+                self.usb_error = None;
+            }
+            Err(error) => self.usb_error = Some(error),
+        }
+    }
+
+    fn saved_target(&self, alias: &str) -> PrinterTarget {
+        let result = (|| {
+            let store = self.store.as_ref().ok_or_else(|| {
+                self.error
+                    .clone()
+                    .unwrap_or_else(|| "Profiles unavailable".into())
+            })?;
+            let entry = store
+                .entries
+                .get(alias)
+                .ok_or_else(|| format!("Saved printer {alias} no longer exists"))?;
+            validate(&entry.profile)?;
+            Ok::<_, String>(entry.profile.clone())
+        })();
+        match result {
+            Ok(p) => PrinterTarget::Profile(p),
+            Err(e) => PrinterTarget::Unavailable(e),
+        }
+    }
+
+    pub fn directory_target(&self) -> PrinterTarget {
+        match self
+            .store
+            .as_ref()
+            .and_then(|s| s.default_printer.as_deref())
+        {
+            Some(alias) => self.saved_target(alias),
+            None => PrinterTarget::Unavailable(self.error.clone().unwrap_or_else(|| {
+                "No default printer in this directory; select a printer".into()
+            })),
+        }
+    }
+
+    fn reload_target(&self, current: &PrinterTarget) -> Option<PrinterTarget> {
+        match current {
+            PrinterTarget::Profile(p) => Some(self.saved_target(&p.alias)),
+            _ => None,
+        }
+    }
+
     pub fn default_profile(&self) -> Option<PrinterProfile> {
         self.store.as_ref()?.selected(None).ok().flatten().cloned()
     }
@@ -76,6 +138,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     }
     let mut open = true;
     let mut selected = None;
+    let active_target = state.printer_target.clone();
     let p = &mut state.profiles;
     egui::Window::new("Printers")
         .open(&mut open)
@@ -91,10 +154,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     p.directory = dir;
                     p.reload();
                     p.editing = None;
+                    selected = Some(p.directory_target());
                 }
                 if ui.button("Reload files").clicked() {
                     p.reload();
                     p.editing = None;
+                    selected = p.reload_target(&active_target);
                 }
                 if ui.button("New printer").clicked() {
                     p.draft = new_profile();
@@ -143,6 +208,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     ui.text_edit_singleline(&mut p.draft.alias);
                     ui.end_row();
                     ui.label("Model");
+                    let previous_model = p.draft.model.clone();
                     egui::ComboBox::from_id_salt("profile_model")
                         .selected_text(&p.draft.model)
                         .show_ui(ui, |ui| {
@@ -162,13 +228,19 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                                 );
                             }
                         });
+                    reconcile_model(&mut p.draft, &previous_model);
                     ui.end_row();
                     ui.label("Connection");
                     let was_network = matches!(p.draft.connection, Connection::Network { .. });
                     let mut network = was_network;
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut network, true, "Network");
-                        ui.radio_value(&mut network, false, "USB");
+                        let model = ptouch_core::printer_model::PrinterModel::find(&p.draft.model);
+                        ui.add_enabled_ui(model.is_some_and(|m| m.network.is_some()), |ui| {
+                            ui.radio_value(&mut network, true, "Network");
+                        });
+                        ui.add_enabled_ui(model.is_some_and(|m| m.usb), |ui| {
+                            ui.radio_value(&mut network, false, "USB");
+                        });
                     });
                     if network != was_network {
                         p.draft.connection = if network {
@@ -182,41 +254,33 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     ui.end_row();
                     match &mut p.draft.connection {
                         Connection::Network { host } => {
-                            ui.label("Hostname / IP");
+                            ui.label("Hostname / IP address");
                             ui.text_edit_singleline(host);
                         }
                         Connection::Usb { serial } => {
-                            ui.label("USB serial (optional)");
-                            let mut value = serial.clone().unwrap_or_default();
-                            if ui.text_edit_singleline(&mut value).changed() {
-                                *serial = if value.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(value)
-                                };
-                            }
+                            ui.label("USB serial");
+                            p.usb_refresh |= usb_serial_selector(
+                                ui, serial, &p.draft.model, &p.usb_devices, p.usb_loading,
+                            );
                         }
                     };
                     ui.end_row();
                     ui.label("Preferred quality");
                     let model = ptouch_core::printer_model::PrinterModel::find(&p.draft.model);
+                    let selected_mode = model
+                        .and_then(|m| m.quality.mode(to_core_quality(p.draft.quality)).ok());
                     egui::ComboBox::from_id_salt("profile_quality")
-                        .selected_text(format!("{:?}", p.draft.quality))
+                        .selected_text(selected_mode.map(|m| m.label())
+                            .unwrap_or_else(|| "Unsupported quality".into()))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut p.draft.quality,
-                                Quality::Standard,
-                                "Standard",
-                            );
-                            if model.is_some_and(|m| m.high_resolution) {
-                                ui.selectable_value(
-                                    &mut p.draft.quality,
-                                    Quality::High,
-                                    "High resolution",
-                                );
-                            }
-                            if model.is_some_and(|m| m.draft) {
-                                ui.selectable_value(&mut p.draft.quality, Quality::Draft, "Draft");
+                            if let Some(model) = model {
+                                for mode in model.quality.modes {
+                                    ui.selectable_value(
+                                        &mut p.draft.quality, from_core_quality(mode.quality), mode.label(),
+                                    ).on_hover_text(format!(
+                                        "DPI: across the head × along the tape. {}", mode.requirement(),
+                                    ));
+                                }
                             }
                         });
                     ui.end_row();
@@ -237,10 +301,16 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     );
                     ui.end_row();
                 });
+            if p.usb_loading {
+                ui.label("Reading USB serials…");
+            }
+            if let Some(error) = &p.usb_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
             ui.horizontal(|ui| {
                 if ui.button("Connect without saving").clicked() {
                     match validate(&p.draft) {
-                        Ok(()) => selected = Some(p.draft.clone()),
+                        Ok(()) => selected = Some(PrinterTarget::TemporaryProfile(p.draft.clone())),
                         Err(e) => p.error = Some(e),
                     }
                 }
@@ -264,7 +334,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                         Ok(()) => {
                             p.editing = Some(p.draft.alias.clone());
                             p.error = None;
-                            selected = Some(p.draft.clone());
+                            selected = Some(PrinterTarget::Profile(p.draft.clone()));
                         }
                         Err(e) => p.error = Some(e),
                     }
@@ -288,26 +358,31 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                         p.error = store.remove(&alias).err().map(|e| e.to_string());
                         if p.error.is_none() {
                             p.editing = None;
+                            if matches!(&active_target, PrinterTarget::Profile(profile) if profile.alias == alias) {
+                                selected = Some(PrinterTarget::Unavailable(format!("Saved printer {alias} was removed")));
+                            }
                         }
                     }
                 });
             }
         });
     p.open = open;
-    if let Some(profile) = selected {
-        state.printer_target = PrinterTarget::Profile(profile);
-        state.apply_target_preferences();
-        state.printer_connected = false;
-        state.connecting = true;
-        state.printer_status = Some("Connecting…".into());
+    if p.usb_refresh && !p.usb_loading {
+        p.usb_refresh = false;
         if let Some(tx) = &state.printer_cmd_tx {
-            let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
+            p.usb_loading = tx.send(PrinterCommand::DiscoverUsbProfiles).is_ok();
         }
+    }
+    if let Some(target) = selected {
+        state.select_target(target);
     }
 }
 
 fn validate(p: &PrinterProfile) -> Result<(), String> {
     p.validate().map_err(|e| e.to_string())?;
+    if let Connection::Network { host } = &p.connection {
+        ptouch_core::network_host::normalize(host).map_err(|e| e.to_string())?;
+    }
     let m = ptouch_core::printer_model::PrinterModel::find(&p.model).ok_or("Unknown model")?;
     if matches!(p.connection, Connection::Usb { .. }) && !m.usb {
         return Err("USB is not implemented for this model".into());
@@ -315,10 +390,297 @@ fn validate(p: &PrinterProfile) -> Result<(), String> {
     if matches!(p.connection, Connection::Network { .. }) && m.network.is_none() {
         return Err("This model has no network backend".into());
     }
-    if (p.quality == Quality::High && !m.high_resolution)
-        || (p.quality == Quality::Draft && !m.draft)
-    {
+    if m.quality.mode(to_core_quality(p.quality)).is_err() {
         return Err("Quality unsupported by this model".into());
     }
     Ok(())
+}
+
+/// A single editable dropdown; returns whether discovery should be refreshed.
+fn usb_serial_selector(
+    ui: &mut egui::Ui,
+    serial: &mut Option<String>,
+    model: &str,
+    devices: &[ptouch_core::usb_profiles::UsbCandidate],
+    loading: bool,
+) -> bool {
+    let mut refresh = false;
+    let mut value = serial.clone().unwrap_or_default();
+    egui::Frame::group(ui.style())
+        .inner_margin(2.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut value)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(240.0)
+                            .hint_text("Automatic — one matching printer"),
+                    )
+                    .changed()
+                {
+                    *serial = serial_value(&value);
+                }
+                ui.menu_button("▾", |ui| {
+                    if ui
+                        .selectable_label(serial.is_none(), "Automatic — one matching printer")
+                        .clicked()
+                    {
+                        *serial = None;
+                        ui.close();
+                    }
+                    for device in devices.iter().filter(|d| d.model == model) {
+                        if let Some(error) = &device.identity_error {
+                            ui.add_enabled(false, egui::Button::new(error));
+                        } else if let Some(candidate) = &device.serial {
+                            if ui
+                                .selectable_label(serial.as_ref() == Some(candidate), candidate)
+                                .clicked()
+                            {
+                                *serial = Some(candidate.clone());
+                                ui.close();
+                            }
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new("Detected printer has no serial"),
+                            );
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!loading, egui::Button::new("Refresh devices"))
+                        .clicked()
+                    {
+                        refresh = true;
+                        ui.close();
+                    }
+                });
+            });
+        });
+    refresh
+}
+
+fn serial_value(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+fn to_core_quality(quality: Quality) -> ptouch_core::PrintQuality {
+    match quality {
+        Quality::Standard => ptouch_core::PrintQuality::Standard,
+        Quality::High => ptouch_core::PrintQuality::HighRes,
+        Quality::Draft => ptouch_core::PrintQuality::Draft,
+    }
+}
+fn from_core_quality(quality: ptouch_core::PrintQuality) -> Quality {
+    match quality {
+        ptouch_core::PrintQuality::Standard => Quality::Standard,
+        ptouch_core::PrintQuality::HighRes => Quality::High,
+        ptouch_core::PrintQuality::Draft => Quality::Draft,
+    }
+}
+
+fn reconcile_model(profile: &mut PrinterProfile, previous: &str) {
+    if profile.model == previous {
+        return;
+    }
+    let Some(model) = ptouch_core::printer_model::PrinterModel::find(&profile.model) else {
+        return;
+    };
+    match &mut profile.connection {
+        Connection::Network { .. } if model.network.is_none() && model.usb => {
+            profile.connection = Connection::Usb { serial: None }
+        }
+        Connection::Usb { .. } if !model.usb && model.network.is_some() => {
+            profile.connection = Connection::Network {
+                host: String::new(),
+            }
+        }
+        Connection::Usb { serial } => *serial = None,
+        _ => {}
+    }
+    if model
+        .quality
+        .mode(to_core_quality(profile.quality))
+        .is_err()
+    {
+        profile.quality = Quality::Standard;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ptouch-profile-ui-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn profile() -> PrinterProfile {
+        PrinterProfile {
+            connection: Connection::Network {
+                host: "old-printer".into(),
+            },
+            ..new_profile()
+        }
+    }
+    fn saved(directory: &TestDirectory) -> ProfilesUi {
+        let mut ui = ProfilesUi::load(directory.0.clone());
+        ui.store.as_mut().unwrap().add(profile(), None).unwrap();
+        ui
+    }
+
+    #[test]
+    fn reload_reconnects_saved_alias_with_current_connection_and_preferences() {
+        let dir = TestDirectory::new();
+        let mut ui = saved(&dir);
+        let mut state = AppState::default();
+        state.select_target(PrinterTarget::Profile(profile()));
+        state.printer_connected = true;
+        let old_selection = state.selection();
+        let mut updated = profile();
+        updated.connection = Connection::Network {
+            host: "new-printer".into(),
+        };
+        updated.quality = Quality::High;
+        updated.final_cut = false;
+        ProfileStore::load(&dir.0)
+            .unwrap()
+            .update("printer", updated.clone())
+            .unwrap();
+        ui.reload();
+        state.select_target(ui.reload_target(&state.printer_target).unwrap());
+        assert_eq!(state.printer_target, PrinterTarget::Profile(updated));
+        assert!(!state.printer_connected);
+        assert!(state.connecting);
+        assert!(!state.auto_cut);
+        assert_eq!(state.print_quality, ptouch_core::PrintQuality::HighRes);
+        assert_ne!(old_selection, state.selection());
+    }
+
+    #[test]
+    fn removed_or_invalid_saved_profiles_disconnect_but_temporary_profiles_survive_reload() {
+        let dir = TestDirectory::new();
+        let mut ui = saved(&dir);
+        let active = PrinterTarget::Profile(profile());
+        let temporary = PrinterTarget::TemporaryProfile(profile());
+        ProfileStore::load(&dir.0)
+            .unwrap()
+            .remove("printer")
+            .unwrap();
+        ui.reload();
+        assert!(matches!(
+            ui.reload_target(&active),
+            Some(PrinterTarget::Unavailable(_))
+        ));
+        assert!(ui.reload_target(&temporary).is_none());
+        std::fs::write(dir.0.join("broken.toml"), "[not valid").unwrap();
+        ui.reload();
+        assert!(ui.error.is_some());
+        assert!(matches!(
+            ui.reload_target(&active),
+            Some(PrinterTarget::Unavailable(_))
+        ));
+        assert!(ui.reload_target(&temporary).is_none());
+    }
+
+    #[test]
+    fn new_directory_uses_its_default_and_rejects_invalid_defaults() {
+        let dir = TestDirectory::new();
+        let mut ui = saved(&dir);
+        assert!(matches!(
+            ui.directory_target(),
+            PrinterTarget::Unavailable(_)
+        ));
+        ui.store
+            .as_mut()
+            .unwrap()
+            .set_default(Some("printer"))
+            .unwrap();
+        assert_eq!(ui.directory_target(), PrinterTarget::Profile(profile()));
+        let mut invalid = profile();
+        invalid.model = "PT-P700".into(); // USB only
+        ui.store
+            .as_mut()
+            .unwrap()
+            .update("printer", invalid)
+            .unwrap();
+        assert!(matches!(
+            ui.directory_target(),
+            PrinterTarget::Unavailable(_)
+        ));
+        let other = TestDirectory::new();
+        let other_ui = saved(&other);
+        assert!(matches!(
+            other_ui.directory_target(),
+            PrinterTarget::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn model_changes_preserve_valid_settings_and_reset_incompatible_settings() {
+        let mut p = profile();
+        p.quality = Quality::High;
+        p.model = "PT-P700".into();
+        reconcile_model(&mut p, "PT-P750W");
+        assert_eq!(p.connection, Connection::Usb { serial: None });
+        assert_eq!(p.quality, Quality::Standard);
+        p.connection = Connection::Usb {
+            serial: Some("old-model-serial".into()),
+        };
+        p.model = "PT-9700PC".into();
+        p.quality = Quality::High;
+        reconcile_model(&mut p, "PT-P700");
+        assert_eq!(p.connection, Connection::Usb { serial: None });
+        assert_eq!(p.quality, Quality::High);
+        p.model = "PT-P950NW".into();
+        reconcile_model(&mut p, "PT-9700PC");
+        assert!(matches!(p.connection, Connection::Network { .. }));
+        assert_eq!(p.quality, Quality::Standard);
+        p.connection = Connection::Network {
+            host: "keep-host".into(),
+        };
+        p.model = "PT-P750W".into();
+        reconcile_model(&mut p, "PT-P950NW");
+        assert_eq!(
+            p.connection,
+            Connection::Network {
+                host: "keep-host".into()
+            }
+        );
+    }
+
+    #[test]
+    fn serial_entry_survives_absent_devices_and_discovery_failures() {
+        let mut ui = ProfilesUi::default();
+        ui.draft.connection = Connection::Usb {
+            serial: serial_value("disconnected-device"),
+        };
+        ui.usb_discovered(Ok(Vec::new()));
+        ui.usb_discovered(Err("USB unavailable".into()));
+        assert_eq!(
+            ui.draft.connection,
+            Connection::Usb {
+                serial: Some("disconnected-device".into())
+            }
+        );
+        assert_eq!(serial_value(" "), None);
+        assert_eq!(serial_value(" ABC "), Some("ABC".into()));
+    }
 }

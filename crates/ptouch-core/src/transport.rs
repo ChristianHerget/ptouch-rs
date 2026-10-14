@@ -102,7 +102,7 @@ impl Transport for UsbBackend {
 
 /// A connection to a Brother P-Touch USB printer.
 ///
-/// This facade keeps the USB constructors and method signatures unchanged.
+/// Raster input carries its resolution explicitly.
 pub struct PtouchDevice {
     session: PrinterSession<UsbBackend>,
     dev_info: DeviceInfo,
@@ -143,29 +143,74 @@ impl PtouchDevice {
 
     /// Select a portable model/serial identity. Ambiguous matches are rejected.
     pub fn open_profile(model: &str, serial: Option<&str>) -> Result<Self> {
+        let devices = crate::usb_profiles::discover()?;
+        let selected = crate::usb_profiles::select(&devices, model, serial)?;
+        #[cfg(windows)]
+        if let crate::usb_profiles::Selector::Windows {
+            instance_id,
+            usbprint: true,
+        } = &selected.selector
+        {
+            return Self::open_usbprint(instance_id);
+        }
         let context = Context::new()?;
         let mut candidates = Vec::new();
+        #[cfg(windows)]
+        let mut identity_error = None;
         for usb in context.devices()?.iter() {
+            #[cfg(not(windows))]
+            if selected.selector != crate::usb_profiles::Selector::Libusb(UsbLocation::of(&usb)) {
+                continue;
+            }
             let Ok(desc) = usb.device_descriptor() else {
                 continue;
             };
             let Some(info) = device::find_device(desc.vendor_id(), desc.product_id()) else {
                 continue;
             };
-            if !info.name.eq_ignore_ascii_case(model)
+            if info.name != selected.model
                 || info
                     .flags
                     .intersects(DeviceFlags::PLITE | DeviceFlags::UNSUP_RASTER)
             {
                 continue;
             }
-            if let Some(serial) = serial {
-                let handle = usb.open()?;
-                if handle.read_serial_number_string_ascii(&desc)?.trim() != serial {
+            if selected.serial.is_some() {
+                let serial = usb
+                    .open()
+                    .and_then(|handle| handle.read_serial_number_string_ascii(&desc));
+                #[cfg(not(windows))]
+                let serial = serial?;
+                #[cfg(windows)]
+                let serial = match serial {
+                    Ok(serial) => serial,
+                    Err(error) => {
+                        // PnP already selected one physical serial. Another
+                        // printer of this model may use USBPRINT, which libusb
+                        // cannot open; it must not hide the selected WinUSB one.
+                        identity_error = Some(error);
+                        continue;
+                    }
+                };
+                if !selected.matches_serial(serial.trim()) {
                     continue;
                 }
             }
+            // With no serial, more than one physical printer of this model
+            // cannot be mapped safely from PnP to libusb.
+            #[cfg(windows)]
+            if selected.serial.is_none()
+                && devices.iter().filter(|d| d.model == selected.model).count() != 1
+            {
+                return Err(PtouchError::AmbiguousDevice);
+            }
             candidates.push((usb, info.clone()));
+        }
+        #[cfg(windows)]
+        if candidates.is_empty()
+            && let Some(error) = identity_error
+        {
+            return Err(error.into());
         }
         let (usb, info) = only_candidate(candidates)?;
         Self::open_device(usb, info)
@@ -333,12 +378,13 @@ impl PtouchDevice {
     pub fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: crate::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: protocol::PrintQuality,
     ) -> Result<()> {
         self.session
-            .print_raster(lines, chain_print, precut, quality)
+            .print_raster(lines, resolution, chain_print, precut, quality)
     }
     /// Feed tape forward and cut.
     pub fn feed_and_cut(&mut self) -> Result<()> {

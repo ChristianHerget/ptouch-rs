@@ -14,15 +14,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::device::DeviceFlags;
+use crate::{
+    PrintResolution, Result,
+    quality::{QualityCommands, QualityProfile},
+};
 
 /// Print quality mode.
 ///
-/// On 360 dpi printers the head resolution is fixed at 360 dpi across the
-/// tape, but the feed resolution along the tape can be doubled (high
-/// resolution, 360x720) or halved (draft, 360x180). Physical label length
-/// is preserved by duplicating or dropping raster lines on the legacy backend.
-/// PT-P750W high resolution instead accepts source rasterized at 360 feed dpi;
-/// the protocol does not duplicate those columns.
+/// Head resolution is fixed. Feed resolution is selected by the mode. Input
+/// rasters must already use that resolution; command builders never rescale them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrintQuality {
     /// Normal 1:1 printing (e.g. 360x360 dpi).
@@ -381,40 +381,33 @@ pub struct JobOptions {
 /// data, as specified by the Brother raster command references (e.g.
 /// PT-P900 reference, section 2.2.3). Printers that boot in ESC/P mode
 /// (PT-9700PC) lock up when M arrives before the raster mode switch.
-pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions) -> Vec<Vec<u8>> {
+pub fn build_print_job(
+    lines: &[Vec<u8>],
+    resolution: PrintResolution,
+    flags: DeviceFlags,
+    profile: QualityProfile,
+    opts: &JobOptions,
+) -> Result<Vec<Vec<u8>>> {
+    profile
+        .mode(opts.quality)?
+        .validate_resolution(resolution)?;
     let use_packbits = flags.contains(DeviceFlags::RASTER_PACKBITS);
     let is_d460bt = flags.contains(DeviceFlags::D460BT_MAGIC);
 
-    // Quality modes change the feed resolution along the tape. Keep the
-    // physical length by duplicating lines (high resolution) or dropping
-    // every other line (draft).
-    let quality = if flags.intersects(DeviceFlags::LEGACY_HIRES | DeviceFlags::P750_HIRES) {
-        opts.quality
-    } else {
-        PrintQuality::Standard
-    };
-    let (repeat, step) = match quality {
-        PrintQuality::Standard => (1, 1),
-        PrintQuality::HighRes if flags.contains(DeviceFlags::P750_HIRES) => (1, 1),
-        PrintQuality::HighRes => (2, 1),
-        PrintQuality::Draft => (1, 2),
-    };
-    let selected: Vec<&Vec<u8>> = lines.iter().step_by(step).collect();
-    let line_count = (selected.len() * repeat) as u32;
-
-    let mut job: Vec<Vec<u8>> = Vec::with_capacity(selected.len() * repeat + 8);
+    let quality = opts.quality;
+    let line_count = lines.len() as u32;
+    let mut job: Vec<Vec<u8>> = Vec::with_capacity(lines.len() + 8);
 
     job.push(cmd_raster_start(flags));
 
-    // The standard quality path stays byte identical to the verified
-    // stream; quality commands are only sent when a non-default mode is
-    // requested on a device that supports it.
-    if flags.contains(DeviceFlags::LEGACY_HIRES) && quality != PrintQuality::Standard {
+    // Preserve each backend's standard stream. Legacy quality commands are
+    // needed only for non-standard modes; AdvancedMode always sets cut flags.
+    if profile.usb_commands == QualityCommands::LegacyInfo && quality != PrintQuality::Standard {
         job.push(cmd_legacy_info(opts.media_width, quality));
         job.push(cmd_advanced_mode(quality, false, true, true));
     }
 
-    if flags.contains(DeviceFlags::P750_HIRES) {
+    if profile.usb_commands == QualityCommands::AdvancedMode {
         job.push(cmd_advanced_mode(quality, false, !opts.chain_print, false));
     }
 
@@ -438,21 +431,19 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
         job.push(cmd_enable_packbits());
     }
 
-    for line in selected {
-        for _ in 0..repeat {
-            if rasterline_is_blank(line) {
-                job.push(cmd_line_feed());
-            } else if use_packbits {
-                job.push(cmd_send_raster_packbits(line));
-            } else {
-                job.push(cmd_send_raster(line));
-            }
+    for line in lines {
+        if rasterline_is_blank(line) {
+            job.push(cmd_line_feed());
+        } else if use_packbits {
+            job.push(cmd_send_raster_packbits(line));
+        } else {
+            job.push(cmd_send_raster(line));
         }
     }
 
     job.push(cmd_finalize(opts.chain_print, flags));
 
-    job
+    Ok(job)
 }
 
 /// Check if a raster line is entirely blank (all zeros).
@@ -608,7 +599,14 @@ mod tests {
             precut: false,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            DeviceFlags::NONE,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         let expected: Vec<u8> = [
             vec![0x1B, 0x69, 0x52, 0x01],       // ESC i R 01 raster start
             vec![0x47, 0x02, 0x00, 0xFF, 0x00], // G len data
@@ -632,7 +630,14 @@ mod tests {
             precut: true,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, flags, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            flags,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         let expected: Vec<u8> = [
             vec![0x1B, 0x69, 0x61, 0x01],             // ESC i a 01 raster mode
             vec![0x1B, 0x69, 0x4D, 0x40],             // ESC i M precut on
@@ -658,7 +663,14 @@ mod tests {
             precut: true,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, flags, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            flags,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         let m_pos = job.iter().position(|c| c == &vec![0x4D, 0x02]).unwrap();
         assert_eq!(job[m_pos + 1][0], 0x47, "raster data must follow M");
     }
@@ -672,7 +684,14 @@ mod tests {
             precut: false,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            DeviceFlags::NONE,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         assert_eq!(job.last().unwrap(), &vec![0x0C]); // form feed, no cut
     }
 
@@ -685,7 +704,14 @@ mod tests {
             precut: true,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            DeviceFlags::NONE,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         assert!(!flat(&job).windows(3).any(|w| w == [0x1B, 0x69, 0x4D]));
     }
 
@@ -701,7 +727,14 @@ mod tests {
             precut: false,
             quality: PrintQuality::Standard,
         };
-        let job = build_print_job(&lines, flags, &opts);
+        let job = build_print_job(
+            &lines,
+            PrintResolution::square(180),
+            flags,
+            QualityProfile::for_model("PT-P700", 180),
+            &opts,
+        )
+        .unwrap();
         let expected: Vec<u8> = [
             vec![0x1B, 0x69, 0x61, 0x01], // raster mode
             vec![
@@ -721,7 +754,6 @@ mod tests {
         DeviceFlags::RASTER_PACKBITS
             .union(DeviceFlags::P700_INIT)
             .union(DeviceFlags::HAS_PRECUT)
-            .union(DeviceFlags::LEGACY_HIRES)
     }
 
     #[test]
@@ -733,7 +765,17 @@ mod tests {
             media_width: 24,
             ..JobOptions::default()
         };
-        let job = build_print_job(&lines, pt9700_flags(), &opts);
+        let job = build_print_job(
+            &lines,
+            QualityProfile::for_model("PT-9700PC", 360)
+                .mode(opts.quality)
+                .unwrap()
+                .resolution,
+            pt9700_flags(),
+            QualityProfile::for_model("PT-9700PC", 360),
+            &opts,
+        )
+        .unwrap();
         let bytes = flat(&job);
         assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x63]));
         assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x4B]));
@@ -747,16 +789,24 @@ mod tests {
             quality: PrintQuality::HighRes,
             ..JobOptions::default()
         };
-        let job = build_print_job(&lines, pt9700_flags(), &opts);
+        let job = build_print_job(
+            &lines,
+            QualityProfile::for_model("PT-9700PC", 360)
+                .mode(opts.quality)
+                .unwrap()
+                .resolution,
+            pt9700_flags(),
+            QualityProfile::for_model("PT-9700PC", 360),
+            &opts,
+        )
+        .unwrap();
         let expected: Vec<u8> = [
             vec![0x1B, 0x69, 0x61, 0x01],                       // raster mode
             vec![0x1B, 0x69, 0x63, 0x86, 0x09, 24, 0x00, 0x01], // ESC i c hires
             vec![0x1B, 0x69, 0x4B, 0x4c], // ESC i K hires bit with default half-cut and cut-at-end bits
             vec![0x4D, 0x02],             // packbits
             vec![0x47, 0x02, 0x00, 0x00, 0xAA], // line 1
-            vec![0x47, 0x02, 0x00, 0x00, 0xAA], // line 1 repeated
             vec![0x47, 0x02, 0x00, 0x00, 0x55], // line 2
-            vec![0x47, 0x02, 0x00, 0x00, 0x55], // line 2 repeated
             vec![0x1A],
         ]
         .concat();
@@ -765,21 +815,32 @@ mod tests {
 
     #[test]
     fn test_job_draft_quality() {
-        // Draft halves the feed resolution: every other line is dropped.
+        // Input already has draft feed resolution: every supplied line is retained.
         let lines = vec![vec![0x01], vec![0x02], vec![0x03]];
         let opts = JobOptions {
             media_width: 12,
             quality: PrintQuality::Draft,
             ..JobOptions::default()
         };
-        let job = build_print_job(&lines, pt9700_flags(), &opts);
+        let job = build_print_job(
+            &lines,
+            QualityProfile::for_model("PT-9700PC", 360)
+                .mode(opts.quality)
+                .unwrap()
+                .resolution,
+            pt9700_flags(),
+            QualityProfile::for_model("PT-9700PC", 360),
+            &opts,
+        )
+        .unwrap();
         let expected: Vec<u8> = [
             vec![0x1B, 0x69, 0x61, 0x01],                       // raster mode
             vec![0x1B, 0x69, 0x63, 0x86, 0x09, 12, 0x00, 0x00], // ESC i c to require HG tape as draft mode needs it
             vec![0x1B, 0x69, 0x4B, 0x0d], // ESC i K draft bit with default half-cut and cut-at-end bits
             vec![0x4D, 0x02],             // packbits
             vec![0x47, 0x02, 0x00, 0x00, 0x01], // line 1
-            vec![0x47, 0x02, 0x00, 0x00, 0x03], // line 3 (line 2 dropped)
+            vec![0x47, 0x02, 0x00, 0x00, 0x02], // line 2
+            vec![0x47, 0x02, 0x00, 0x00, 0x03], // line 3
             vec![0x1A],
         ]
         .concat();
@@ -787,17 +848,31 @@ mod tests {
     }
 
     #[test]
-    fn test_job_quality_ignored_without_device_support() {
+    fn test_job_rejects_unsupported_quality_and_wrong_resolution() {
         let lines = vec![vec![0xFF]];
         let opts = JobOptions {
-            media_width: 12,
             quality: PrintQuality::HighRes,
             ..JobOptions::default()
         };
-        let job = build_print_job(&lines, DeviceFlags::RASTER_PACKBITS, &opts);
-        let bytes = flat(&job);
-        assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x63]));
-        // Lines are not duplicated either.
-        assert_eq!(bytes.iter().filter(|&&b| b == 0x47).count(), 1);
+        assert!(
+            build_print_job(
+                &lines,
+                PrintResolution::square(180),
+                DeviceFlags::NONE,
+                QualityProfile::for_model("PT-P700", 180),
+                &opts
+            )
+            .is_err()
+        );
+        assert!(
+            build_print_job(
+                &lines,
+                PrintResolution::square(360),
+                pt9700_flags(),
+                QualityProfile::for_model("PT-9700PC", 360),
+                &opts
+            )
+            .is_err()
+        );
     }
 }

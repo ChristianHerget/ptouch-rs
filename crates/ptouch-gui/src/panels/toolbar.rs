@@ -18,16 +18,14 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         // -- Element addition buttons --
         if ui.button("Add Text").clicked() {
-            state.elements.push(LabelElement::Text {
+            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Text {
                 content: "Label".to_string(),
                 font_size: None,
                 align: TextAlign::Left,
                 rotation: 0.0,
                 flip_h: false,
                 flip_v: false,
-            });
-            state.selected_element = Some(state.elements.len() - 1);
-            state.mark_dirty();
+            }));
             info!("Added text element");
         }
 
@@ -46,9 +44,7 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                         state.status_message = format!("Image load error: {}", path.display());
                     } else {
                         info!("Loaded image: {}", path.display());
-                        state.elements.push(element);
-                        state.selected_element = Some(state.elements.len() - 1);
-                        state.mark_dirty();
+                        state.apply_editor_action(crate::editor::EditorAction::Add(element));
                     }
                 }
                 Err(e) => {
@@ -59,16 +55,14 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         if ui.button("Cut Mark").clicked() {
-            state.elements.push(LabelElement::CutMark);
-            state.selected_element = Some(state.elements.len() - 1);
-            state.mark_dirty();
+            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::CutMark));
             info!("Added cut mark");
         }
 
         if ui.button("Padding").clicked() {
-            state.elements.push(LabelElement::Padding { pixels: 20 });
-            state.selected_element = Some(state.elements.len() - 1);
-            state.mark_dirty();
+            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Padding {
+                pixels: 20,
+            }));
             info!("Added padding element");
         }
 
@@ -77,61 +71,13 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
         // -- Action buttons --
         let connected = state.printer_connected;
         let busy = state.is_printer_busy();
-        let has_bitmap = state.preview_bitmap.is_some() && !state.needs_rerender;
+        let has_bitmap = state.output_preview().is_some();
 
         if ui
             .add_enabled(connected && !busy && has_bitmap, egui::Button::new("Print"))
             .clicked()
-            && let Some(ref bitmap) = state.preview_bitmap
         {
-            let high_bitmap;
-            let bitmap = if state.printer_model_id == "PT-P750W"
-                && state.print_quality == ptouch_core::PrintQuality::HighRes
-            {
-                let mut renderer = ptouch_render::text::TextRenderer::new();
-                match ptouch_render::document::render_elements_high_resolution(
-                    &state.elements,
-                    state.tape_width_px,
-                    &state.font_name,
-                    state.font_margin,
-                    &mut renderer,
-                ) {
-                    Ok(Some(rendered)) => {
-                        high_bitmap = rendered.mirrored(state.overall_flip_h, state.overall_flip_v)
-                    }
-                    _ => {
-                        state.status_message = "High-resolution render failed".into();
-                        return;
-                    }
-                }
-                &high_bitmap
-            } else {
-                bitmap
-            };
-            let raster_lines = if let Some(left) = state.band_left {
-                raster::bitmap_to_raster_lines_at(bitmap, state.printer_max_px, left)
-            } else {
-                raster::bitmap_to_raster_lines(bitmap, state.printer_max_px)
-            };
-            let chain_print = !state.auto_cut;
-            let auto_cut = state.auto_cut;
-            if let Some(ref tx) = state.printer_cmd_tx {
-                let cancellation = ptouch_core::CancellationToken::default();
-                state.cancellation = Some(cancellation.clone());
-                let _ = tx.send(PrinterCommand::Print {
-                    raster_lines,
-                    expected_media: (state.tape_width_mm, state.media_code),
-                    job_timeout_secs: state.job_timeout_secs,
-                    chain_print,
-                    auto_cut,
-                    precut: state.precut,
-                    quality: state.print_quality,
-                    target: state.printer_target.clone(),
-                    cancellation,
-                });
-                state.operation_in_progress = true;
-                state.status_message = "Printing...".to_string();
-            }
+            do_print(state);
         }
 
         if ui
@@ -148,7 +94,7 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             let cancellation = ptouch_core::CancellationToken::default();
             state.cancellation = Some(cancellation.clone());
             let _ = tx.send(PrinterCommand::FeedAndCut {
-                target: state.printer_target.clone(),
+                target: state.selection(),
                 cancellation,
             });
             state.operation_in_progress = true;
@@ -164,7 +110,10 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             state.status_message = "Cancelling; sent data may still print".into();
         }
 
-        if ui.button("Export Image").clicked() {
+        if ui
+            .add_enabled(has_bitmap, egui::Button::new("Export Image"))
+            .clicked()
+        {
             do_export_image(state);
         }
 
@@ -178,6 +127,40 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             do_open_layout(state);
         }
     });
+}
+
+/// Submit exactly the pixels shown by the current preview.
+fn do_print(state: &mut AppState) {
+    if !state.printer_connected || state.is_printer_busy() || state.printer_quality.is_none() {
+        return;
+    }
+    let Some(preview) = state.output_preview() else {
+        return;
+    };
+    let resolution = preview.resolution;
+    let raster_lines = if let Some(left) = state.band_left {
+        raster::bitmap_to_raster_lines_at(&preview.bitmap, state.printer_max_px, left)
+    } else {
+        raster::bitmap_to_raster_lines(&preview.bitmap, state.printer_max_px)
+    };
+    if let Some(ref tx) = state.printer_cmd_tx {
+        let cancellation = ptouch_core::CancellationToken::default();
+        state.cancellation = Some(cancellation.clone());
+        let _ = tx.send(PrinterCommand::Print {
+            raster_lines,
+            resolution,
+            expected_media: (state.tape_width_mm, state.media_code),
+            job_timeout_secs: state.job_timeout_secs,
+            chain_print: !state.auto_cut,
+            auto_cut: state.auto_cut,
+            precut: state.precut,
+            quality: state.print_quality,
+            target: state.selection(),
+            cancellation,
+        });
+        state.operation_in_progress = true;
+        state.status_message = "Printing...".to_string();
+    }
 }
 
 /// Save the current design to a `.ptl` layout file (TOML with embedded images).
@@ -257,9 +240,13 @@ fn do_open_layout(state: &mut AppState) {
     }
 }
 
-fn apply_layout(state: &mut AppState, document: LabelDocument) {
-    if !state.printer_target.is_bluetooth() {
+pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) {
+    state.editor = crate::editor::Editor::default();
+    if !state.printer_connected {
         state.tape_width_mm = document.tape_width_mm;
+        state.printer_dpi = document.dpi;
+        state.printer_max_px = 0;
+        state.band_left = None;
         state.update_tape_pixels();
     }
     state.font_name = document.font_name;
@@ -267,14 +254,14 @@ fn apply_layout(state: &mut AppState, document: LabelDocument) {
     state.overall_flip_h = document.flip_h;
     state.overall_flip_v = document.flip_v;
     state.elements = document.elements;
-    state.selected_element = None;
+    state.select_element(None);
     state.mark_dirty();
 }
 
 /// Export the current label preview as an image file.
 fn do_export_image(state: &mut AppState) {
-    let bitmap = match state.preview_bitmap {
-        Some(ref bmp) => bmp,
+    let preview = match state.output_preview() {
+        Some(preview) => preview,
         None => {
             state.status_message = "Nothing to export".to_string();
             return;
@@ -296,7 +283,7 @@ fn do_export_image(state: &mut AppState) {
         } else {
             path
         };
-        match bitmap.save(&save_path) {
+        match preview.square_pixel_bitmap().save(&save_path) {
             Ok(()) => {
                 state.status_message = format!("Saved to {}", save_path.display());
                 info!("Exported image: {}", save_path.display());
@@ -315,6 +302,83 @@ mod tests {
     use crate::state::PrinterTarget;
     use ptouch_render::text::TextRenderer;
 
+    #[test]
+    fn print_submits_cached_pixels_and_rejects_stale_previews() {
+        use crate::preview::RenderedPreview;
+        use ptouch_core::{PrintQuality, PrintResolution, quality::QualityProfile};
+        use ptouch_render::bitmap::LabelBitmap;
+
+        for (name, head) in [("PT-P750W", 180), ("PT-9500PC", 360), ("PT-9700PC", 360)] {
+            let profile = QualityProfile::for_model(name, head);
+            for mode in profile.modes {
+                for left in [None, Some(3)] {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    // No elements: a fresh render could not produce these dots.
+                    let mut bitmap = LabelBitmap::new(17, 9);
+                    bitmap.set_pixel(0, 0, true);
+                    bitmap.set_pixel(8, 4, true);
+                    bitmap.set_pixel(16, 8, true);
+                    let expected = match left {
+                        Some(left) => raster::bitmap_to_raster_lines_at(&bitmap, 32, left),
+                        None => raster::bitmap_to_raster_lines(&bitmap, 32),
+                    };
+                    let mut state = AppState {
+                        printer_connected: true,
+                        printer_max_px: 32,
+                        printer_dpi: head,
+                        printer_quality: Some(profile),
+                        print_quality: mode.quality,
+                        band_left: left,
+                        needs_rerender: false,
+                        preview: Some(RenderedPreview::new(
+                            &egui::Context::default(),
+                            bitmap,
+                            mode.resolution,
+                        )),
+                        printer_cmd_tx: Some(tx),
+                        ..Default::default()
+                    };
+                    state.mark_dirty();
+                    assert!(state.output_preview().is_none());
+                    do_print(&mut state);
+                    assert!(rx.try_recv().is_err());
+                    state.needs_rerender = false;
+                    state.preview.as_mut().unwrap().resolution = PrintResolution::square(1);
+                    assert!(state.output_preview().is_none());
+                    do_print(&mut state);
+                    assert!(rx.try_recv().is_err());
+                    state.preview.as_mut().unwrap().resolution = mode.resolution;
+                    do_print(&mut state);
+                    match rx.try_recv().unwrap() {
+                        PrinterCommand::Print {
+                            raster_lines,
+                            resolution,
+                            quality,
+                            ..
+                        } => {
+                            assert_eq!(raster_lines, expected);
+                            assert_eq!(resolution, mode.resolution);
+                            assert_eq!(quality, mode.quality);
+                        }
+                        _ => panic!("expected print command"),
+                    }
+                    assert!(state.operation_in_progress);
+                }
+            }
+        }
+        // Offline resolution remains square at the design DPI, independent
+        // of any stale preferred quality before a printer is identified.
+        let state = AppState {
+            printer_dpi: 360,
+            print_quality: PrintQuality::HighRes,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.preview_resolution().unwrap(),
+            PrintResolution::square(360)
+        );
+    }
+
     fn layout(tape_width_mm: u8) -> LabelDocument {
         let document = LabelDocument {
             version: ptouch_render::document::DOCUMENT_VERSION,
@@ -327,6 +391,48 @@ mod tests {
             elements: vec![LabelElement::CutMark],
         };
         LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn opening_layout_preserves_network_band_before_next_poll() {
+        let mut state = AppState {
+            printer_connected: true,
+            printer_max_px: 128,
+            printer_dpi: 180,
+            tape_width_mm: 12,
+            tape_width_px: 70,
+            media_code: 1,
+            band_left: Some(29),
+            ..AppState::default()
+        };
+        for width in [12, 24] {
+            apply_layout(&mut state, layout(width));
+            assert_eq!(
+                (
+                    state.tape_width_mm,
+                    state.tape_width_px,
+                    state.band_left,
+                    state.media_code
+                ),
+                (12, 70, Some(29), 1)
+            );
+            assert!(state.needs_rerender);
+            let bitmap = ptouch_render::document::render_elements(
+                &state.elements,
+                state.tape_width_px,
+                &state.font_name,
+                0,
+                &mut TextRenderer::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let lines = raster::bitmap_to_raster_lines_at(&bitmap, 128, 29);
+            for line in lines {
+                for pin in (0..29).chain(99..128) {
+                    assert_eq!(line[pin / 8] & (0x80 >> (pin % 8)), 0);
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Built-in capabilities. User profiles select these; they cannot redefine commands.
 use crate::{
-    PtouchError, Result,
+    Result,
     device::{self, DeviceFlags},
     protocol::PrintQuality,
     tape::{self, HeadBand},
@@ -22,8 +22,7 @@ pub struct PrinterModel {
     pub network: Option<NetworkDialect>,
     pub usb: bool,
     pub experimental: bool,
-    pub high_resolution: bool,
-    pub draft: bool,
+    pub quality: crate::quality::QualityProfile,
 }
 
 impl PrinterModel {
@@ -45,9 +44,7 @@ impl PrinterModel {
                     _ => None,
                 },
                 experimental: info.name == "PT-E550W",
-                high_resolution: info.name == "PT-P750W"
-                    || info.flags.contains(DeviceFlags::LEGACY_HIRES),
-                draft: info.flags.contains(DeviceFlags::LEGACY_HIRES),
+                quality: crate::quality::QualityProfile::for_model(info.name, info.dpi),
             });
         }
         let (name, network) = match name.as_str() {
@@ -63,8 +60,7 @@ impl PrinterModel {
             network: Some(network),
             usb: false,
             experimental: true,
-            high_resolution: false,
-            draft: false,
+            quality: crate::quality::QualityProfile::for_model(name, 360),
         })
     }
 
@@ -81,27 +77,21 @@ impl PrinterModel {
     }
 
     pub fn validate_quality(self, quality: PrintQuality, media_type: u8) -> Result<()> {
-        if (quality == PrintQuality::HighRes && !self.high_resolution)
-            || (quality == PrintQuality::Draft && !self.draft)
-        {
-            return Err(PtouchError::UnsupportedQuality(self.name.into()));
-        }
-        // Enable new P750 high resolution only on the documented laminated medium.
-        if self.name == "PT-P750W" && quality == PrintQuality::HighRes && media_type != 0x01 {
-            return Err(PtouchError::UnsupportedOperation(
-                "PT-P750W high resolution requires laminated tape",
-            ));
-        }
-        Ok(())
+        self.quality.mode(quality)?.validate_media(media_type)
     }
 
-    /// Feed resolution; cross-tape head resolution never changes.
-    pub fn feed_dpi(self, quality: PrintQuality) -> u16 {
-        match quality {
-            PrintQuality::Standard => self.head_dpi,
-            PrintQuality::HighRes => self.head_dpi * 2,
-            PrintQuality::Draft => self.head_dpi / 2,
+    /// Feed amount when suppressing the initial cut, from the raster references.
+    /// E850 follows P900 provisionally; its margin remains experimental.
+    pub fn margin_dots(self, quality: PrintQuality, precut: bool) -> Result<u16> {
+        let dpi = self.quality.mode(quality)?.resolution.feed_dpi;
+        if precut {
+            return Ok((f64::from(dpi) * 2.0 / 25.4).round() as u16);
         }
+        Ok(match self.network {
+            Some(NetworkDialect::P900 | NetworkDialect::E850) => 382,
+            _ if dpi == 360 => 344,
+            _ => 172,
+        })
     }
 
     pub fn network_band(self, media_type: u8, width: u8) -> Option<HeadBand> {

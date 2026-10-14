@@ -91,10 +91,11 @@ pub fn load_image_from_reader<R: Read>(
 ) -> Result<LabelBitmap> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
-    let cursor = std::io::Cursor::new(buf);
-    let img = image::ImageReader::new(cursor)
-        .with_guessed_format()?
-        .decode()?;
+    let img = match image::guess_format(&buf) {
+        Ok(format) => image::load_from_memory_with_format(&buf, format)?,
+        // Reuse the SVG parser for embedded vector sources, including SVGZ.
+        Err(_) => render_svg_data(&buf, options.target_height)?,
+    };
     Ok(convert_to_bitmap(img, options))
 }
 

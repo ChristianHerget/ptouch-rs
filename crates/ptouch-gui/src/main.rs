@@ -11,7 +11,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod editor;
 mod panels;
+mod preview;
 mod printer_worker;
 mod profile_ui;
 mod state;

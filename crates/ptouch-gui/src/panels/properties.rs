@@ -25,6 +25,24 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
 
+    if state.needs_rerender {
+        ui.label("Updating preview…");
+    } else if let Some(length) = state
+        .output_preview()
+        .and_then(|preview| preview.element_length_mm(selected))
+    {
+        ui.label(format!("Length: {}", crate::preview::format_mm(length)))
+            .on_hover_text(
+                "This element's contribution to preview length, including its whitespace.",
+            );
+    } else {
+        ui.label("No rendered output");
+    }
+    ui.separator();
+
+    let before = state.content_snapshot();
+    state.editor.changed_group = None;
+
     // We need to clone the element to avoid borrow issues, then write back.
     let mut element = state.elements[selected].clone();
     let mut changed = false;
@@ -80,13 +98,18 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("No editable properties.");
         }
         LabelElement::Padding { pixels } => {
-            changed |= show_padding_properties(ui, pixels);
+            changed |= show_padding_properties(ui, pixels, state);
         }
     }
 
     if changed {
         state.elements[selected] = element;
-        state.mark_dirty();
+        state.record_content(
+            before,
+            "Edit element",
+            state.editor.changed_group,
+            ui.input(|i| i.time),
+        );
     }
 }
 
@@ -141,7 +164,9 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     let mut changed = false;
 
     ui.label("Text Content:");
-    let response = ui.add(
+    let response = crate::editor::content_input(
+        ui,
+        &mut state.editor,
         egui::TextEdit::multiline(content)
             .desired_width(f32::INFINITY)
             .desired_rows(4),
@@ -156,6 +181,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     ui.label("Font:");
     ui.add(
         egui::TextEdit::singleline(&mut state.font_search)
+            .id(egui::Id::new("label_font_search"))
             .desired_width(f32::INFINITY)
             .hint_text("Search fonts..."),
     );
@@ -196,9 +222,12 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     if let Some(size) = font_size {
         ui.horizontal(|ui| {
             ui.label("Size:");
-            if ui
-                .add(egui::DragValue::new(size).speed(0.5).range(4.0..=200.0))
-                .changed()
+            if crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                egui::DragValue::new(size).speed(0.5).range(4.0..=200.0),
+            )
+            .changed()
             {
                 changed = true;
             }
@@ -210,13 +239,14 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     // Font margin
     ui.horizontal(|ui| {
         ui.label("Margin:");
-        if ui
-            .add(
-                egui::DragValue::new(&mut state.font_margin)
-                    .speed(1.0)
-                    .range(0..=50),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            egui::DragValue::new(&mut state.font_margin)
+                .speed(1.0)
+                .range(0..=50),
+        )
+        .changed()
         {
             changed = true;
         }
@@ -256,14 +286,15 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     // Rotation
     ui.label("Rotation:");
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::DragValue::new(rotation)
-                    .speed(1.0)
-                    .range(-360.0..=360.0)
-                    .suffix(" deg"),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            egui::DragValue::new(rotation)
+                .speed(1.0)
+                .range(-360.0..=360.0)
+                .suffix(" deg"),
+        )
+        .changed()
         {
             state.rotation_input = format!("{}", *rotation as i32);
             changed = true;
@@ -399,9 +430,12 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     if let Some(h) = target_height {
         ui.horizontal(|ui| {
             ui.label("Height:");
-            if ui
-                .add(egui::DragValue::new(h).speed(1.0).range(1..=1000))
-                .changed()
+            if crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                egui::DragValue::new(h).speed(1.0).range(1..=1000),
+            )
+            .changed()
             {
                 changed = true;
             }
@@ -414,14 +448,15 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     // Rotation
     ui.label("Rotation:");
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::DragValue::new(rotation)
-                    .speed(1.0)
-                    .range(-360.0..=360.0)
-                    .suffix(" deg"),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            egui::DragValue::new(rotation)
+                .speed(1.0)
+                .range(-360.0..=360.0)
+                .suffix(" deg"),
+        )
+        .changed()
         {
             state.rotation_input = format!("{}", *rotation as i32);
             changed = true;
@@ -466,7 +501,7 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
 }
 
 /// Show properties for a padding element. Returns true if changed.
-fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
+fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32, state: &mut AppState) -> bool {
     let mut changed = false;
 
     ui.label("Padding");
@@ -474,9 +509,12 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
 
     ui.horizontal(|ui| {
         ui.label("Pixels:");
-        if ui
-            .add(egui::DragValue::new(pixels).speed(1.0).range(1..=500))
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            egui::DragValue::new(pixels).speed(1.0).range(1..=500),
+        )
+        .changed()
         {
             changed = true;
         }

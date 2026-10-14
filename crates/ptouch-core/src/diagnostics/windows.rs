@@ -62,6 +62,34 @@ fn property(
     ))
 }
 
+fn unique_id(set: &DeviceSet, device: &SP_DEVINFO_DATA) -> io::Result<bool> {
+    let mut capabilities = 0u32;
+    let mut kind = 0;
+    let mut bytes = 0;
+    // SAFETY: output points to one aligned DWORD with its exact byte capacity.
+    if unsafe {
+        SetupDiGetDeviceRegistryPropertyW(
+            set.0,
+            device,
+            SPDRP_CAPABILITIES,
+            &mut kind,
+            (&mut capabilities as *mut u32).cast(),
+            4,
+            &mut bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if kind != 4 || bytes != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid USB capabilities",
+        ));
+    }
+    Ok(capabilities & CM_DEVCAP_UNIQUEID != 0)
+}
+
 pub(super) fn inspect(report: &mut DoctorReport) {
     let mut process = 0;
     let mut native = 0;
@@ -156,7 +184,13 @@ pub(super) fn inspect(report: &mut DoctorReport) {
         };
         let service = text(SPDRP_SERVICE);
         let description = text(SPDRP_DEVICEDESC);
+        let (unique_id, identity_error) = match unique_id(&set, &device) {
+            Ok(unique) => (unique, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
         report.windows_bindings.push(DriverBinding {
+            unique_id,
+            identity_error,
             instance_id,
             hardware_ids: ids,
             service,

@@ -344,6 +344,9 @@ fn profile_command(command: ProfileCommand, directory: &Path) -> ptouch_profiles
 }
 
 fn validate_profile(profile: &PrinterProfile) -> ptouch_profiles::Result<()> {
+    if let Connection::Network { host } = &profile.connection {
+        ptouch_core::network_host::normalize(host)?;
+    }
     let model = PrinterModel::find(&profile.model).ok_or("Unknown model")?;
     if matches!(profile.connection, Connection::Usb { .. }) && !model.usb {
         return Err("USB is not implemented for this model".into());
@@ -351,8 +354,10 @@ fn validate_profile(profile: &PrinterProfile) -> ptouch_profiles::Result<()> {
     if matches!(profile.connection, Connection::Network { .. }) && model.network.is_none() {
         return Err("This model has no network backend".into());
     }
-    if (profile.quality == Quality::High && !model.high_resolution)
-        || (profile.quality == Quality::Draft && !model.draft)
+    if model
+        .quality
+        .mode(profile_quality(profile.quality))
+        .is_err()
     {
         return Err("Quality unsupported by this model".into());
     }
@@ -510,6 +515,32 @@ impl CliDevice {
     }
 }
 
+fn render_resolution(
+    args: &PrintArgs,
+    device: Option<&impl PrintDevice>,
+) -> Result<ptouch_core::PrintResolution, PtouchError> {
+    if args.output.is_none()
+        && let Some(device) = device
+    {
+        return device.resolution(args.quality.to_print_quality());
+    }
+    Ok(ptouch_core::PrintResolution::square(180))
+}
+
+fn print_needs_profile(args: &PrintArgs) -> bool {
+    !args.list_vars
+        && (args.target.printer.is_some()
+            || (args.output.is_none() || (args.tape_width.is_none() && args.layout.is_none())))
+}
+
+fn profile_quality(quality: Quality) -> PrintQuality {
+    match quality {
+        Quality::Standard => PrintQuality::Standard,
+        Quality::High => PrintQuality::HighRes,
+        Quality::Draft => PrintQuality::Draft,
+    }
+}
+
 /// Operations used by label output, separate from discovery and connection setup.
 trait PrintDevice {
     fn is_network(&self) -> bool {
@@ -518,14 +549,16 @@ trait PrintDevice {
     fn band_left(&self) -> Option<u16> {
         None
     }
-    fn rendered_high_resolution(&self) -> bool {
-        false
-    }
+    fn resolution(
+        &self,
+        quality: PrintQuality,
+    ) -> Result<ptouch_core::PrintResolution, PtouchError>;
     fn dpi(&self) -> u16;
     fn is_bluetooth(&self) -> bool;
     fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: ptouch_core::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: PrintQuality,
@@ -543,8 +576,15 @@ impl PrintDevice for CliDevice {
             None
         }
     }
-    fn rendered_high_resolution(&self) -> bool {
-        self.model_name() == "PT-P750W"
+    fn resolution(
+        &self,
+        quality: PrintQuality,
+    ) -> Result<ptouch_core::PrintResolution, PtouchError> {
+        Ok(
+            ptouch_core::quality::QualityProfile::for_model(self.model_name(), self.dpi())
+                .mode(quality)?
+                .resolution,
+        )
     }
 
     fn dpi(&self) -> u16 {
@@ -568,20 +608,23 @@ impl PrintDevice for CliDevice {
     fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: ptouch_core::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: PrintQuality,
     ) -> Result<(), PtouchError> {
         match self {
-            Self::Usb(device) => device.print_raster(lines, chain_print, precut, quality),
+            Self::Usb(device) => {
+                device.print_raster(lines, resolution, chain_print, precut, quality)
+            }
             Self::Network(device) => {
-                match device.print_raster(lines, chain_print, precut, quality)? {
+                match device.print_raster(lines, resolution, chain_print, precut, quality)? {
                     PrintOutcome::Complete => Ok(()),
                     PrintOutcome::SubmittedUnconfirmed => Err(PtouchError::CompletionUnknown),
                 }
             }
             #[cfg(target_os = "macos")]
-            Self::Bluetooth(device) => device.print_raster(lines),
+            Self::Bluetooth(device) => device.print_raster(lines, resolution),
         }
     }
 }
@@ -673,7 +716,7 @@ fn main() {
                     &directory,
                 )?;
             }
-            Commands::Print(args) if args.output.is_none() || args.target.printer.is_some() => {
+            Commands::Print(args) if print_needs_profile(args) => {
                 if let Some(profile) = resolve_profile(
                     &mut args.target,
                     args.usb.is_some() || args.usbprint.is_some() || args.bluetooth.is_some(),
@@ -1160,21 +1203,23 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         };
 
     // Whole-label mirroring applies once, after the label is composed.
-    let high = args.quality == QualityArg::High
-        && device
-            .as_ref()
-            .is_some_and(PrintDevice::rendered_high_resolution)
-        && args.output.is_none();
+    let resolution = render_resolution(args, device.as_ref())?;
+    let high = resolution.feed_dpi == resolution.head_dpi * 2;
     let bitmap = if high {
         let mut scaled = args.clone();
         scaled.size = scaled.size.map(|v| v * 2.0);
         scaled.margin *= 2;
         scaled.pad = scaled.pad.map(|v| v * 2);
-        build_label(&scaled, print_width * 2)?.halve_height()
+        build_label(&scaled, print_width * 2, 2)?.halve_height()
     } else {
-        build_label(args, print_width)?
-    }
-    .mirrored(args.flip_h, args.flip_v);
+        build_label(args, print_width, 1)?
+    };
+    let bitmap = if resolution.feed_dpi * 2 == resolution.head_dpi {
+        bitmap.halve_feed()
+    } else {
+        bitmap
+    };
+    let bitmap = bitmap.mirrored(args.flip_h, args.flip_v);
     emit_label(&bitmap, args, max_px, device.as_mut())?;
 
     if let Some(dev) = device {
@@ -1231,15 +1276,8 @@ fn print_layout(args: &PrintArgs, layout_path: &str) -> Result<(), Box<dyn std::
     doc.apply_values(&values);
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
-    let bitmap = render_layout_quality(
-        &doc,
-        print_width,
-        args.quality == QualityArg::High
-            && device
-                .as_ref()
-                .is_some_and(PrintDevice::rendered_high_resolution)
-            && args.output.is_none(),
-    )?;
+    let bitmap =
+        render_layout_quality(&doc, print_width, render_resolution(args, device.as_ref())?)?;
     emit_label(&bitmap, args, max_px, device.as_mut())?;
 
     if let Some(dev) = device {
@@ -1279,18 +1317,14 @@ fn print_layout_batch(
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
 
-    let high = args.quality == QualityArg::High
-        && device
-            .as_ref()
-            .is_some_and(PrintDevice::rendered_high_resolution)
-        && args.output.is_none();
+    let resolution = render_resolution(args, device.as_ref())?;
     let labels = rdr.records().map(|record| {
         let record = record?;
         let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
         let values = build_row_values(&base, &headers, &row);
         let mut row_doc = doc.clone();
         row_doc.apply_values(&values);
-        render_layout_quality(&row_doc, print_width, high)
+        render_layout_quality(&row_doc, print_width, resolution)
     });
     let count = emit_batch(labels, args, max_px, device.as_mut())?;
 
@@ -1358,18 +1392,19 @@ fn build_row_values(
 fn render_layout_quality(
     doc: &LabelDocument,
     width: u32,
-    high: bool,
+    resolution: ptouch_core::PrintResolution,
 ) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
-    if !high {
+    if resolution.head_dpi == resolution.feed_dpi {
         return render_layout(doc, width);
     }
     let mut renderer = TextRenderer::new();
-    Ok(document::render_elements_high_resolution(
+    Ok(document::render_elements_at_resolution(
         &doc.elements,
         width,
         &doc.font_name,
         doc.font_margin,
         &mut renderer,
+        resolution,
     )?
     .ok_or("Layout produced no output")?
     .mirrored(doc.flip_h, doc.flip_v))
@@ -1485,6 +1520,7 @@ fn emit_label(
 fn build_label(
     args: &PrintArgs,
     print_width: u32,
+    source_scale: u32,
 ) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
     let mut result: Option<LabelBitmap> = None;
 
@@ -1530,7 +1566,7 @@ fn build_label(
     // Add cut mark if requested
     if args.cut {
         debug!("Adding cut mark");
-        let mark = make_cutmark(print_width);
+        let mark = make_cutmark(print_width / source_scale).scale_to_height(print_width);
         result = Some(append_bitmap(result, mark));
     }
 
@@ -1612,6 +1648,7 @@ fn print_to_device(
 
         dev.print_raster(
             &raster_lines,
+            dev.resolution(args.quality.to_print_quality())?,
             chain_print,
             if dev.is_network() {
                 !args.no_precut
@@ -1622,12 +1659,9 @@ fn print_to_device(
         )?;
     }
 
-    let feed_dpi = if args.quality == QualityArg::High && dev.rendered_high_resolution() {
-        dev.dpi() * 2
-    } else {
-        dev.dpi()
-    };
-    let tape_mm = bitmap.width() as f64 / f64::from(feed_dpi) * 25.4;
+    let tape_mm = dev
+        .resolution(args.quality.to_print_quality())?
+        .length_mm(bitmap.width() as usize);
     println!(
         "Printed {} cop{} ({:.1} mm of tape each)",
         total_copies,
@@ -1641,6 +1675,106 @@ fn print_to_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_export_uses_default_profile_and_explicit_targets_take_precedence() {
+        let directory = std::env::temp_dir().join(format!(
+            "ptouch-cli-profiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = ProfileStore::load(&directory).unwrap();
+        for (alias, host) in [("desk", "default.local"), ("other", "other.local")] {
+            store
+                .add(
+                    PrinterProfile {
+                        alias: alias.into(),
+                        model: "PT-P750W".into(),
+                        connection: Connection::Network { host: host.into() },
+                        quality: Quality::High,
+                        final_cut: false,
+                        allow_experimental: false,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        store.set_default(Some("desk")).unwrap();
+        let mut args = batch_args(&["test", "--output", "label.png"]);
+        assert!(print_needs_profile(&args));
+        let profile = resolve_profile(&mut args.target, false, &directory)
+            .unwrap()
+            .unwrap();
+        apply_profile_preferences(&mut args, &profile, false);
+        assert_eq!(args.target.host.as_deref(), Some("default.local"));
+        assert_eq!(args.target.model.as_deref(), Some("PT-P750W"));
+        assert!(matches!(args.quality, QualityArg::High));
+        assert!(args.chain);
+        let mut args = batch_args(&["--printer", "other"]);
+        resolve_profile(&mut args.target, false, &directory).unwrap();
+        assert_eq!(args.target.host.as_deref(), Some("other.local"));
+        for flags in [
+            vec!["--usb", "1:2"],
+            vec!["--model", "PT-P700"],
+            vec!["--host", "explicit.local", "--model", "PT-P750W"],
+        ] {
+            let mut args = batch_args(&flags);
+            assert!(
+                resolve_profile(&mut args.target, args.usb.is_some(), &directory)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_ne!(args.target.host.as_deref(), Some("default.local"));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exports_resolve_profiles_only_when_printer_geometry_or_an_explicit_alias_is_needed() {
+        for (flags, expected) in [
+            (vec!["test", "--output", "label.png"], true),
+            (
+                vec!["test", "--output", "label.png", "--tape-width", "76"],
+                false,
+            ),
+            (
+                vec!["--layout", "label.ptl", "--output", "label.png"],
+                false,
+            ),
+            (vec!["--layout", "label.ptl", "--list-vars"], false),
+            (
+                vec![
+                    "--layout",
+                    "label.ptl",
+                    "--list-vars",
+                    "--printer",
+                    "missing",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "--layout",
+                    "label.ptl",
+                    "--output",
+                    "label.png",
+                    "--printer",
+                    "desk",
+                ],
+                true,
+            ),
+            (vec!["test"], true),
+        ] {
+            assert_eq!(
+                print_needs_profile(&batch_args(&flags)),
+                expected,
+                "{flags:?}"
+            );
+        }
+    }
 
     #[test]
     fn direct_network_requires_model_and_selection_is_unambiguous() {
@@ -1900,6 +2034,16 @@ mod tests {
         fn is_network(&self) -> bool {
             self.network
         }
+        fn resolution(
+            &self,
+            quality: PrintQuality,
+        ) -> Result<ptouch_core::PrintResolution, PtouchError> {
+            Ok(
+                ptouch_core::quality::QualityProfile::for_model("PT-P700", 180)
+                    .mode(quality)?
+                    .resolution,
+            )
+        }
         fn dpi(&self) -> u16 {
             180
         }
@@ -1911,6 +2055,7 @@ mod tests {
         fn print_raster(
             &mut self,
             lines: &[Vec<u8>],
+            resolution: ptouch_core::PrintResolution,
             chain_print: bool,
             precut: bool,
             quality: PrintQuality,
@@ -1925,7 +2070,13 @@ mod tests {
                 precut,
                 quality,
             };
-            let job = ptouch_core::protocol::build_print_job(lines, DeviceFlags::NONE, &opts);
+            let job = ptouch_core::protocol::build_print_job(
+                lines,
+                resolution,
+                DeviceFlags::NONE,
+                ptouch_core::quality::QualityProfile::for_model("PT-P700", 180),
+                &opts,
+            )?;
             self.commands.borrow_mut().push(job.last().unwrap()[0]);
             Ok(())
         }

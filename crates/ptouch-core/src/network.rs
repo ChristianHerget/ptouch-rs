@@ -9,7 +9,7 @@ use crate::{
 };
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, TcpStream, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -174,6 +174,28 @@ fn decode_status(values: &[(String, SnmpValue)]) -> Result<(PrinterStatus, i64)>
     Ok((status, state))
 }
 
+/// Retry only preflight transport failures. An answered identity mismatch is
+/// terminal, and the resulting socket address is retained for the whole job.
+fn select_address(
+    addresses: &[SocketAddr],
+    model: &str,
+    mut identify: impl FnMut(SocketAddr) -> Result<bool>,
+) -> Result<SocketAddr> {
+    let mut last = PtouchError::DeviceNotFound;
+    for &address in addresses {
+        match identify(address) {
+            Ok(true) => return Ok(address),
+            Ok(false) => {
+                return Err(network_error(format!(
+                    "device identity does not match {model}"
+                )));
+            }
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
 impl NetworkPrinter {
     pub fn open(model: &str, host: &str, allow_experimental: bool) -> Result<Self> {
         let model = PrinterModel::find(model)
@@ -188,39 +210,19 @@ impl NetworkPrinter {
                 "experimental network model; enable allow_experimental or --allow-experimental",
             ));
         }
-        if host.trim().is_empty() || host.contains('/') || host.chars().any(char::is_whitespace) {
-            return Err(network_error(
-                "use a hostname or IP address, without a URL or port",
-            ));
-        }
-        let addresses: Vec<_> = (host.trim_matches(['[', ']']), 161)
-            .to_socket_addrs()
-            .map_err(network_error)?
-            .collect();
-        let mut last = PtouchError::DeviceNotFound;
-        for address in addresses {
-            match snmp_get(address, &[DEVICE_ID], Duration::from_secs(2)) {
-                Ok(values) => {
-                    let matching = values.iter().any(|(oid, v)| oid == DEVICE_ID && matches!(v, SnmpValue::Bytes(bytes) if String::from_utf8_lossy(bytes).split(';').any(|field| field == format!("MDL:{}", model.name))));
-                    if !matching {
-                        return Err(network_error(format!(
-                            "device identity does not match {}",
-                            model.name
-                        )));
-                    }
-                    let status = idle_status(address)?;
-                    return Ok(Self {
-                        model,
-                        address,
-                        status,
-                        timeout: Duration::from_secs(600),
-                        cancellation: CancellationToken::default(),
-                    });
-                }
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        let addresses = crate::network_host::resolve(host, 161)?;
+        let address = select_address(&addresses, model.name, |address| {
+            let values = snmp_get(address, &[DEVICE_ID], Duration::from_secs(2))?;
+            Ok(values.iter().any(|(oid, v)| oid == DEVICE_ID && matches!(v, SnmpValue::Bytes(bytes) if String::from_utf8_lossy(bytes).split(';').any(|field| field == format!("MDL:{}", model.name)))))
+        })?;
+        let status = idle_status(address)?;
+        Ok(Self {
+            model,
+            address,
+            status,
+            timeout: Duration::from_secs(600),
+            cancellation: CancellationToken::default(),
+        })
     }
 
     pub fn status(&self) -> &PrinterStatus {
@@ -246,10 +248,15 @@ impl NetworkPrinter {
     pub fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: crate::PrintResolution,
         chain: bool,
         precut: bool,
         quality: PrintQuality,
     ) -> Result<PrintOutcome> {
+        self.model
+            .quality
+            .mode(quality)?
+            .validate_resolution(resolution)?;
         self.cancellation.check()?;
         let now = idle_status(self.address)?;
         if now.has_error() {
@@ -269,7 +276,7 @@ impl NetworkPrinter {
                 "no-cut jobs are not verified for this experimental model",
             ));
         }
-        let data = build_job(self.model, &now, lines, !chain, precut, quality)?;
+        let data = build_job(self.model, &now, lines, resolution, !chain, precut, quality)?;
         let started = Instant::now();
         let mut address = self.address;
         address.set_port(515);
@@ -322,10 +329,15 @@ fn build_job(
     model: PrinterModel,
     status: &PrinterStatus,
     lines: &[Vec<u8>],
+    resolution: crate::PrintResolution,
     final_cut: bool,
     precut: bool,
     quality: PrintQuality,
 ) -> Result<Vec<u8>> {
+    model
+        .quality
+        .mode(quality)?
+        .validate_resolution(resolution)?;
     model.validate_quality(quality, status.media_type)?;
     if lines.is_empty()
         || lines
@@ -356,8 +368,7 @@ fn build_job(
     if model.network == Some(NetworkDialect::E850) {
         data.extend(protocol::cmd_esc_i_k_lower());
     }
-    let margin_mm = if precut { 2.0 } else { 24.3 };
-    let margin = (f64::from(model.feed_dpi(quality)) * margin_mm / 25.4).round() as u16;
+    let margin = model.margin_dots(quality, precut)?;
     data.extend(protocol::cmd_page_flags(margin));
     data.extend(protocol::cmd_enable_packbits());
     for line in lines {
@@ -450,6 +461,72 @@ fn lpr_submit(
 mod tests {
     use super::*;
     use std::io::BufRead;
+
+    #[test]
+    fn address_selection_falls_back_before_submission_and_preserves_scope() {
+        let addresses: Vec<SocketAddr> = vec![
+            "[fe80::1%3]:161".parse().unwrap(),
+            "192.0.2.1:161".parse().unwrap(),
+        ];
+        let mut visited = Vec::new();
+        let selected = select_address(&addresses, "PT-P750W", |a| {
+            visited.push(a);
+            if a.is_ipv6() {
+                Err(PtouchError::Timeout)
+            } else {
+                Ok(true)
+            }
+        })
+        .unwrap();
+        assert_eq!(visited, addresses);
+        assert_eq!(selected, addresses[1]);
+        let scoped = select_address(&addresses, "PT-P750W", |_| Ok(true)).unwrap();
+        assert_eq!(scoped, addresses[0]);
+        let mut calls = 0;
+        assert!(
+            select_address(&addresses, "PT-P750W", |_| {
+                calls += 1;
+                Ok(false)
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn network_margin_bytes_follow_model_and_feed_resolution() {
+        let mut bytes = [0; 32];
+        bytes[10] = 12;
+        bytes[11] = 1;
+        let status = PrinterStatus::from_bytes(&bytes).unwrap();
+        for (name, quality, expected) in [
+            ("PT-P750W", PrintQuality::Standard, 172u16),
+            ("PT-P750W", PrintQuality::HighRes, 344),
+            ("PT-P900W", PrintQuality::Standard, 382),
+            ("PT-P950NW", PrintQuality::Standard, 382),
+            ("PT-E850TKW", PrintQuality::Standard, 382),
+        ] {
+            let model = PrinterModel::find(name).unwrap();
+            let resolution = model.quality.mode(quality).unwrap().resolution;
+            let data = build_job(
+                model,
+                &status,
+                &[vec![0; usize::from(model.raster_pins).div_ceil(8)]],
+                resolution,
+                true,
+                false,
+                quality,
+            )
+            .unwrap();
+            let [lo, hi] = expected.to_le_bytes();
+            assert!(
+                data.windows(5).any(|w| w == [0x1b, 0x69, 0x64, lo, hi]),
+                "{name}"
+            );
+            let short = model.margin_dots(quality, true).unwrap();
+            assert_eq!(short, if resolution.feed_dpi == 180 { 14 } else { 28 });
+        }
+    }
 
     #[test]
     fn virtual_clock_allows_long_printing_but_never_assumes_completion() {
@@ -551,6 +628,10 @@ mod tests {
             model,
             &status,
             &[vec![0xff; 16]; 1],
+            crate::PrintResolution {
+                head_dpi: 180,
+                feed_dpi: 360,
+            },
             true,
             true,
             PrintQuality::HighRes,

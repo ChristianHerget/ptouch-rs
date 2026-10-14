@@ -57,6 +57,41 @@ are not saved. A hostname or IP must still be reachable from the new machine.
 The `.profiles.lock` file is local coordination state and need not be copied.
 Layouts remain separate self-contained `.ptl` files.
 
+The GUI lists only the connections implemented for the selected model. For
+example, PT-P700 offers USB only. Its editable USB serial dropdown lists detected
+serials for that model and also accepts a manually entered serial. **Automatic**
+requires exactly one matching physical printer. Refreshing the list does not
+erase a saved or manually entered serial when the printer is disconnected.
+
+On Windows, PT-P710BT profiles can use the existing USBPRINT driver. The serial
+list uses the physical PnP inventory, avoiding duplicate libusb/USBPRINT entries.
+Only an instance ID marked unique by the USB bus supplies a serial; generated
+port-dependent IDs are never saved as serials. Windows compares serials without
+case sensitivity because PnP can normalize their case.
+
+**Reload files** reconnects the active saved alias using its current address,
+quality, and final-cut preference. A removed or invalid profile disconnects it.
+Temporary connections remain independent of the saved collection. Choosing a
+different directory selects that directory's default, or disconnects when there
+is no valid default. Loading a layout retains the connected printer's tape
+geometry and refreshes the preview before printing.
+
+## Hostnames, IPv4, and IPv6
+
+The host field accepts hostnames, IPv4, and either bare or bracketed IPv6:
+`printer.local`, `192.0.2.10`, `2001:db8::10`, or `[2001:db8::10]`. URLs and
+addresses with an explicit port are rejected; the protocols supply their ports.
+Link-local IPv6 requires a scope, such as `fe80::1%eth0` or `[fe80::1%3]`.
+The interface name or index belongs to the local computer and may need changing
+when a profile is copied to another machine.
+
+Address parsing uses Rust's `IpAddr`; hostname and named-scope lookup use
+`ToSocketAddrs` and the operating system resolver. Preflight tries addresses in
+the returned order when an address is unreachable. A responding printer with
+the wrong model stops selection. Once preflight identifies the printer, the
+job and status requests keep that address, including its IPv6 scope. Submission
+never switches addresses or retries a job.
+
 `ptouch printers add ... --file office.toml` adds to a group file; omitting
 `--file` creates `<alias>.toml`. The GUI preserves each entry's source file when
 editing or removing it. Writes use a temporary file and atomic replacement,
@@ -69,6 +104,7 @@ without an alias clears the default.
 | Model | USB | Network | Quality exposed by this application |
 | --- | --- | --- | --- |
 | PT-P750W | Existing backend, plus high resolution | LPR + SNMP, tested on hardware | 180×180; 180×360 on laminated tape |
+| PT-9500PC, PT-9700PC | Existing backend | Not enabled | 360×360; 360×720 high resolution and 360×180 draft on HG tape |
 | PT-E550W | Existing unsupported flag retained | Experimental LPR + SNMP | 180×180 initially |
 | PT-P900W, PT-P950NW | Not added in this change | Experimental LPR + SNMP | 360×360 initially |
 | PT-E850TKW | Not added in this change | Experimental LPR + SNMP; E850-specific command | 360×360 initially |
@@ -90,11 +126,23 @@ PT-P750W network geometry follows Brother's raster reference (12 mm tape has
 retained. The 560-pin profiles use the imported model-specific media bands;
 unsupported tape types and widths are rejected.
 
-High resolution holds the cross-tape resolution at 180 dpi and doubles feed
-resolution to 360 dpi. The apps render source content with extra detail before
-reducing its height to match the head. This preserves physical length and
-avoids merely duplicating columns. Existing legacy 360-dpi quality handling
-remains unchanged. The P750W does not expose draft mode.
+Quality labels show head × feed DPI. High resolution keeps the head resolution
+fixed and doubles feed resolution: 180×360 on PT-P750W, and 360×720 on PT-9500PC
+and PT-9700PC. The apps render source content with extra detail while preserving
+physical dimensions. Draft reduces feed resolution in the renderer. The protocol
+sends each supplied raster column once in every mode. HG tape requirements on
+legacy models are enforced by the printer's existing quality commands.
+PT-P750W does not expose draft; PT-P900W/PT-P950NW remain standard-only.
+
+GUI previews and image exports retain their square document resolution. Saved
+profile and layout formats and CLI quality names are unchanged. Library callers
+must adopt the explicit raster resolution argument; see the
+[Rust raster API migration](raster-api.md).
+
+A plain CLI image export without `--tape-width` uses the selected/default
+printer's geometry. Forced-width exports, layout exports, and `--list-vars` work
+offline without loading the default profile. An explicit `--printer` still
+resolves that alias for exports; `--list-vars` needs only the layout.
 
 ## Cutting and batches
 
@@ -102,8 +150,11 @@ remains unchanged. The P750W does not expose draft mode.
 CSV chaining, and job timeout remain job settings.
 
 Network jobs default to short 2 mm margins, which can produce a leading offcut.
-`--no-precut` requests roughly 24.3 mm margins to avoid that cut, using more tape
-on short labels. `--precut` explicitly selects short margins. The GUI calls
+`--no-precut` requests model-specific margins to avoid that cut, using more tape
+on short labels: PT-P750W uses 172 standard or 344 high-resolution feed dots
+(about 24.3 mm), and PT-P900W/PT-P950NW use 382 dots (about 27 mm).
+PT-E850TKW provisionally uses the latter margin and remains experimental.
+`--precut` explicitly selects short margins. The GUI calls
 this **Short margins (leading cut)** and enables it by default. The printer's
 cutter position also limits minimum physical label length.
 

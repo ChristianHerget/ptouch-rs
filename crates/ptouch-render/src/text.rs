@@ -6,7 +6,9 @@
 //! Renders multi-line text into a [`LabelBitmap`] using system fonts.
 //! Supports auto-sizing, alignment, and font selection.
 
-use cosmic_text::{Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::RenderError;
@@ -118,19 +120,27 @@ impl TextRenderer {
         let attrs = Attrs::new().family(family);
         let cosmic_align = Some(align.to_cosmic());
 
-        // We do not know the final horizontal width yet. Use a large initial
-        // width so cosmic-text does not wrap, then we measure the actual
-        // extent and create a tight bitmap.
-        let layout_width = 16384.0f32;
-
+        // Labels have no horizontal limit and only explicit line breaks.
+        // Measure without alignment first: center/right alignment needs a
+        // finite width, which must accommodate even the longest label.
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, Some(available_height));
+        buffer.set_text(&text, &attrs, Shaping::Advanced, Some(Align::Left));
+        buffer.shape_until_scroll(&mut self.font_system, true);
+        let layout_width = buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max)
+            .ceil()
+            .max(1.0);
         buffer.set_size(Some(layout_width), Some(available_height));
         buffer.set_text(&text, &attrs, Shaping::Advanced, cosmic_align);
         buffer.shape_until_scroll(&mut self.font_system, true);
 
         // Measure tight horizontal extent (min_x..max_x) from layout runs.
-        // With Center/Right alignment, cosmic-text offsets glyphs within the
-        // large layout_width. We subtract min_x so the bitmap is tight.
+        // Alignment offsets shorter lines within the measured layout width.
+        // Subtract min_x so the bitmap is tight.
         let mut min_x: f32 = f32::MAX;
         let mut max_x: f32 = 0.0;
         for run in buffer.layout_runs() {
@@ -189,6 +199,128 @@ impl TextRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn measured_width(renderer: &mut TextRenderer, text: &str, size: f32) -> f32 {
+        let mut buffer = Buffer::new(
+            &mut renderer.font_system,
+            Metrics::new(size, (size * 1.2).ceil()),
+        );
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, None);
+        buffer.set_text(
+            text,
+            &Attrs::new().family(Family::Name("monospace")),
+            Shaping::Advanced,
+            Some(Align::Left),
+        );
+        buffer.shape_until_scroll(&mut renderer.font_system, true);
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0, f32::max)
+    }
+
+    fn ink_bounds(bitmap: &LabelBitmap, start_y: u32, end_y: u32) -> (u32, u32) {
+        let columns: Vec<_> = (0..bitmap.width())
+            .filter(|&x| (start_y..end_y).any(|y| bitmap.get_pixel(x, y)))
+            .collect();
+        (
+            *columns.first().expect("visible text"),
+            *columns.last().unwrap(),
+        )
+    }
+
+    #[test]
+    fn long_labels_preserve_suffix_at_every_printer_resolution() {
+        use crate::document::{LabelElement, render_elements_at_resolution};
+        use ptouch_core::quality::QualityProfile;
+
+        let mut renderer = TextRenderer::new();
+        let advance = measured_width(&mut renderer, "M", 24.0);
+        assert!(advance > 0.0);
+        // The first label crosses the old limit only at high resolution;
+        // the second already crosses it at standard resolution.
+        for target_width in [12_000.0, 20_000.0] {
+            let count = (target_width / advance).ceil() as usize;
+            let prefix = "M".repeat(count);
+            let content = format!("{prefix}   END");
+            let expected_width = measured_width(&mut renderer, &content, 24.0).ceil() as u32;
+            assert_eq!(expected_width > 16_384, target_width > 16_384.0);
+            for (name, head, height) in [
+                ("PT-P750W", 180, 70),
+                ("PT-9500PC", 360, 150),
+                ("PT-9700PC", 360, 150),
+            ] {
+                let elements = [LabelElement::Text {
+                    content: content.clone(),
+                    font_size: Some(24.0),
+                    align: TextAlign::Left,
+                    rotation: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                }];
+                for mode in QualityProfile::for_model(name, head).modes {
+                    let bitmap = render_elements_at_resolution(
+                        &elements,
+                        height,
+                        "monospace",
+                        0,
+                        &mut renderer,
+                        mode.resolution,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let ratio = f32::from(mode.resolution.feed_dpi) / f32::from(head);
+                    assert_eq!(bitmap.height(), height);
+                    assert!(
+                        bitmap
+                            .width()
+                            .abs_diff((expected_width as f32 * ratio).ceil() as u32)
+                            <= 2,
+                        "{name} {mode:?}: {}",
+                        bitmap.width()
+                    );
+                    // Ink beyond the measured prefix proves the suffix survived.
+                    let suffix_start =
+                        measured_width(&mut renderer, &format!("{prefix}   "), 24.0) * ratio;
+                    assert!(
+                        (suffix_start.ceil() as u32..bitmap.width())
+                            .any(|x| (0..height).any(|y| bitmap.get_pixel(x, y))),
+                        "missing suffix: {name} {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_lines_preserve_alignment() {
+        let mut renderer = TextRenderer::new();
+        let long = "MMMMMMMM";
+        let short = "MM";
+        let width_difference =
+            measured_width(&mut renderer, long, 24.0) - measured_width(&mut renderer, short, 24.0);
+        let mut offsets = Vec::new();
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let bitmap = renderer
+                .render_text(&[long, short], 80, "monospace", Some(24.0), 0, align)
+                .unwrap();
+            let top = ink_bounds(&bitmap, 0, 40);
+            let bottom = ink_bounds(&bitmap, 40, 80);
+            offsets.push(bottom.0 as f32 - top.0 as f32);
+            assert!((top.1 - top.0) > (bottom.1 - bottom.0));
+        }
+        for (offset, expected) in
+            offsets
+                .into_iter()
+                .zip([0.0, width_difference / 2.0, width_difference])
+        {
+            assert!(
+                (offset - expected).abs() <= 1.0,
+                "offset {offset}, expected {expected}"
+            );
+        }
+    }
 
     #[test]
     fn test_text_align_conversion() {

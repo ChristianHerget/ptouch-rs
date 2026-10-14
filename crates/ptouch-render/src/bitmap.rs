@@ -42,6 +42,17 @@ impl LabelBitmap {
         }
         out
     }
+    /// Draft output keeps every other feed column, including the last odd column.
+    pub fn halve_feed(&self) -> Self {
+        let mut out = Self::new(self.width.div_ceil(2), self.height);
+        for y in 0..self.height {
+            for x in 0..out.width {
+                out.set_pixel(x, y, self.get_pixel(x * 2, y));
+            }
+        }
+        out
+    }
+
     /// Number of bytes per row (each row is padded to whole bytes).
     #[inline]
     fn row_stride(width: u32) -> usize {

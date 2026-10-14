@@ -20,16 +20,19 @@ pub fn show_status_bar(ui: &mut egui::Ui, state: &AppState) {
         ui.separator();
 
         // Label dimensions
-        if let Some(ref bmp) = state.preview_bitmap {
-            ui.label(format!("{}x{} px", bmp.width(), bmp.height()));
+        if let Some(ref preview) = state.preview {
+            ui.label(format!(
+                "{}×{} px",
+                preview.bitmap.width(),
+                preview.bitmap.height()
+            ));
+            ui.label(format!(
+                "{}×{} dpi (head/feed)",
+                preview.resolution.head_dpi, preview.resolution.feed_dpi
+            ));
         } else {
             ui.label("-- x -- px");
         }
-
-        ui.separator();
-
-        // Zoom level
-        ui.label(format!("Zoom: {:.0}%", state.zoom * 100.0));
 
         ui.separator();
 

@@ -17,7 +17,7 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 - Network printing with model-specific capabilities and media checks
 - PT-P750W standard 180×180 and high resolution 180×360 modes
 - Chain print and multi-copy support
-- Print quality modes on 360 dpi models (high resolution 360x720, draft 360x180)
+- PT-9500PC/PT-9700PC quality modes (360×720 high resolution, 360×180 draft)
 - GUI with live preview, zoom, and drag-and-drop element reordering
 - Export to image (PNG, JPEG, BMP, GIF, TIFF, WebP) without a printer connected
 - Feed and cut tape without printing
@@ -133,15 +133,20 @@ and print through the normal preview workflow. Bluetooth operations run outside
 the interface process so connecting and printing do not block window updates.
 
 Library users can also open `ptouch_core::BluetoothDevice`, call `init`, prepare
-16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
+16-byte raster lines using bottom-to-top dot order, then call
+`print_raster(&lines, PrintResolution::square(180))` and
 `close`. Native objects stay on the main thread and cannot be sent or shared
 across threads. These synchronous session calls are suitable for the example;
-the GUI needs a separate event-driven service before Bluetooth selection is
-added. Close assumes exclusive ownership and also disconnects the printer's
+the GUI runs these calls in a separate process. Close assumes exclusive
+ownership and also disconnects the printer's
 baseband connection. Apple's baseband close is synchronous. If an async write
 never completes, one transfer buffer is conservatively retained to avoid freeing
 memory still potentially used by Bluetooth; this only occurs on a failed
 connection, which is then closed.
+
+All Rust raster APIs now take explicit input DPI. See the
+[raster API migration](docs/raster-api.md) for mode metadata and rendering at
+the selected head × feed resolution.
 
 ## Prebuilt Packages
 
@@ -188,14 +193,26 @@ printer worker. This mode requires a working display and OpenGL context.
 ptouch-gui
 ```
 
-- Live label preview with zoom
-- Add/edit/reorder text, images, cut marks, padding
+- Label preview with Fit, approximate Actual size, and sharp Pixels presets
+- Graphical preview length and tape width, with a printable-area guide
+- Click preview elements to select; hover for length, also shown in Properties
+- Drag elements in the preview or use list handles to reorder
+- Duplicate or delete elements through row ⋯ menus or right-click menus in the list and preview
+- Undo/redo label content and formatting edits, including typing and element reordering
+- Pan with Space+drag, middle-drag, or by dragging empty canvas
+- Add/edit text, images, cut marks, and padding
 - Free-angle text rotation with auto font sizing
 - Mirror the whole label or a single element (horizontal/vertical)
 - Tape width selection
 - Save/Open layout (`.ptl`) with images embedded for portability
 - Print to connected printer or export to image file
 - Feed and cut tape without printing
+
+With the preview or element list focused, use Ctrl/Cmd+D to duplicate, Delete
+or Backspace to delete, and Alt+Up/Down to reorder. Undo with Ctrl/Cmd+Z and redo
+with Ctrl/Cmd+Shift+Z (also Ctrl+Y on Windows/Linux). History retains up to 100
+edits for the current layout and resets when another layout is opened. Printer
+and tape settings remain outside content history.
 
 ## CLI Usage
 
