@@ -203,16 +203,19 @@ ptouch list
 
 ### Free layout and precise patch-panel labels
 
-New GUI layouts use physical objects for text, images, and cut marks. Each has a
-millimeter frame with width, height, X/Y position, rotation, and mirroring. Drag
-an object on the canvas to move it, drag its square handle to resize it, or drag
-the round handle above its top-right corner to rotate its content. Hold Shift
-while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow
-keys allow fine position adjustments (Shift moves 1 mm).
-Turn off whole-label horizontal mirroring before moving or resizing with the
-mouse; the round rotation handle, numeric properties, and each object's own
-mirroring remain available. This avoids an ambiguous movement origin when the
-mirrored label's total length changes.
+New GUI layouts give text, images, and cut marks a millimeter **slot** for
+template position and spacing, plus an independent **object** box for content
+size and center offsets. In **Object** mode, dragging moves the content within
+or beyond its slot. Its square handle scales proportionally, including an
+explicit text font size; its round handle rotates the object and its handles
+without shrinking it back into the slot. **Slot** mode moves or resizes the
+template frame without scaling a manually sized object. Hold Shift while
+rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
+allow fine position adjustments (Shift moves 1 mm).
+Turn off whole-label horizontal mirroring before using mouse transforms or
+arrow-key movement. Numeric properties remain available; each object's own
+mirroring and whole-label vertical mirroring also allow mouse transforms. This
+avoids an ambiguous origin when the horizontally mirrored label changes length.
 The X and Y millimeter rulers remain visible while scrolling and follow the
 original print pixels even when a long preview texture is reduced for display.
 The Y endpoint shows the actual printable height at the current DPI, which can
@@ -220,26 +223,28 @@ be smaller than the nominal tape width.
 
 New text starts as a 10 mm wide box with automatic font size; its height is
 8 mm or the printable height, whichever is smaller. The first object starts at
-X=0, Y=0. Subsequent objects start 3 mm after the rightmost object, using absolute
-coordinates. Images keep their aspect ratio and fit inside their frames.
+X=0, Y=0. Subsequent slots start 3 mm after the rightmost slot, using absolute
+coordinates. Images keep their aspect ratio inside their object boxes.
 
 Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
 The source bytes are embedded in the saved `.ptl`, so reopening does not require
 the original image file. SVG sources should embed any linked images as well.
 
-Choose **After previous** to position a frame after the previous element's right
-edge with a specified gap. Empty text still reserves the whole box, so template
-values do not shift later ports. Dragging a relative frame changes its gap; if
+Choose **After previous** to position a slot after the previous slot's right
+edge with a specified gap. Empty text still reserves the whole slot, so template
+values do not shift later ports. Dragging a relative slot changes its gap; if
 it crosses to the left of its predecessor's right edge, it becomes absolute to
 allow overlap. Dragging list rows or using Up/Down changes composition order:
 absolute coordinates stay fixed, while relative objects follow their new
 predecessors. Black pixels combine at overlaps; white pixels do not erase other
 objects. The list order also determines which overlapping object is selected.
 
-Text rotates inside its fixed frame. Auto font size fits both dimensions without
+Object width and height describe the unrotated content box; offsets move its
+center relative to the slot center. Auto font size fits that box without
 stretching letters; an explicit size uses points and clipped text raises a
-warning. Images rotate and then fit proportionally inside their frames. Rotation
-does not change the frame's position or move a following relative object.
+warning. Rotation keeps the object size and slot spacing. Content can overlap
+neighboring slots or extend the label length; the printable tape edges clip it
+with a warning. **Auto fit slot** restores the older fit-inside-slot behavior.
 
 The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
 at 5, 18, and 31 mm, with 3 mm gaps:
@@ -257,20 +262,21 @@ ptouch print --layout examples/patch-panel.ptl \
 Coordinates start at the **printable area's top-left**, not the physical tape
 edge or cut. Printer feed and cutter offsets can add leading tape; verify those
 on the device before using the first coordinate as a cut-edge measurement.
-Box width and height describe the final container after text rotation. Text is
-rotated, aligned, clipped, and then mirrored inside that container. Overlapping
-elements combine their black pixels. Each element sets the next relative start
-to its own right edge, even if it was moved backwards with absolute positioning.
-Negative/non-finite coordinates, zero or excessive dimensions, and boxes beyond
-the printable tape height are errors. Bounds are rounded from absolute physical
-positions, so repeated ports do not accumulate pixel-rounding drift.
+Each slot sets the next relative start to its own right edge, even if it was
+moved backwards with absolute positioning. Negative/non-finite slot coordinates,
+zero or excessive dimensions, and slots beyond the printable tape height are
+errors; object center offsets may be negative. Bounds are rounded from absolute
+physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
-New free layouts use format version 3, which older builds reject. Versions 1
-and 2 remain readable and retain their original layout behavior; opening and
-saving an unchanged legacy layout preserves its version. **Convert to free
-layout** preserves the exact dimensions of existing millimeter frames and
-resolves their positions without rounding through preview pixels. Legacy
-natural dimensions are frozen into physical frames at the selected preview DPI.
+New free layouts use format version 4, which older builds reject. Versions 1,
+2, and 3 retain their original rendering and version when opened and saved
+unchanged. Objects without a `content_box` keep fitting inside their slots;
+their first Object move, resize, or rotation fixes the current content size and
+saves it as v4. Content previously clipped by the slot may reappear on that
+first edit. **Convert to free layout** preserves the exact dimensions of
+existing millimeter frames and resolves their positions without rounding
+through preview pixels. Legacy natural dimensions are frozen into physical
+frames at the selected preview DPI.
 Review the result before saving: legacy automatic text sizing and rotated
 images may fit differently in fixed frames. Conversion keeps Padding as an
 empty physical frame, preserving its occupied space. On labels with existing
@@ -292,7 +298,8 @@ pixels, not the layout DPI or its millimeter coordinates.
 Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
 per print, or drive a batch from a CSV file. The GUI edits and saves placeholders
 but does not have a variable-value form; its preview shows the literal tokens.
-CLI substitution changes only text content, preserving object geometry.
+CLI substitution changes only text content, preserving slots, independent
+object dimensions, offsets, and rotation.
 
 By default, USB CSV batches print as one continuous strip, including all
 `--copies`, with final feed/cut only after the last row. `--chain` skips that final step. Printers

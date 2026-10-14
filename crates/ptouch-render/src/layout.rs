@@ -37,9 +37,9 @@ pub enum VerticalAlign {
     Bottom,
 }
 
-/// A final, axis-aligned physical container, independent of its content.
-/// Rotation acts on the content before alignment; mirroring acts on the filled
-/// container. Coordinates are relative to the printable area, not a cut edge.
+/// A fixed, axis-aligned template slot. Legacy/auto-fit content rotates before
+/// fitting and alignment; independent content uses the slot as its position
+/// anchor. Coordinates are relative to the printable area, not a cut edge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextBox {
@@ -66,6 +66,45 @@ impl Default for TextBox {
     }
 }
 
+/// An independent, unrotated content box. Offsets are relative to the template
+/// slot center before object or whole-label mirroring.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentBox {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    #[serde(default)]
+    pub offset_x_mm: f64,
+    #[serde(default)]
+    pub offset_y_mm: f64,
+}
+
+impl ContentBox {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.width_mm.is_finite()
+            || !self.height_mm.is_finite()
+            || self.width_mm <= 0.0
+            || self.height_mm <= 0.0
+            || !self.offset_x_mm.is_finite()
+            || !self.offset_y_mm.is_finite()
+        {
+            return Err(RenderError::Layout(
+                "content box dimensions must be positive and finite; offsets must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Output-pixel corners in local TL/TR/BR/BL order, including all mirrors.
+/// `edit_box` remains in the document's unmirrored physical coordinate system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentGeometry {
+    pub element_index: usize,
+    pub corners: [[f32; 2]; 4],
+    pub edit_box: ContentBox,
+}
+
 /// Raster bounds at the requested output DPI, after whole-label mirroring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElementBounds {
@@ -80,6 +119,7 @@ pub struct ElementBounds {
 pub struct RenderedLabel {
     pub bitmap: Option<LabelBitmap>,
     pub bounds: Vec<ElementBounds>,
+    pub content_bounds: Vec<ContentGeometry>,
     /// Non-fatal clipping diagnostics, including the one-based element number.
     pub diagnostics: Vec<String>,
 }
@@ -162,9 +202,11 @@ pub fn render_document(
     let mut cursor_mm = 0.0;
     let mut segments = Vec::new();
     let mut bounds = Vec::new();
+    let mut content_bounds = Vec::new();
     let mut diagnostics = Vec::new();
     let mut total_width = 0;
     let mut segment_pixels = 0_u64;
+    let ppm = f64::from(target_dpi) / 25.4;
 
     for (index, element) in doc.elements.iter().enumerate() {
         let framed = match element {
@@ -181,11 +223,16 @@ pub fn render_document(
                         "free-layout objects require layout version 3".into(),
                     ));
                 }
+                if object.content_box.is_some() && doc.version < 4 {
+                    return Err(RenderError::Layout(
+                        "independent content boxes require layout version 4".into(),
+                    ));
+                }
                 Some((&object.frame, object.rotation, object.flip_h, object.flip_v))
             }
             _ => None,
         };
-        let (segment, rect) = if let Some((frame, rotation, flip_h, flip_v)) = framed {
+        let (segment, rect, left, top) = if let Some((frame, rotation, flip_h, flip_v)) = framed {
             if doc.version < 2 {
                 return Err(RenderError::Layout(
                     "text boxes require layout version 2".into(),
@@ -224,39 +271,84 @@ pub fn render_document(
                 return Err(RenderError::Layout(format!(
                     "element {}: box must be at least one output pixel in each dimension and fit inside the printable height ({:.3} mm)",
                     index + 1,
-                    f64::from(tape_width_px) * 25.4 / f64::from(target_dpi)
+                    f64::from(tape_width_px) / ppm
                 )));
             }
             check_size(right, tape_width_px)?;
             let width = right - x;
             let height = bottom - y;
-            let (segment, clipped) = match element {
-                LabelElement::Text {
-                    content,
-                    font_size,
-                    align,
-                    ..
-                } => render_box(
-                    renderer,
-                    content,
-                    *font_size,
-                    *align,
-                    rotation,
-                    frame.vertical_align,
-                    width,
-                    height,
-                    &doc.font_name,
-                    doc.font_margin,
-                    target_dpi,
-                )?,
-                LabelElement::Object(object) => {
-                    render_object(object, doc, width, height, target_dpi, renderer)?
+            let slot_center = [
+                (x_mm + frame.width_mm / 2.0) * ppm,
+                (frame.y_mm + frame.height_mm / 2.0) * ppm,
+            ];
+            let (segment, clipped, mut geometry, mut left, mut top) = match element {
+                LabelElement::Object(object) if object.content_box.is_some() => {
+                    render_independent(object, doc, slot_center, target_dpi, renderer)?
                 }
-                _ => unreachable!("only text boxes and objects have frames"),
+                _ => {
+                    let (segment, clipped, local) = match element {
+                        LabelElement::Text {
+                            content,
+                            font_size,
+                            align,
+                            ..
+                        } => render_box(
+                            renderer,
+                            content,
+                            *font_size,
+                            *align,
+                            rotation,
+                            frame.vertical_align,
+                            width,
+                            height,
+                            &doc.font_name,
+                            doc.font_margin,
+                            target_dpi,
+                        )?,
+                        LabelElement::Object(object) => render_object(
+                            object,
+                            doc,
+                            width,
+                            height,
+                            target_dpi,
+                            renderer,
+                            object.rotation,
+                        )?,
+                        _ => unreachable!("only text boxes and objects have frames"),
+                    };
+                    let geometry =
+                        local.into_geometry(index, [x as f32, y as f32], slot_center, ppm);
+                    (segment, clipped, geometry, i64::from(x), i64::from(y))
+                }
             };
+            geometry.element_index = index;
             if clipped {
                 diagnostics.push(format!("Element {}: text exceeds its fixed box and is clipped; use Auto font size or enlarge the box", index + 1));
             }
+            // Object mirrors act around the slot center, including independent offsets.
+            let mirror_center = [
+                f64::from(x) + f64::from(width) / 2.0,
+                f64::from(y) + f64::from(height) / 2.0,
+            ];
+            if flip_h {
+                left = i64::from(x) * 2 + i64::from(width) - left - i64::from(segment.width());
+                for point in &mut geometry.corners {
+                    point[0] = (mirror_center[0] * 2.0) as f32 - point[0];
+                }
+            }
+            if flip_v {
+                top = i64::from(y) * 2 + i64::from(height) - top - i64::from(segment.height());
+                for point in &mut geometry.corners {
+                    point[1] = (mirror_center[1] * 2.0) as f32 - point[1];
+                }
+            }
+            if left < 0 || top < 0 || top + i64::from(segment.height()) > i64::from(tape_width_px) {
+                diagnostics.push(format!(
+                    "Element {}: content extends outside the printable area and is clipped",
+                    index + 1
+                ));
+            }
+            content_bounds.push(geometry);
             cursor_mm = right_mm;
             (
                 segment.mirrored(flip_h, flip_v),
@@ -267,9 +359,10 @@ pub fn render_document(
                     width,
                     height,
                 },
+                left,
+                top,
             )
         } else {
-            // Guard pixel padding before the legacy renderer allocates it.
             if let LabelElement::Padding { pixels } = element {
                 check_size(*pixels, tape_width_px)?;
             }
@@ -289,6 +382,7 @@ pub fn render_document(
                 .checked_add(width)
                 .ok_or_else(|| RenderError::Layout("layout width overflow".into()))?;
             check_size(right, tape_width_px)?;
+            // Preserve the historical arithmetic order at half-pixel edges.
             cursor_mm += f64::from(width) * 25.4 / f64::from(target_dpi);
             (
                 segment,
@@ -299,32 +393,39 @@ pub fn render_document(
                     width,
                     height: tape_width_px,
                 },
+                i64::from(x),
+                0,
             )
         };
-        total_width = total_width.max(rect.x + rect.width);
+        let content_right = left + i64::from(segment.width());
+        if content_right > i64::from(MAX_LENGTH_PX) {
+            return Err(RenderError::Layout("layout raster is too large".into()));
+        }
+        total_width = total_width
+            .max(rect.x + rect.width)
+            .max(content_right.max(0) as u32);
         segment_pixels += u64::from(segment.width()) * u64::from(segment.height());
-        // Limit the actual retained working set as well as each bitmap. Many
-        // overlapping objects can have a small union but huge cached rasters.
         let canvas_pixels = u64::from(total_width) * u64::from(tape_width_px);
         if segment_pixels + canvas_pixels > MAX_LAYOUT_PIXELS {
             return Err(RenderError::Layout(
                 "layout working set is too large; reduce object count or frame dimensions".into(),
             ));
         }
-        segments.push(segment);
+        segments.push((segment, left, top));
         bounds.push(rect);
     }
     if bounds.is_empty() {
         return Ok(RenderedLabel {
             bitmap: None,
             bounds,
+            content_bounds,
             diagnostics,
         });
     }
     check_size(total_width, tape_width_px)?;
     let mut bitmap = LabelBitmap::new(total_width, tape_width_px);
-    for (segment, rect) in segments.iter().zip(&bounds) {
-        blit(&mut bitmap, segment, i64::from(rect.x), i64::from(rect.y));
+    for (segment, left, top) in &segments {
+        blit(&mut bitmap, segment, *left, *top);
     }
     for rect in &mut bounds {
         if doc.flip_h {
@@ -334,9 +435,20 @@ pub fn render_document(
             rect.y = tape_width_px - rect.y - rect.height;
         }
     }
+    for geometry in &mut content_bounds {
+        for point in &mut geometry.corners {
+            if doc.flip_h {
+                point[0] = total_width as f32 - point[0];
+            }
+            if doc.flip_v {
+                point[1] = tape_width_px as f32 - point[1];
+            }
+        }
+    }
     Ok(RenderedLabel {
         bitmap: Some(bitmap.mirrored(doc.flip_h, doc.flip_v)),
         bounds,
+        content_bounds,
         diagnostics,
     })
 }
@@ -355,7 +467,7 @@ pub fn convert_to_objects(
     let total_width = rendered.bitmap.as_ref().map_or(0, LabelBitmap::width);
     let mm_per_pixel = 25.4 / f64::from(target_dpi);
     let mut converted = doc.clone();
-    converted.version = DOCUMENT_VERSION;
+    converted.version = doc.version.max(3);
     let mut cursor_mm = 0.0;
     let mut occupied_right_mm = 0.0_f64;
     let mut new_empty_frames = Vec::new();
@@ -462,6 +574,7 @@ pub fn convert_to_objects(
                 }
                 LabelObject {
                     frame,
+                    content_box: None,
                     rotation: *rotation,
                     flip_h: *flip_h,
                     flip_v: *flip_v,
@@ -493,6 +606,7 @@ pub fn convert_to_objects(
                 );
                 LabelObject {
                     frame,
+                    content_box: None,
                     rotation: *rotation,
                     flip_h: *flip_h,
                     flip_v: *flip_v,
@@ -505,6 +619,7 @@ pub fn convert_to_objects(
             }
             LabelElement::CutMark | LabelElement::Padding { .. } => LabelObject {
                 frame,
+                content_box: None,
                 rotation: 0.0,
                 flip_h: false,
                 flip_v: false,
@@ -536,6 +651,135 @@ pub fn convert_to_objects(
     Ok(converted)
 }
 
+/// Geometry retained from the same source and fit calculation as the raster.
+struct LocalContent {
+    corners: [[f32; 2]; 4],
+    width: f32,
+    height: f32,
+    center: [f32; 2],
+}
+
+fn effective_rotation(rotation: f32) -> f32 {
+    let norm = rotation.rem_euclid(360.0);
+    for angle in [0.0_f32, 90.0, 180.0, 270.0, 360.0] {
+        if (norm - angle).abs() < 0.5 {
+            return angle.rem_euclid(360.0);
+        }
+    }
+    norm
+}
+
+fn content_corners(width: f32, height: f32, rotation: f32, center: [f32; 2]) -> [[f32; 2]; 4] {
+    let radians = effective_rotation(rotation).to_radians();
+    let (sin, cos) = radians.sin_cos();
+    [
+        [-width / 2.0, -height / 2.0],
+        [width / 2.0, -height / 2.0],
+        [width / 2.0, height / 2.0],
+        [-width / 2.0, height / 2.0],
+    ]
+    .map(|[x, y]| [center[0] + x * cos - y * sin, center[1] + x * sin + y * cos])
+}
+
+impl LocalContent {
+    fn rectangle(width: u32, height: u32, rotation: f32) -> Self {
+        let (width, height) = (width as f32, height as f32);
+        let center = [width / 2.0, height / 2.0];
+        Self {
+            corners: content_corners(width, height, rotation, center),
+            width,
+            height,
+            center,
+        }
+    }
+
+    fn into_geometry(
+        self,
+        index: usize,
+        origin: [f32; 2],
+        slot_center: [f64; 2],
+        ppm: f64,
+    ) -> ContentGeometry {
+        ContentGeometry {
+            element_index: index,
+            corners: self.corners.map(|p| [p[0] + origin[0], p[1] + origin[1]]),
+            edit_box: ContentBox {
+                width_mm: f64::from(self.width) / ppm,
+                height_mm: f64::from(self.height) / ppm,
+                offset_x_mm: (f64::from(self.center[0]) + f64::from(origin[0]) - slot_center[0])
+                    / ppm,
+                offset_y_mm: (f64::from(self.center[1]) + f64::from(origin[1]) - slot_center[1])
+                    / ppm,
+            },
+        }
+    }
+}
+
+fn signed_boundary(px: f64) -> Result<i64> {
+    if !px.is_finite() || px.abs() > f64::from(MAX_LENGTH_PX) {
+        return Err(RenderError::Layout(
+            "content position is non-finite or too large".into(),
+        ));
+    }
+    Ok(px.round() as i64)
+}
+
+type IndependentRaster = (LabelBitmap, bool, ContentGeometry, i64, i64);
+
+fn render_independent(
+    object: &LabelObject,
+    doc: &LabelDocument,
+    slot_center: [f64; 2],
+    dpi: u16,
+    renderer: &mut TextRenderer,
+) -> Result<IndependentRaster> {
+    let content_box = object
+        .content_box
+        .as_ref()
+        .expect("independent content box");
+    content_box.validate()?;
+    let ppm = f64::from(dpi) / 25.4;
+    let width = boundary(content_box.width_mm, dpi)?;
+    let height = boundary(content_box.height_mm, dpi)?;
+    if width == 0 || height == 0 {
+        return Err(RenderError::Layout(
+            "content box must be at least one output pixel in each dimension".into(),
+        ));
+    }
+    check_size(width, height)?;
+    let center = [
+        slot_center[0] + content_box.offset_x_mm * ppm,
+        slot_center[1] + content_box.offset_y_mm * ppm,
+    ];
+    // Check coordinates before allocating even a valid-sized offscreen object.
+    signed_boundary(center[0])?;
+    signed_boundary(center[1])?;
+    let (source, clipped, _) = render_object(object, doc, width, height, dpi, renderer, 0.0)?;
+    let mut bitmap = checked_rotate(&source, object.rotation)?;
+    if source.data().iter().any(|byte| *byte != 0) && !bitmap.data().iter().any(|byte| *byte != 0) {
+        if matches!(object.content, ObjectContent::CutMark) {
+            bitmap.set_pixel(bitmap.width() / 2, bitmap.height() / 2, true);
+        } else {
+            return Err(RenderError::Layout(
+                "rotated content has no visible pixels at this output DPI; enlarge the content box"
+                    .into(),
+            ));
+        }
+    }
+    let left = signed_boundary(center[0] - f64::from(bitmap.width()) / 2.0)?;
+    let top = signed_boundary(center[1] - f64::from(bitmap.height()) / 2.0)?;
+    let raster_center = [
+        left as f32 + bitmap.width() as f32 / 2.0,
+        top as f32 + bitmap.height() as f32 / 2.0,
+    ];
+    let geometry = ContentGeometry {
+        element_index: 0,
+        corners: content_corners(width as f32, height as f32, object.rotation, raster_center),
+        edit_box: content_box.clone(),
+    };
+    Ok((bitmap, clipped, geometry, left, top))
+}
+
 fn render_object(
     object: &LabelObject,
     doc: &LabelDocument,
@@ -543,7 +787,8 @@ fn render_object(
     height: u32,
     dpi: u16,
     renderer: &mut TextRenderer,
-) -> Result<(LabelBitmap, bool)> {
+    rotation: f32,
+) -> Result<(LabelBitmap, bool, LocalContent)> {
     match &object.content {
         ObjectContent::Text {
             content,
@@ -554,7 +799,7 @@ fn render_object(
             content,
             *font_size,
             *align,
-            object.rotation,
+            rotation,
             object.frame.vertical_align,
             width,
             height,
@@ -573,17 +818,15 @@ fn render_object(
                 )?),
                 None => return Err(RenderError::Layout("image object has no image data".into())),
             };
-            Ok((
-                render_contained(
-                    &source,
-                    object.rotation,
-                    object.frame.vertical_align,
-                    width,
-                    height,
-                    false,
-                )?,
+            let (bitmap, geometry) = render_contained(
+                &source,
+                rotation,
+                object.frame.vertical_align,
+                width,
+                height,
                 false,
-            ))
+            )?;
+            Ok((bitmap, false, geometry))
         }
         ObjectContent::CutMark => {
             // A cut guide spans its frame rather than inheriting the legacy
@@ -596,19 +839,21 @@ fn render_object(
                     source.set_pixel(line_x, y, true);
                 }
             }
-            Ok((
-                render_contained(
-                    &source,
-                    object.rotation,
-                    object.frame.vertical_align,
-                    width,
-                    height,
-                    true,
-                )?,
-                false,
-            ))
+            let (bitmap, geometry) = render_contained(
+                &source,
+                rotation,
+                object.frame.vertical_align,
+                width,
+                height,
+                true,
+            )?;
+            Ok((bitmap, false, geometry))
         }
-        ObjectContent::Padding => Ok((LabelBitmap::new(width, height), false)),
+        ObjectContent::Padding => Ok((
+            LabelBitmap::new(width, height),
+            false,
+            LocalContent::rectangle(width, height, rotation),
+        )),
     }
 }
 
@@ -621,7 +866,7 @@ fn render_contained(
     width: u32,
     height: u32,
     preserve_ink: bool,
-) -> Result<LabelBitmap> {
+) -> Result<(LabelBitmap, LocalContent)> {
     if source.width() == 0 || source.height() == 0 {
         return Err(RenderError::Layout(
             "object image dimensions must be positive".into(),
@@ -668,7 +913,28 @@ fn render_contained(
         // output dot; inverse rotation can otherwise miss its sole pixel.
         frame.set_pixel(width / 2, height / 2, true);
     }
-    Ok(frame)
+    let center = [
+        left as f32 + scaled_w as f32 / 2.0,
+        top as f32 + scaled_h as f32 / 2.0,
+    ];
+    let sx = scaled_w as f32 / rotated.width() as f32;
+    let sy = scaled_h as f32 / rotated.height() as f32;
+    let corners = content_corners(
+        source.width() as f32,
+        source.height() as f32,
+        rotation,
+        [rotated.width() as f32 / 2.0, rotated.height() as f32 / 2.0],
+    )
+    .map(|p| [left as f32 + p[0] * sx, top as f32 + p[1] * sy]);
+    Ok((
+        frame,
+        LocalContent {
+            corners,
+            width: (f64::from(source.width()) * scale) as f32,
+            height: (f64::from(source.height()) * scale) as f32,
+            center,
+        },
+    ))
 }
 
 /// Black-pixel composition; source white never erases an earlier element.
@@ -703,20 +969,28 @@ fn render_box(
     font_name: &str,
     margin: u32,
     dpi: u16,
-) -> Result<(LabelBitmap, bool)> {
+) -> Result<(LabelBitmap, bool, LocalContent)> {
     let mut frame = LabelBitmap::new(width, height);
     if content.trim().is_empty() {
-        return Ok((frame, false));
+        return Ok((
+            frame,
+            false,
+            LocalContent::rectangle(width, height, rotation),
+        ));
     }
     let available_h = height
         .checked_sub(margin.saturating_mul(2))
         .filter(|h| *h > 0)
         .ok_or_else(|| RenderError::Layout("font margin leaves no space in the text box".into()))?;
-    let mut render = |size: f32| -> Result<LabelBitmap> {
+    let mut render = |size: f32| -> Result<(LabelBitmap, u32, u32)> {
         let source = renderer.render_unbounded(content, font_name, size, align)?;
-        checked_rotate(&source, rotation)
+        Ok((
+            checked_rotate(&source, rotation)?,
+            source.width(),
+            source.height(),
+        ))
     };
-    let text = if let Some(size) = font_size_pt {
+    let (text, source_width, source_height) = if let Some(size) = font_size_pt {
         render(size * f32::from(dpi) / 72.0)?
     } else {
         // Search actual shaped and rotated glyph bounds, including fallback
@@ -730,7 +1004,7 @@ fn render_box(
         loop {
             match render(high) {
                 Ok(candidate)
-                    if candidate.width() <= width && candidate.height() <= available_h =>
+                    if candidate.0.width() <= width && candidate.0.height() <= available_h =>
                 {
                     low = high;
                     best = candidate;
@@ -747,7 +1021,7 @@ fn render_box(
             let size = (low + high) / 2.0;
             match render(size) {
                 Ok(candidate)
-                    if candidate.width() <= width && candidate.height() <= available_h =>
+                    if candidate.0.width() <= width && candidate.0.height() <= available_h =>
                 {
                     low = size;
                     best = candidate;
@@ -782,7 +1056,28 @@ fn render_box(
     let mut inset = LabelBitmap::new(width, available_h);
     blit(&mut inset, &text, left, top - i64::from(margin));
     blit(&mut frame, &inset, 0, i64::from(margin));
-    Ok((frame, clipped))
+    let center = [
+        left as f32 + text.width() as f32 / 2.0,
+        top as f32 + text.height() as f32 / 2.0,
+    ];
+    Ok((
+        frame,
+        clipped,
+        LocalContent {
+            corners: content_corners(
+                source_width as f32,
+                source_height as f32 + margin as f32 * 2.0,
+                rotation,
+                center,
+            ),
+            width: source_width as f32,
+            // The independent box will apply the font margin in its own local
+            // axes. Include that inset when freezing the fitted glyph size,
+            // otherwise pinning would deduct the same margin a second time.
+            height: source_height as f32 + margin as f32 * 2.0,
+            center,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1223,6 +1518,7 @@ mod tests {
         LabelElement::Object(LabelObject {
             content,
             frame,
+            content_box: None,
             rotation: 0.0,
             flip_h: false,
             flip_v: false,
@@ -1739,5 +2035,322 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn independent_object(
+        content: ObjectContent,
+        frame: TextBox,
+        width: f64,
+        height: f64,
+    ) -> LabelElement {
+        let mut item = object(content, frame);
+        item.as_object_mut().unwrap().content_box = Some(ContentBox {
+            width_mm: width,
+            height_mm: height,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        item
+    }
+
+    fn side_length(corners: &[[f32; 2]; 4], a: usize, b: usize) -> f32 {
+        (corners[a][0] - corners[b][0]).hypot(corners[a][1] - corners[b][1])
+    }
+
+    #[test]
+    fn independent_rotation_preserves_content_size_and_template_pitch() {
+        for dpi in [180, 360] {
+            let mut doc = document(vec![
+                independent_object(
+                    image_content(solid_bitmap(40, 20)),
+                    TextBox {
+                        x_mm: 10.0,
+                        y_mm: 3.0,
+                        width_mm: 6.0,
+                        height_mm: 4.0,
+                        ..TextBox::default()
+                    },
+                    12.0,
+                    4.0,
+                ),
+                object(
+                    ObjectContent::Padding,
+                    TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 3.0,
+                        width_mm: 2.0,
+                        height_mm: 4.0,
+                        ..TextBox::default()
+                    },
+                ),
+            ]);
+            doc.version = 4;
+            let mut previous = None;
+            for rotation in [0.0, 0.4, 45.0, 90.0, 135.0, 270.0] {
+                doc.elements[0].as_object_mut().unwrap().rotation = rotation;
+                let result = render(&doc, dpi);
+                assert_eq!(result.bounds[1].x, boundary(19.0, dpi).unwrap());
+                let quad = &result.content_bounds[0].corners;
+                assert!(
+                    (side_length(quad, 0, 1) - boundary(12.0, dpi).unwrap() as f32).abs() < 0.001
+                );
+                assert!(
+                    (side_length(quad, 1, 2) - boundary(4.0, dpi).unwrap() as f32).abs() < 0.001
+                );
+                assert_eq!(result.content_bounds[0].edit_box.width_mm, 12.0);
+                if rotation == 0.4 {
+                    assert_eq!(
+                        result.bitmap.as_ref().unwrap().data(),
+                        previous.as_ref().unwrap()
+                    );
+                }
+                previous = Some(result.bitmap.unwrap().data().to_vec());
+            }
+        }
+    }
+
+    #[test]
+    fn independent_content_extends_length_but_clips_only_at_printable_edges() {
+        let mut doc = document(vec![independent_object(
+            image_content(solid_bitmap(20, 10)),
+            TextBox {
+                width_mm: 4.0,
+                height_mm: 4.0,
+                ..TextBox::default()
+            },
+            8.0,
+            4.0,
+        )]);
+        doc.version = 4;
+        let item = doc.elements[0].as_object_mut().unwrap();
+        item.content_box.as_mut().unwrap().offset_x_mm = 8.0;
+        let result = render(&doc, 180);
+        assert!(result.diagnostics.is_empty());
+        assert!(result.bitmap.as_ref().unwrap().width() > result.bounds[0].width);
+        let ink = ink_bounds(result.bitmap.as_ref().unwrap());
+        assert!(ink.0 > result.bounds[0].width);
+        let item = doc.elements[0].as_object_mut().unwrap();
+        item.content_box.as_mut().unwrap().offset_x_mm = -2.0;
+        item.content_box.as_mut().unwrap().offset_y_mm = -2.0;
+        let result = render(&doc, 180);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|s| s.contains("outside the printable area"))
+        );
+        assert!(
+            result.content_bounds[0]
+                .corners
+                .iter()
+                .any(|p| p[0] < 0.0 && p[1] < 0.0)
+        );
+        assert!(
+            result
+                .bitmap
+                .as_ref()
+                .unwrap()
+                .data()
+                .iter()
+                .any(|b| *b != 0)
+        );
+    }
+
+    #[test]
+    fn independent_content_corners_follow_all_object_and_label_mirrors() {
+        let mut doc = document(vec![independent_object(
+            image_content(solid_bitmap(30, 20)),
+            TextBox {
+                x_mm: 20.0,
+                y_mm: 2.0,
+                width_mm: 20.0,
+                height_mm: 6.0,
+                ..TextBox::default()
+            },
+            4.0,
+            2.0,
+        )]);
+        doc.version = 4;
+        let item = doc.elements[0].as_object_mut().unwrap();
+        item.rotation = 30.0;
+        item.content_box.as_mut().unwrap().offset_x_mm = 2.0;
+        item.content_box.as_mut().unwrap().offset_y_mm = 1.0;
+        let original = render(&doc, 180);
+        for mirrors in 0..16 {
+            let item = doc.elements[0].as_object_mut().unwrap();
+            item.flip_h = mirrors & 1 != 0;
+            item.flip_v = mirrors & 2 != 0;
+            doc.flip_h = mirrors & 4 != 0;
+            doc.flip_v = mirrors & 8 != 0;
+            let result = render(&doc, 180);
+            let slot = original.bounds[0];
+            for (old, actual) in original.content_bounds[0]
+                .corners
+                .iter()
+                .zip(result.content_bounds[0].corners)
+            {
+                let mut expected = *old;
+                if mirrors & 1 != 0 {
+                    expected[0] = (slot.x * 2 + slot.width) as f32 - expected[0];
+                }
+                if mirrors & 2 != 0 {
+                    expected[1] = (slot.y * 2 + slot.height) as f32 - expected[1];
+                }
+                if doc.flip_h {
+                    expected[0] = result.bitmap.as_ref().unwrap().width() as f32 - expected[0];
+                }
+                if doc.flip_v {
+                    expected[1] = 76.0 - expected[1];
+                }
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(
+                result.content_bounds[0].edit_box,
+                original.content_bounds[0].edit_box
+            );
+        }
+    }
+
+    #[test]
+    fn fitted_content_geometry_describes_the_content_instead_of_the_slot() {
+        let mut doc = document(vec![object(
+            image_content(solid_bitmap(40, 20)),
+            TextBox {
+                x_mm: 5.0,
+                width_mm: 10.0,
+                height_mm: 8.0,
+                ..TextBox::default()
+            },
+        )]);
+        doc.version = 3;
+        for rotation in [0.0, 45.0, 90.0] {
+            doc.elements[0].as_object_mut().unwrap().rotation = rotation;
+            let result = render(&doc, 180);
+            let quad = &result.content_bounds[0].corners;
+            assert!((side_length(quad, 0, 1) / side_length(quad, 1, 2) - 2.0).abs() < 0.05);
+            assert!(result.content_bounds[0].edit_box.height_mm < 8.0);
+            if rotation == 45.0 {
+                assert!((quad[1][1] - quad[0][1]).abs() > 1.0);
+            }
+        }
+        for content in [
+            ObjectContent::Padding,
+            ObjectContent::Text {
+                content: String::new(),
+                font_size: None,
+                align: TextAlign::Left,
+            },
+        ] {
+            doc.elements[0].as_object_mut().unwrap().content = content;
+            let result = render(&doc, 180);
+            assert_eq!(result.content_bounds.len(), 1);
+            assert!(result.content_bounds[0].edit_box.width_mm > 0.0);
+        }
+    }
+
+    #[test]
+    fn independent_content_rejects_invalid_dimensions_versions_and_allocation_limits() {
+        let mut doc = document(vec![independent_object(
+            ObjectContent::Padding,
+            TextBox::default(),
+            10.0,
+            8.0,
+        )]);
+        for version in [1, 2, 3] {
+            doc.version = version;
+            assert!(render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_err());
+        }
+        doc.version = 4;
+        for (width, height, x, y) in [
+            (0.0, 8.0, 0.0, 0.0),
+            (-1.0, 8.0, 0.0, 0.0),
+            (f64::NAN, 8.0, 0.0, 0.0),
+            (10.0, f64::INFINITY, 0.0, 0.0),
+            (10.0, 8.0, f64::INFINITY, 0.0),
+            (10.0, 8.0, 0.0, f64::NAN),
+            (0.001, 8.0, 0.0, 0.0),
+            (100000.0, 100000.0, 0.0, 0.0),
+            (10.0, 8.0, 1e20, 0.0),
+        ] {
+            doc.elements[0].as_object_mut().unwrap().content_box = Some(ContentBox {
+                width_mm: width,
+                height_mm: height,
+                offset_x_mm: x,
+                offset_y_mm: y,
+            });
+            assert!(render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_err());
+        }
+    }
+
+    #[test]
+    fn pinning_fitted_text_does_not_apply_the_font_margin_twice() {
+        for font_size in [None, Some(5.0)] {
+            for rotation in [0.0, 45.0, 90.0] {
+                let mut item = object(
+                    ObjectContent::Text {
+                        content: "汉字".into(),
+                        font_size,
+                        align: TextAlign::Center,
+                    },
+                    TextBox {
+                        x_mm: 5.0,
+                        width_mm: 16.0,
+                        height_mm: 10.0,
+                        ..TextBox::default()
+                    },
+                );
+                item.as_object_mut().unwrap().rotation = rotation;
+                let mut doc = document(vec![item]);
+                doc.version = 3;
+                doc.font_margin = 10;
+                let before = render(&doc, 180);
+                assert!(before.diagnostics.is_empty());
+                let before_ink = ink_bounds(before.bitmap.as_ref().unwrap());
+                doc.version = 4;
+                doc.elements[0].as_object_mut().unwrap().content_box =
+                    Some(before.content_bounds[0].edit_box.clone());
+                let after = render(&doc, 180);
+                assert!(
+                    after.diagnostics.is_empty(),
+                    "font={font_size:?}, rotation={rotation}: {:?}",
+                    after.diagnostics
+                );
+                let after_ink = ink_bounds(after.bitmap.as_ref().unwrap());
+                assert!(
+                    (i64::from(before_ink.2 - before_ink.0) - i64::from(after_ink.2 - after_ink.0))
+                        .abs()
+                        <= 2,
+                    "font={font_size:?}, rotation={rotation}: {before_ink:?} -> {after_ink:?}"
+                );
+                assert!(
+                    (i64::from(before_ink.3 - before_ink.1) - i64::from(after_ink.3 - after_ink.1))
+                        .abs()
+                        <= 2,
+                    "font={font_size:?}, rotation={rotation}: {before_ink:?} -> {after_ink:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_tiny_cut_guides_survive_rotation_and_other_content_never_disappears_silently() {
+        let mut doc = document(vec![independent_object(
+            ObjectContent::CutMark,
+            TextBox::default(),
+            25.4 / 180.0,
+            25.4 / 180.0,
+        )]);
+        doc.version = 4;
+        doc.elements[0].as_object_mut().unwrap().rotation = 45.0;
+        assert!(
+            render(&doc, 180)
+                .bitmap
+                .unwrap()
+                .data()
+                .iter()
+                .any(|b| *b != 0)
+        );
+        doc.elements[0].as_object_mut().unwrap().content = image_content(solid_bitmap(1, 1));
+        assert!(render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_err());
     }
 }

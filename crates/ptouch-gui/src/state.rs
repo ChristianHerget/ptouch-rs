@@ -8,12 +8,20 @@ use std::sync::mpsc;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_render::bitmap::LabelBitmap;
 use ptouch_render::document::{
-    DOCUMENT_VERSION, ElementBounds, LabelDocument, LabelObject, ObjectContent, PositionMode,
-    TextBox,
+    ContentBox, ContentGeometry, DOCUMENT_VERSION, ElementBounds, LabelDocument, LabelObject,
+    ObjectContent, PositionMode, TextBox,
 };
 use ptouch_render::text::{TextAlign, TextRenderer};
 
 pub use ptouch_render::document::LabelElement;
+
+/// Select the visible object or the fixed template slot for canvas editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CanvasEditTarget {
+    #[default]
+    Content,
+    Slot,
+}
 
 /// Printer connection selected in the GUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +155,9 @@ pub struct AppState {
     pub preview_texture: Option<egui::TextureHandle>,
     /// Bounds in original print pixels, independent of preview downsampling.
     pub preview_bounds: Vec<ElementBounds>,
+    /// Oriented object geometry in original print pixels, after all mirrors.
+    pub preview_content_bounds: Vec<ContentGeometry>,
+    pub canvas_edit_target: CanvasEditTarget,
     pub preview_diagnostics: Vec<String>,
     pub show_bounds: bool,
     /// Flag indicating the preview needs to be re-rendered.
@@ -211,6 +222,8 @@ impl Default for AppState {
             preview_bitmap: None,
             preview_texture: None,
             preview_bounds: Vec::new(),
+            preview_content_bounds: Vec::new(),
+            canvas_edit_target: CanvasEditTarget::default(),
             preview_diagnostics: Vec::new(),
             show_bounds: true,
             needs_rerender: true,
@@ -248,8 +261,23 @@ impl AppState {
     }
 
     pub fn document(&self) -> LabelDocument {
+        // A canvas edit can introduce new fields before the stored version is
+        // updated. Render and save must both see the minimum required version.
+        let version = self
+            .elements
+            .iter()
+            .fold(self.document_version, |version, element| {
+                version.max(match element {
+                    LabelElement::Object(object) if object.content_box.is_some() => 4,
+                    LabelElement::Object(_) => 3,
+                    LabelElement::Text {
+                        text_box: Some(_), ..
+                    } => 2,
+                    _ => 1,
+                })
+            });
         LabelDocument {
-            version: self.document_version,
+            version,
             tape_width_mm: self.tape_width_mm,
             dpi: self.design_dpi,
             font_name: self.font_name.clone(),
@@ -266,6 +294,36 @@ impl AppState {
                 .elements
                 .iter()
                 .all(|element| element.as_object().is_some())
+    }
+
+    /// Resolve the unrotated physical object box without changing old files.
+    /// Auto-fit objects use the renderer's current geometry on their first edit.
+    pub fn resolved_content_box(&self, index: usize) -> Option<ContentBox> {
+        let object = self.elements.get(index)?.as_object()?;
+        object
+            .content_box
+            .clone()
+            .or_else(|| {
+                self.preview_content_bounds
+                    .iter()
+                    .find(|geometry| geometry.element_index == index)
+                    .map(|geometry| geometry.edit_box.clone())
+            })
+            .or_else(|| Some(content_box_for_frame(&object.frame)))
+    }
+
+    /// Explicitly detach object sizing from its slot on the first transform.
+    /// Opening, viewing, and converting a legacy file never call this method.
+    pub fn pin_content_box(&mut self, index: usize) -> Option<ContentBox> {
+        let resolved = self.resolved_content_box(index)?;
+        let object = self.elements.get_mut(index)?.as_object_mut()?;
+        let changed = object.content_box.is_none();
+        object.content_box = Some(resolved.clone());
+        self.document_version = self.document_version.max(4);
+        if changed {
+            self.mark_dirty();
+        }
+        Some(resolved)
     }
 
     /// Resolve a model rectangle before whole-label mirroring. Millimeter
@@ -340,6 +398,12 @@ impl AppState {
     }
 
     fn add_element(&mut self, element: LabelElement) {
+        if element
+            .as_object()
+            .is_some_and(|object| object.content_box.is_some())
+        {
+            self.document_version = self.document_version.max(4);
+        }
         self.elements.push(element);
         self.selected_element = Some(self.elements.len() - 1);
         self.mark_dirty();
@@ -347,10 +411,10 @@ impl AppState {
 
     pub fn add_text(&mut self) {
         let element = if self.is_free_layout() {
-            LabelElement::Object(LabelObject::text(
-                "Label".to_string(),
-                self.default_object_frame(10.0, 8.0),
-            ))
+            let mut object =
+                LabelObject::text("Label".to_string(), self.default_object_frame(10.0, 8.0));
+            object.content_box = Some(content_box_for_frame(&object.frame));
+            LabelElement::Object(object)
         } else {
             LabelElement::Text {
                 content: "Label".to_string(),
@@ -384,6 +448,7 @@ impl AppState {
             let height = self.printable_height_mm().min(40.0 / aspect);
             object.frame.width_mm = (height * aspect).max(25.4 / f64::from(self.target_dpi()));
             object.frame.height_mm = height.max(25.4 / f64::from(self.target_dpi()));
+            object.content_box = Some(content_box_for_frame(&object.frame));
             LabelElement::Object(object)
         } else {
             let element = LabelElement::image_from_bytes(path, bytes);
@@ -398,8 +463,10 @@ impl AppState {
 
     pub fn add_cut_mark(&mut self) {
         let element = if self.is_free_layout() {
+            let frame = self.default_object_frame(1.27, self.printable_height_mm());
             LabelElement::Object(LabelObject {
-                frame: self.default_object_frame(1.27, self.printable_height_mm()),
+                content_box: Some(content_box_for_frame(&frame)),
+                frame,
                 rotation: 0.0,
                 flip_h: false,
                 flip_v: false,
@@ -464,6 +531,15 @@ impl AppState {
     }
 }
 
+fn content_box_for_frame(frame: &TextBox) -> ContentBox {
+    ContentBox {
+        width_mm: frame.width_mm,
+        height_mm: frame.height_mm,
+        offset_x_mm: 0.0,
+        offset_y_mm: 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +547,7 @@ mod tests {
     #[test]
     fn new_objects_have_independent_frames_after_the_furthest_right_edge() {
         let mut state = AppState::default();
-        assert_eq!(state.document_version, 3);
+        assert_eq!(state.document_version, DOCUMENT_VERSION);
         state.add_text();
         state.add_text();
         let first = state.elements[0].as_object_mut().unwrap();
@@ -481,7 +557,9 @@ mod tests {
             .elements
             .iter()
             .map(|element| {
-                let frame = &element.as_object().unwrap().frame;
+                let object = element.as_object().unwrap();
+                let frame = &object.frame;
+                assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
                 assert_eq!(frame.position, PositionMode::Absolute);
                 assert_eq!(
                     (frame.width_mm, frame.height_mm, frame.y_mm),
@@ -534,6 +612,10 @@ mod tests {
         let mut state = AppState::default();
         assert!(state.add_image_bytes(None, bytes.clone()));
         let object = state.elements[0].as_object().unwrap();
+        assert_eq!(
+            object.content_box,
+            Some(content_box_for_frame(&object.frame))
+        );
         assert!((object.frame.width_mm / object.frame.height_mm - 2.0).abs() < 1e-9);
         assert_eq!(object.frame.height_mm, state.printable_height_mm());
         let ObjectContent::Image {
@@ -559,9 +641,98 @@ mod tests {
         state.add_text();
         state.add_cut_mark();
         for element in &state.elements {
-            let frame = &element.as_object().unwrap().frame;
+            let object = element.as_object().unwrap();
+            let frame = &object.frame;
+            assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
             assert!(frame.height_mm <= state.printable_height_mm());
             assert_eq!(frame.y_mm, 0.0);
         }
+    }
+
+    #[test]
+    fn first_object_edit_pins_preview_geometry_without_changing_its_slot() {
+        let slot = TextBox {
+            x_mm: 5.0,
+            ..TextBox::default()
+        };
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "PORT1",
+                slot.clone(),
+            ))],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Content);
+        assert_eq!(
+            state.resolved_content_box(0),
+            Some(content_box_for_frame(&slot))
+        );
+        let actual = ContentBox {
+            width_mm: 8.7,
+            height_mm: 3.9,
+            offset_x_mm: -0.2,
+            offset_y_mm: 0.1,
+        };
+        state.preview_content_bounds.push(ContentGeometry {
+            element_index: 0,
+            corners: [[0.0; 2]; 4],
+            edit_box: actual.clone(),
+        });
+        assert_eq!(state.resolved_content_box(0), Some(actual.clone()));
+        assert_eq!(state.document_version, 3);
+        assert!(!state.needs_rerender);
+        assert_eq!(state.pin_content_box(0), Some(actual.clone()));
+        assert_eq!(state.document_version, 4);
+        assert!(state.needs_rerender);
+        assert_eq!(state.elements[0].as_object().unwrap().frame, slot);
+        // Once manual, a stale preview must never replace the stored geometry.
+        state.preview_content_bounds[0].edit_box.width_mm = 1.0;
+        assert_eq!(state.resolved_content_box(0), Some(actual));
+        assert!(state.resolved_content_box(1).is_none());
+    }
+
+    #[test]
+    fn manual_geometry_upgrades_document_and_survives_save_without_moving_slot() {
+        let mut state = AppState {
+            document_version: 3,
+            ..AppState::default()
+        };
+        let mut object = LabelObject::text("PORT1", TextBox::default());
+        let content_box = ContentBox {
+            width_mm: 12.3,
+            height_mm: 4.5,
+            offset_x_mm: -1.2,
+            offset_y_mm: 0.7,
+        };
+        object.content_box = Some(content_box.clone());
+        object.rotation = 45.0;
+        state.elements.push(LabelElement::Object(object));
+        let document = state.document();
+        assert_eq!(document.version, 4);
+        let reopened = LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap();
+        assert_eq!(reopened.version, 4);
+        let object = reopened.elements[0].as_object().unwrap();
+        assert_eq!(object.content_box, Some(content_box));
+        assert_eq!(object.frame, TextBox::default());
+        assert_eq!(object.rotation, 45.0);
+    }
+
+    #[test]
+    fn explicit_legacy_conversion_does_not_enable_independent_object_sizing() {
+        let mut state = AppState {
+            document_version: 1,
+            elements: vec![LabelElement::CutMark, LabelElement::Padding { pixels: 20 }],
+            ..AppState::default()
+        };
+        state.convert_to_free_layout().unwrap();
+        assert!(state.is_free_layout());
+        assert!(
+            state
+                .elements
+                .iter()
+                .all(|element| element.as_object().unwrap().content_box.is_none())
+        );
     }
 }
