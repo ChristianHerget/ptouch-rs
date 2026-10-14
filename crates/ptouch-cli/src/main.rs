@@ -259,6 +259,14 @@ impl CliDevice {
         }
     }
 
+    fn query_status(&mut self) -> Result<&PrinterStatus, PtouchError> {
+        match self {
+            Self::Usb(device) => device.query_status(),
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(device) => device.query_status(),
+        }
+    }
+
     fn status(&self) -> Option<&PrinterStatus> {
         match self {
             Self::Usb(device) => device.status(),
@@ -712,13 +720,9 @@ fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.usb,
         args.usbprint.as_deref(),
     )?;
-    dev.init()?;
-
-    // init() already called get_status() internally; use that result.
-    let status = dev
-        .status()
-        .ok_or_else(|| PtouchError::StatusError("No status available after init".to_string()))?
-        .clone();
+    // A read-only query preserves device errors for display without resetting
+    // the printer or requiring it to be ready for a new print job.
+    let status = dev.query_status()?.clone();
 
     println!("Printer Information");
     println!("  Model:          {}", dev.model_name());
