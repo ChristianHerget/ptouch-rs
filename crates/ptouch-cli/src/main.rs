@@ -1253,7 +1253,7 @@ fn print_to_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use document::{LabelElement, LabelObject, ObjectContent, PositionMode, TextBox};
+    use document::{ContentBox, LabelElement, LabelObject, ObjectContent, PositionMode, TextBox};
 
     fn free_layout_fixture(dir: &Path, dpi: u16) -> LabelDocument {
         let image_path = dir.join("original.png");
@@ -1307,6 +1307,7 @@ mod tests {
                 LabelElement::Object(text),
                 LabelElement::Object(image),
                 LabelElement::Object(LabelObject {
+                    content_box: None,
                     frame: TextBox {
                         position: PositionMode::Relative,
                         gap_mm: 1.0,
@@ -1320,6 +1321,7 @@ mod tests {
                     content: ObjectContent::Padding,
                 }),
                 LabelElement::Object(LabelObject {
+                    content_box: None,
                     frame: TextBox {
                         position: PositionMode::Relative,
                         gap_mm: 2.0,
@@ -1440,6 +1442,167 @@ mod tests {
                 assert_eq!(exports[0].get_pixel(x, y), exports[1].get_pixel(x, y));
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn independent_layout_fixture(dir: &Path, dpi: u16) -> LabelDocument {
+        let mut doc = free_layout_fixture(dir, dpi);
+        let text = doc.elements[0].as_object_mut().unwrap();
+        text.rotation = 30.0;
+        text.flip_h = false;
+        text.content_box = Some(ContentBox {
+            width_mm: 6.0,
+            height_mm: 2.0,
+            offset_x_mm: 2.0,
+            offset_y_mm: 0.5,
+        });
+        let image = doc.elements[1].as_object_mut().unwrap();
+        image.frame.y_mm = 3.5;
+        image.content_box = Some(ContentBox {
+            width_mm: 8.0,
+            height_mm: 4.0,
+            offset_x_mm: 1.25,
+            offset_y_mm: -0.25,
+        });
+        // Leave the old version and the remaining auto-fit objects intact:
+        // saving independent content must promote the document to v4.
+        doc
+    }
+
+    #[test]
+    fn v4_saved_layout_set_export_keeps_independent_geometry_at_design_dpi() {
+        let dir = std::env::temp_dir().join(format!("ptouch-v4-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (dpi, height, length, slot_starts) in [
+            (180, 76, 191, [14, 85, 135, 170]),
+            (360, 150, 383, [28, 170, 269, 340]),
+        ] {
+            let original = independent_layout_fixture(&dir, dpi);
+            let serialized = original.to_toml_string().unwrap();
+            let reopened = LabelDocument::from_toml_str(&serialized).unwrap();
+            assert_eq!(reopened.version, 4);
+            assert_eq!(reopened.dpi, dpi);
+            assert_eq!(reopened.to_toml_string().unwrap(), serialized);
+            for (before, after) in original.elements.iter().zip(&reopened.elements) {
+                let before = before.as_object().unwrap();
+                let after = after.as_object().unwrap();
+                assert_eq!(after.frame, before.frame);
+                assert_eq!(after.content_box, before.content_box);
+                assert_eq!(after.rotation, before.rotation);
+                assert_eq!((after.flip_h, after.flip_v), (before.flip_h, before.flip_v));
+            }
+            let layout = dir.join(format!("independent-{dpi}.ptl"));
+            std::fs::write(&layout, reopened.to_toml_string().unwrap()).unwrap();
+            let mut previous_geometry = None;
+            for (row, value) in ["LAN1", "UPLINK-CONTROL", ""].into_iter().enumerate() {
+                let output = dir.join(format!("independent-{dpi}-{row}.png"));
+                execute_print(
+                    &batch_args(&[
+                        "--layout",
+                        layout.to_str().unwrap(),
+                        "--set",
+                        &format!("port={value}"),
+                        "--set",
+                        "suffix=",
+                        "--output",
+                        output.to_str().unwrap(),
+                    ]),
+                    &[],
+                )
+                .unwrap();
+
+                let mut filled = reopened.clone();
+                let ObjectContent::Text { content, .. } =
+                    &mut filled.elements[0].as_object_mut().unwrap().content
+                else {
+                    unreachable!();
+                };
+                *content = value.into();
+                let rendered =
+                    document::render_document(&filled, height, dpi, &mut TextRenderer::new())
+                        .unwrap();
+                assert_eq!(
+                    rendered.bounds.iter().map(|b| b.x).collect::<Vec<_>>(),
+                    slot_starts
+                );
+                // A 90-degree independent image remains taller than its slot;
+                // loading through the CLI must not revert to v3 containment.
+                let image_corners = rendered.content_bounds[1].corners;
+                assert!(
+                    (image_corners[1][1] - image_corners[0][1]).abs()
+                        > rendered.bounds[1].height as f32 * 1.9
+                );
+                let geometry = (rendered.bounds, rendered.content_bounds);
+                if let Some(previous) = &previous_geometry {
+                    assert_eq!(&geometry, previous);
+                }
+                previous_geometry = Some(geometry);
+                let exported = load_export(&output);
+                assert_eq!((exported.width(), exported.height()), (length, height));
+                assert_eq!(exported.data(), rendered.bitmap.unwrap().data());
+            }
+            // CLI substitution is per output; the saved template stays reusable.
+            assert_eq!(std::fs::read_to_string(layout).unwrap(), serialized);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v4_csv_empty_value_keeps_transformed_objects_and_saved_template() {
+        let dir = std::env::temp_dir().join(format!("ptouch-v4-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let serialized = independent_layout_fixture(&dir, 360)
+            .to_toml_string()
+            .unwrap();
+        let mut doc = LabelDocument::from_toml_str(&serialized).unwrap();
+        let layout = dir.join("independent.ptl");
+        let csv = dir.join("ports.csv");
+        let output = dir.join("port-{n}.png");
+        std::fs::write(&layout, &serialized).unwrap();
+        std::fs::write(&csv, "port\nLAN1\n\"\"\n").unwrap();
+        execute_print(
+            &batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--csv",
+                csv.to_str().unwrap(),
+                "--set",
+                "port=must-be-overridden",
+                "--set",
+                "suffix=",
+                "--output",
+                output.to_str().unwrap(),
+            ]),
+            &[],
+        )
+        .unwrap();
+
+        let mut exports = Vec::new();
+        for (row, value) in [(1, "LAN1"), (2, "")] {
+            let ObjectContent::Text { content, .. } =
+                &mut doc.elements[0].as_object_mut().unwrap().content
+            else {
+                unreachable!();
+            };
+            *content = value.into();
+            let expected =
+                document::render_document(&doc, 150, 360, &mut TextRenderer::new()).unwrap();
+            let exported = load_export(&dir.join(format!("port-{row}.png")));
+            assert_eq!((exported.width(), exported.height()), (383, 150));
+            assert_eq!(exported.data(), expected.bitmap.unwrap().data());
+            exports.push(exported);
+        }
+        assert_ne!(exports[0].data(), exports[1].data());
+        for y in 0..150 {
+            for x in 0..170 {
+                assert!(!exports[1].get_pixel(x, y));
+            }
+            for x in 170..383 {
+                assert_eq!(exports[0].get_pixel(x, y), exports[1].get_pixel(x, y));
+            }
+        }
+        assert!(!dir.join("port-3.png").exists());
+        assert_eq!(std::fs::read_to_string(layout).unwrap(), serialized);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

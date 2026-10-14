@@ -64,6 +64,7 @@ impl PtouchApp {
             self.state.preview_bitmap = None;
             self.state.preview_texture = None;
             self.state.preview_bounds.clear();
+            self.state.preview_content_bounds.clear();
             self.state.preview_diagnostics.clear();
             return;
         }
@@ -79,6 +80,7 @@ impl PtouchApp {
                     self.state.status_message = "Preview updated".to_string();
                 }
                 self.state.preview_bounds = result.bounds;
+                self.state.preview_content_bounds = result.content_bounds;
                 self.state.preview_diagnostics = result.diagnostics;
                 result.bitmap
             }
@@ -86,6 +88,7 @@ impl PtouchApp {
                 error!("Render failed: {}", e);
                 self.state.status_message = format!("Render error: {}", e);
                 self.state.preview_bounds.clear();
+                self.state.preview_content_bounds.clear();
                 self.state.preview_diagnostics = vec![e.to_string()];
                 None
             }
@@ -228,6 +231,12 @@ impl eframe::App for PtouchApp {
                 panels::sidebar::show_sidebar(ui, &mut self.state);
             });
 
+        // Reordering or opening a file invalidates geometry by element index.
+        // Properties must freeze the current object's geometry on first edit.
+        if self.state.needs_rerender {
+            self.update_preview(&ctx);
+        }
+
         // Right properties panel
         egui::Panel::right("properties")
             .default_size(250.0)
@@ -237,6 +246,11 @@ impl eframe::App for PtouchApp {
                     panels::properties::show_properties(ui, &mut self.state);
                 });
             });
+
+        // Numeric edits and pointer gestures can arrive in the same frame.
+        if self.state.needs_rerender {
+            self.update_preview(&ctx);
+        }
 
         // Central canvas
         egui::CentralPanel::default().show(ui, |ui| {
@@ -505,5 +519,89 @@ mod tests {
             (expected.bounds[0].x, expected.bounds[0].width)
         );
         assert!(bound.width > 1024);
+    }
+
+    #[test]
+    fn reordered_auto_fit_object_uses_fresh_geometry_before_first_keyboard_edit() {
+        use eframe::App;
+        use ptouch_render::document::{LabelElement, LabelObject, TextBox};
+
+        let first_slot = TextBox {
+            x_mm: 5.0,
+            y_mm: 1.0,
+            width_mm: 6.0,
+            height_mm: 4.0,
+            ..TextBox::default()
+        };
+        let (mut app, _tx) = app(AppState {
+            document_version: 3,
+            selected_element: Some(0),
+            elements: vec![
+                LabelElement::Object(LabelObject::text("A", first_slot.clone())),
+                LabelElement::Object(LabelObject::text(
+                    "BBBBBBBBBBBB",
+                    TextBox {
+                        x_mm: 20.0,
+                        width_mm: 18.0,
+                        ..first_slot.clone()
+                    },
+                )),
+            ],
+            ..AppState::default()
+        });
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run_frame = |app: &mut PtouchApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut frame),
+            );
+            output.textures_delta.clear();
+        };
+        run_frame(&mut app, vec![]);
+        let expected = app.state.resolved_content_box(0).unwrap();
+        let stale_index_geometry = app.state.resolved_content_box(1).unwrap();
+        assert!((expected.width_mm - stale_index_geometry.width_mm).abs() > 1.0);
+        assert_eq!(app.state.document_version, 3);
+
+        // This is the model mutation made by a sidebar reorder. The cached
+        // preview still describes the previous order when this UI frame begins.
+        app.state.elements.swap(0, 1);
+        app.state.selected_element = Some(1);
+        app.state.mark_dirty();
+        run_frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let edited = app.state.elements[1].as_object().unwrap();
+        let pinned = edited.content_box.as_ref().unwrap();
+        assert_eq!(
+            (pinned.width_mm, pinned.height_mm),
+            (expected.width_mm, expected.height_mm)
+        );
+        assert!((pinned.offset_x_mm - expected.offset_x_mm - 0.1).abs() < 1e-6);
+        assert_eq!(pinned.offset_y_mm, expected.offset_y_mm);
+        assert_eq!(edited.frame, first_slot);
+        assert!(
+            app.state.elements[0]
+                .as_object()
+                .unwrap()
+                .content_box
+                .is_none()
+        );
+        assert_eq!(app.state.document_version, 4);
     }
 }

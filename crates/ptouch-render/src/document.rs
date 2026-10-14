@@ -23,11 +23,12 @@ use crate::image_loader::{self, ImageLoadOptions};
 use crate::text::{TextAlign, TextRenderer};
 
 pub use crate::layout::{
-    ElementBounds, PositionMode, RenderedLabel, TextBox, VerticalAlign, render_document,
+    ContentBox, ContentGeometry, ElementBounds, PositionMode, RenderedLabel, TextBox,
+    VerticalAlign, render_document,
 };
 
 /// Current on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 3;
+pub const DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
 fn default_dpi() -> u16 {
@@ -78,6 +79,9 @@ impl LabelDocument {
         {
             doc.version = doc.version.max(3);
         }
+        if doc.has_content_boxes() {
+            doc.version = doc.version.max(4);
+        }
         Ok(toml::to_string(&doc)?)
     }
 
@@ -113,6 +117,16 @@ impl LabelDocument {
                 "design dpi must be greater than zero".into(),
             ));
         }
+        if doc.version < 4 && doc.has_content_boxes() {
+            return Err(RenderError::Layout(
+                "independent content boxes require layout version 4".into(),
+            ));
+        }
+        for object in doc.elements.iter().filter_map(LabelElement::as_object) {
+            if let Some(content_box) = &object.content_box {
+                content_box.validate()?;
+            }
+        }
         doc.decode_image_caches()?;
         Ok(doc)
     }
@@ -127,6 +141,13 @@ impl LabelDocument {
                 }
             )
         })
+    }
+
+    fn has_content_boxes(&self) -> bool {
+        self.elements
+            .iter()
+            .filter_map(LabelElement::as_object)
+            .any(|object| object.content_box.is_some())
     }
 
     /// Decode every image element's embedded bytes into its render cache.
@@ -250,7 +271,7 @@ fn substitute_placeholders(content: &str, lookup: impl Fn(&str) -> Option<String
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LabelElement {
-    /// A v3 object with shared physical geometry and content transforms.
+    /// A physical object; v4 optionally separates content geometry from its slot.
     Object(LabelObject),
     /// A text block with content, optional font size, alignment, and rotation.
     Text {
@@ -310,12 +331,18 @@ pub enum LabelElement {
     },
 }
 
-/// A physical object. Rotation transforms its content inside the fixed,
-/// axis-aligned frame; mirroring transforms the filled frame afterwards.
+/// A physical object with a fixed, axis-aligned template slot. Without a
+/// `content_box`, content rotates and fits inside that slot. With one, content
+/// rotates independently and may extend beyond it. Object mirroring reflects
+/// the content and its offset around the slot center afterwards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LabelObject {
     pub frame: TextBox,
+    /// Independent, unrotated content dimensions and offset from the slot center.
+    /// Absent in v3: retain the original fit-to-slot rendering behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_box: Option<ContentBox>,
     #[serde(default)]
     pub rotation: f32,
     #[serde(default)]
@@ -354,6 +381,7 @@ impl LabelObject {
     pub fn text(content: impl Into<String>, frame: TextBox) -> Self {
         Self {
             frame,
+            content_box: None,
             rotation: 0.0,
             flip_h: false,
             flip_v: false,
@@ -373,6 +401,7 @@ impl LabelObject {
         .ok();
         Self {
             frame,
+            content_box: None,
             rotation: 0.0,
             flip_h: false,
             flip_v: false,
@@ -839,6 +868,7 @@ mod tests {
                 )),
                 LabelElement::Object(LabelObject {
                     frame: frame.clone(),
+                    content_box: None,
                     rotation: 90.0,
                     flip_h: false,
                     flip_v: false,
@@ -846,6 +876,7 @@ mod tests {
                 }),
                 LabelElement::Object(LabelObject {
                     frame: frame.clone(),
+                    content_box: None,
                     rotation: 0.0,
                     flip_h: false,
                     flip_v: false,
@@ -882,6 +913,52 @@ mod tests {
         assert_eq!(doc.elements[0].as_object().unwrap().frame, frame);
         doc.version = 1;
         assert!(doc.to_toml_string().unwrap().contains("version = 3"));
+    }
+
+    #[test]
+    fn independent_content_boxes_require_v4_and_preserve_v3_without_them() {
+        let mut object = LabelObject::text("{{port}}", TextBox::default());
+        let mut doc = LabelDocument {
+            version: 3,
+            tape_width_mm: 12,
+            dpi: 180,
+            font_name: String::new(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::Object(object.clone())],
+        };
+        let old = doc.to_toml_string().unwrap();
+        assert!(old.contains("version = 3"));
+        assert!(!old.contains("content_box"));
+        object.content_box = Some(ContentBox {
+            width_mm: 12.0,
+            height_mm: 3.5,
+            offset_x_mm: -2.25,
+            offset_y_mm: 1.0,
+        });
+        doc.elements[0] = LabelElement::Object(object.clone());
+        let saved = doc.to_toml_string().unwrap();
+        assert!(saved.contains("version = 4"));
+        let decoded = LabelDocument::from_toml_str(&saved).unwrap();
+        assert_eq!(
+            decoded.elements[0].as_object().unwrap().content_box,
+            object.content_box
+        );
+        assert!(
+            LabelDocument::from_toml_str(&saved.replace("version = 4", "version = 3")).is_err()
+        );
+        assert!(
+            LabelDocument::from_toml_str(&saved.replace("width_mm = 12.0", "width_mm = -12.0"))
+                .is_err()
+        );
+        assert_eq!(
+            LabelDocument::from_toml_str(&old)
+                .unwrap()
+                .to_toml_string()
+                .unwrap(),
+            old
+        );
     }
 
     #[test]

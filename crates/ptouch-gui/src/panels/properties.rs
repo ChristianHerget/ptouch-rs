@@ -7,11 +7,13 @@ use log::{error, info};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use ptouch_render::document::{LabelObject, ObjectContent, PositionMode, TextBox, VerticalAlign};
+use ptouch_render::document::{
+    ContentBox, LabelObject, ObjectContent, PositionMode, TextBox, VerticalAlign,
+};
 use ptouch_render::image_loader;
 use ptouch_render::text::TextAlign;
 
-use crate::state::{AppState, LabelElement};
+use crate::state::{AppState, CanvasEditTarget, LabelElement};
 
 /// Render the right-side properties panel.
 pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
@@ -91,6 +93,12 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if changed {
+        if element
+            .as_object()
+            .is_some_and(|object| object.content_box.is_some())
+        {
+            state.document_version = state.document_version.max(4);
+        }
         state.elements[selected] = element;
         state.mark_dirty();
     }
@@ -197,7 +205,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
         changed = true;
     }
     if let Some(bounds) = text_box {
-        changed |= show_text_box(ui, bounds, state);
+        changed |= show_text_box(ui, bounds, state, true);
     } else {
         ui.small("Natural width; follows the previous element.");
     }
@@ -368,7 +376,12 @@ fn switch_position_mode(
     Ok(true)
 }
 
-fn show_text_box(ui: &mut egui::Ui, bounds: &mut TextBox, state: &mut AppState) -> bool {
+fn show_text_box(
+    ui: &mut egui::Ui,
+    bounds: &mut TextBox,
+    state: &mut AppState,
+    show_alignment: bool,
+) -> bool {
     let mut changed = false;
     let previous_right = (0..state.selected_element.unwrap_or(0))
         .rev()
@@ -446,18 +459,9 @@ fn show_text_box(ui: &mut egui::Ui, bounds: &mut TextBox, state: &mut AppState) 
             .y_mm
             .min((printable_height - bounds.height_mm).max(0.0));
     }
-    ui.horizontal(|ui| {
-        ui.label("Vertical:");
-        for (value, label) in [
-            (VerticalAlign::Top, "Top"),
-            (VerticalAlign::Center, "Center"),
-            (VerticalAlign::Bottom, "Bottom"),
-        ] {
-            changed |= ui
-                .selectable_value(&mut bounds.vertical_align, value, label)
-                .changed();
-        }
-    });
+    if show_alignment {
+        changed |= show_vertical_alignment(ui, &mut bounds.vertical_align);
+    }
     ui.small("Origin: printable top-left, not the cut edge. Rotation keeps this frame fixed.");
     if bounds.position == PositionMode::Relative {
         ui.small(
@@ -467,13 +471,133 @@ fn show_text_box(ui: &mut egui::Ui, bounds: &mut TextBox, state: &mut AppState) 
     changed
 }
 
-/// Free-layout properties share geometry and transforms across every type.
+fn show_vertical_alignment(ui: &mut egui::Ui, align: &mut VerticalAlign) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Content vertical:");
+        for (value, label) in [
+            (VerticalAlign::Top, "Top"),
+            (VerticalAlign::Center, "Center"),
+            (VerticalAlign::Bottom, "Bottom"),
+        ] {
+            changed |= ui.selectable_value(align, value, label).changed();
+        }
+    });
+    changed
+}
+
+/// Freeze the existing unrotated geometry before changing an auto-fit object's
+/// angle. Subsequent rotations keep its physical size independent of the slot.
+fn set_object_rotation(object: &mut LabelObject, rotation: f32, resolved: &ContentBox) -> bool {
+    if rotation == object.rotation {
+        return false;
+    }
+    if object.content_box.is_none() {
+        object.content_box = Some(resolved.clone());
+    }
+    object.rotation = rotation;
+    true
+}
+
+fn show_content_box(
+    ui: &mut egui::Ui,
+    object: &mut LabelObject,
+    resolved: &ContentBox,
+    state: &AppState,
+) -> bool {
+    let mut changed = false;
+    let mut auto_fit = object.content_box.is_none();
+    if ui.checkbox(&mut auto_fit, "Auto fit slot").changed() {
+        object.content_box = (!auto_fit).then(|| resolved.clone());
+        changed = true;
+    }
+    let mut dimensions = object
+        .content_box
+        .clone()
+        .unwrap_or_else(|| resolved.clone());
+    let minimum = 25.4 / f64::from(state.target_dpi());
+    ui.add_enabled_ui(!auto_fit, |ui| {
+        egui::Grid::new("object_content_dimensions")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (label, value, min) in [
+                    ("Object width", &mut dimensions.width_mm, minimum),
+                    ("Object height", &mut dimensions.height_mm, minimum),
+                    ("Offset X", &mut dimensions.offset_x_mm, -10_000.0),
+                    ("Offset Y", &mut dimensions.offset_y_mm, -10_000.0),
+                ] {
+                    ui.label(label);
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(value)
+                                .speed(0.1)
+                                .clamp_existing_to_range(false)
+                                .range(min..=10_000.0)
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    ui.end_row();
+                }
+            });
+    });
+    if changed && !auto_fit {
+        object.content_box = Some(dimensions);
+    }
+    ui.small(
+        "Offsets move the object's center from the slot center. Rotation keeps this object size.",
+    );
+    if auto_fit {
+        ui.small("Auto fit follows the slot. Rotating or dragging fixes the current object size.");
+        ui.small("Previously clipped content may reappear when detached from the slot.");
+    } else {
+        ui.small("Object content may extend beyond its slot. The printable tape edge clips it.");
+    }
+    changed
+}
+
+/// Objects have independent content geometry and a fixed template slot.
 fn show_object_properties(
     ui: &mut egui::Ui,
     object: &mut LabelObject,
     state: &mut AppState,
 ) -> bool {
-    let mut changed = show_text_box(ui, &mut object.frame, state);
+    // Resolve this before drawing any controls: the first transform of an old
+    // auto-fit object must use the geometry from its previous angle.
+    let resolved = state
+        .selected_element
+        .and_then(|index| state.resolved_content_box(index))
+        .unwrap_or(ContentBox {
+            width_mm: object.frame.width_mm,
+            height_mm: object.frame.height_mm,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+    ui.horizontal(|ui| {
+        ui.label("Edit:");
+        ui.selectable_value(
+            &mut state.canvas_edit_target,
+            CanvasEditTarget::Content,
+            "Object",
+        );
+        ui.selectable_value(
+            &mut state.canvas_edit_target,
+            CanvasEditTarget::Slot,
+            "Slot",
+        );
+    });
+    let mut changed = match state.canvas_edit_target {
+        CanvasEditTarget::Content => {
+            let mut changed = show_content_box(ui, object, &resolved, state);
+            changed |= show_vertical_alignment(ui, &mut object.frame.vertical_align);
+            changed
+        }
+        CanvasEditTarget::Slot => {
+            ui.label("Slot (template position and spacing)");
+            let changed = show_text_box(ui, &mut object.frame, state, false);
+            ui.small("Slot dimensions control spacing. Resizing a slot does not scale a manually sized object.");
+            changed
+        }
+    };
     ui.separator();
     match &mut object.content {
         ObjectContent::Text {
@@ -489,7 +613,7 @@ fn show_object_properties(
                         .desired_rows(3),
                 )
                 .changed();
-            ui.small("Template variables such as {{port}} keep this frame in place.");
+            ui.small("Template variables such as {{port}} keep the slot in place.");
             changed |= show_font_properties(ui, font_size, align, true, state);
         }
         ObjectContent::Image {
@@ -510,7 +634,9 @@ fn show_object_properties(
                     bitmap.height()
                 ));
             }
-            ui.small("Image keeps its aspect ratio and fits inside the frame after rotation.");
+            ui.small(
+                "The image keeps its aspect ratio inside the object box, then rotates with it.",
+            );
             if let Some(path) = path.clone()
                 && ui.button("Reload").clicked()
             {
@@ -536,15 +662,16 @@ fn show_object_properties(
             ui.small("A printed guide only; it does not trigger the cutter.");
         }
         ObjectContent::Padding => {
-            ui.label("Blank frame (converted padding)");
+            ui.label("Blank slot (converted padding)");
             ui.small("Keeps its extent and can anchor relative objects. Use positions or gaps for new spacing.");
         }
     }
     ui.separator();
-    ui.label("Rotation:");
-    changed |= ui
+    ui.label("Object rotation:");
+    let mut rotation = object.rotation;
+    let mut rotation_changed = ui
         .add(
-            egui::DragValue::new(&mut object.rotation)
+            egui::DragValue::new(&mut rotation)
                 .speed(1.0)
                 .clamp_existing_to_range(false)
                 .range(-360.0..=360.0)
@@ -553,11 +680,14 @@ fn show_object_properties(
         .changed();
     ui.horizontal(|ui| {
         for degrees in [0.0_f32, 45.0, 90.0, 180.0, 270.0] {
-            changed |= ui
-                .selectable_value(&mut object.rotation, degrees, format!("{}", degrees as i32))
+            rotation_changed |= ui
+                .selectable_value(&mut rotation, degrees, format!("{}", degrees as i32))
                 .changed();
         }
     });
+    if rotation_changed {
+        changed |= set_object_rotation(object, rotation, &resolved);
+    }
     changed |= show_flip_controls(ui, &mut object.flip_h, &mut object.flip_v);
     changed
 }
@@ -780,7 +910,15 @@ mod tests {
         if let ObjectContent::Text { font_size, .. } = &mut object.content {
             *font_size = Some(300.0);
         }
+        let mut independent = object.clone();
+        independent.content_box = Some(ContentBox {
+            width_mm: 0.08,
+            height_mm: 20.0,
+            offset_x_mm: -12_000.0,
+            offset_y_mm: 15_000.0,
+        });
         for (version, element) in [
+            (4, LabelElement::Object(independent)),
             (3, LabelElement::Object(object)),
             (
                 2,
@@ -794,23 +932,62 @@ mod tests {
                     text_box: Some(frame),
                 },
             ),
+            (
+                1,
+                LabelElement::Text {
+                    content: "Legacy natural".into(),
+                    font_size: Some(300.0),
+                    align: TextAlign::Left,
+                    rotation: 370.0,
+                    flip_h: false,
+                    flip_v: false,
+                    text_box: None,
+                },
+            ),
         ] {
-            let mut state = AppState {
-                document_version: version,
-                elements: vec![element],
-                selected_element: Some(0),
-                needs_rerender: false,
-                ..AppState::default()
-            };
-            let before = state.document().to_toml_string().unwrap();
-            let context = egui::Context::default();
-            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                show_properties(ui, &mut state);
-            });
-            output.textures_delta.clear();
-            assert_eq!(state.document().to_toml_string().unwrap(), before);
-            assert!(!state.needs_rerender);
+            for target in [CanvasEditTarget::Content, CanvasEditTarget::Slot] {
+                let mut state = AppState {
+                    document_version: version,
+                    elements: vec![element.clone()],
+                    selected_element: Some(0),
+                    canvas_edit_target: target,
+                    needs_rerender: false,
+                    ..AppState::default()
+                };
+                let before = state.document().to_toml_string().unwrap();
+                let context = egui::Context::default();
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                    show_properties(ui, &mut state);
+                });
+                output.textures_delta.clear();
+                assert_eq!(state.document().to_toml_string().unwrap(), before);
+                assert_eq!(state.document_version, version);
+                assert!(!state.needs_rerender);
+            }
         }
+    }
+
+    #[test]
+    fn rotating_auto_fit_pins_previous_geometry_then_preserves_it() {
+        let mut object = LabelObject::text("PORT1", TextBox::default());
+        let old_slot = object.frame.clone();
+        let previous = ContentBox {
+            width_mm: 8.7,
+            height_mm: 3.9,
+            offset_x_mm: 0.5,
+            offset_y_mm: -0.2,
+        };
+        assert!(!set_object_rotation(&mut object, 0.0, &previous));
+        assert!(object.content_box.is_none());
+        assert!(set_object_rotation(&mut object, 45.0, &previous));
+        assert_eq!(object.content_box, Some(previous.clone()));
+        let stale_preview = ContentBox {
+            width_mm: 1.0,
+            ..previous.clone()
+        };
+        assert!(set_object_rotation(&mut object, 90.0, &stale_preview));
+        assert_eq!(object.content_box, Some(previous));
+        assert_eq!(object.frame, old_slot);
     }
 
     #[test]
