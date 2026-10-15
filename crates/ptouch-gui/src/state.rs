@@ -23,6 +23,13 @@ pub enum CanvasEditTarget {
     Slot,
 }
 
+/// A specific object or template slot addressed by the canvas and element list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasTarget {
+    pub element: usize,
+    pub edit: CanvasEditTarget,
+}
+
 /// Printer connection selected in the GUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterTarget {
@@ -158,8 +165,9 @@ pub struct AppState {
     /// Oriented object geometry in original print pixels, after all mirrors.
     pub preview_content_bounds: Vec<ContentGeometry>,
     pub canvas_edit_target: CanvasEditTarget,
+    pub canvas_hover_target: Option<CanvasTarget>,
+    pub canvas_drag_target: Option<CanvasTarget>,
     pub preview_diagnostics: Vec<String>,
-    pub show_bounds: bool,
     /// Flag indicating the preview needs to be re-rendered.
     pub needs_rerender: bool,
     /// Current zoom level (1.0 = 100%).
@@ -224,8 +232,9 @@ impl Default for AppState {
             preview_bounds: Vec::new(),
             preview_content_bounds: Vec::new(),
             canvas_edit_target: CanvasEditTarget::default(),
+            canvas_hover_target: None,
+            canvas_drag_target: None,
             preview_diagnostics: Vec::new(),
-            show_bounds: true,
             needs_rerender: true,
             zoom: 1.0,
             zoom_fit: true,
@@ -252,6 +261,99 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn selected_canvas_target(&self) -> Option<CanvasTarget> {
+        self.selected_element
+            .filter(|index| *index < self.elements.len())
+            .map(|element| CanvasTarget {
+                element,
+                edit: self.canvas_edit_target,
+            })
+    }
+
+    /// Selecting a target is UI state only: never detach auto-fit content,
+    /// upgrade the file format, or request a different rendered bitmap.
+    pub fn select_canvas_target(&mut self, target: Option<CanvasTarget>) {
+        let target = target.filter(|target| target.element < self.elements.len());
+        self.selected_element = target.map(|target| target.element);
+        if let Some(target) = target {
+            self.canvas_edit_target = target.edit;
+        }
+    }
+
+    /// Only the consecutive relative slots depend on this slot's right edge.
+    /// An absolute slot or an unboxed legacy element ends this chain.
+    pub fn slot_followers(&self, index: usize) -> Vec<usize> {
+        if index >= self.elements.len() {
+            return Vec::new();
+        }
+        self.elements
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .take_while(|(_, element)| {
+                slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Show the direct predecessor of a relative slot and its dependent chain,
+    /// excluding the target itself. Absolute predecessors remain anchors.
+    pub fn slot_related(&self, index: usize) -> Vec<usize> {
+        let Some(element) = self.elements.get(index) else {
+            return Vec::new();
+        };
+        let mut related = Vec::new();
+        if index > 0
+            && slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
+        {
+            related.push(index - 1);
+        }
+        related.extend(self.slot_followers(index));
+        related
+    }
+
+    /// An interaction hint independent of save/error/printer status messages.
+    pub fn canvas_hint(&self) -> Option<String> {
+        let valid = |target: &CanvasTarget| target.element < self.elements.len();
+        let (phase, target) = if let Some(target) = self.canvas_drag_target.filter(valid) {
+            ("Dragging", target)
+        } else if let Some(target) = self.canvas_hover_target.filter(valid) {
+            ("Candidate", target)
+        } else {
+            ("Selected", self.selected_canvas_target()?)
+        };
+        let name = match target.edit {
+            CanvasEditTarget::Content => "Object",
+            CanvasEditTarget::Slot => "Slot",
+        };
+        let consequence = match target.edit {
+            CanvasEditTarget::Content => "Spacing unchanged.".to_string(),
+            CanvasEditTarget::Slot => {
+                let count = self.slot_followers(target.element).len();
+                format!(
+                    "Horizontal move affects {count} following {}.",
+                    if count == 1 { "object" } else { "objects" }
+                )
+            }
+        };
+        let action = if !self.is_free_layout() {
+            " Legacy layout: convert to free layout before dragging."
+        } else if self.overall_flip_h {
+            " Turn off label horizontal mirroring to drag."
+        } else if phase == "Candidate" {
+            " Click to select."
+        } else if phase == "Selected" && target.edit == CanvasEditTarget::Slot {
+            " Drag border to move."
+        } else {
+            ""
+        };
+        Some(format!(
+            "{phase} {name} {}: {consequence}{action}",
+            target.element + 1
+        ))
+    }
+
     pub fn target_dpi(&self) -> u16 {
         if self.printer_connected || self.preview_uses_printer {
             self.printer_dpi
@@ -331,11 +433,7 @@ impl AppState {
     pub fn element_rect_mm(&self, index: usize) -> Option<(f64, f64, f64, f64)> {
         let mut cursor = 0.0;
         for (i, element) in self.elements.iter().enumerate().take(index + 1) {
-            let frame = match element {
-                LabelElement::Object(object) => Some(&object.frame),
-                LabelElement::Text { text_box, .. } => text_box.as_ref(),
-                _ => None,
-            };
+            let frame = slot_frame(element);
             let rect = if let Some(frame) = frame {
                 let x = match frame.position {
                     PositionMode::Absolute => frame.x_mm,
@@ -405,7 +503,10 @@ impl AppState {
             self.document_version = self.document_version.max(4);
         }
         self.elements.push(element);
-        self.selected_element = Some(self.elements.len() - 1);
+        self.select_canvas_target(Some(CanvasTarget {
+            element: self.elements.len() - 1,
+            edit: CanvasEditTarget::Content,
+        }));
         self.mark_dirty();
     }
 
@@ -531,6 +632,15 @@ impl AppState {
     }
 }
 
+/// Both v2 text boxes and newer objects define physical template slots.
+fn slot_frame(element: &LabelElement) -> Option<&TextBox> {
+    match element {
+        LabelElement::Object(object) => Some(&object.frame),
+        LabelElement::Text { text_box, .. } => text_box.as_ref(),
+        _ => None,
+    }
+}
+
 fn content_box_for_frame(frame: &TextBox) -> ContentBox {
     ContentBox {
         width_mm: frame.width_mm,
@@ -543,6 +653,190 @@ fn content_box_for_frame(frame: &TextBox) -> ContentBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selecting_and_hovering_targets_never_pin_or_change_the_saved_layout() {
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "PORT1",
+                TextBox::default(),
+            ))],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        let before = state.document().to_toml_string().unwrap();
+        for edit in [CanvasEditTarget::Content, CanvasEditTarget::Slot] {
+            let target = CanvasTarget { element: 0, edit };
+            state.select_canvas_target(Some(target));
+            assert_eq!(state.selected_canvas_target(), Some(target));
+            state.canvas_hover_target = Some(target);
+            state.canvas_drag_target = Some(target);
+            assert!(state.canvas_hint().unwrap().starts_with("Dragging"));
+        }
+        state.select_canvas_target(None);
+        assert!(state.selected_canvas_target().is_none());
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 99,
+            edit: CanvasEditTarget::Slot,
+        }));
+        assert!(state.selected_canvas_target().is_none());
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.document_version, 3);
+        assert!(!state.needs_rerender);
+        assert!(state.elements[0].as_object().unwrap().content_box.is_none());
+    }
+
+    #[test]
+    fn slot_relationships_stop_at_absolute_slots_and_exclude_the_target() {
+        let mut state = AppState::default();
+        for position in [
+            PositionMode::Absolute,
+            PositionMode::Relative,
+            PositionMode::Relative,
+            PositionMode::Absolute,
+            PositionMode::Relative,
+        ] {
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "",
+                TextBox {
+                    position,
+                    ..TextBox::default()
+                },
+            )));
+        }
+        state.elements.push(LabelElement::CutMark);
+        state.elements.push(LabelElement::Object(LabelObject::text(
+            "",
+            TextBox {
+                position: PositionMode::Relative,
+                ..TextBox::default()
+            },
+        )));
+        assert_eq!(state.slot_followers(0), [1, 2]);
+        assert_eq!(state.slot_related(0), [1, 2]);
+        assert_eq!(state.slot_related(1), [0, 2]);
+        assert_eq!(state.slot_related(2), [1]);
+        assert_eq!(state.slot_related(3), [4]);
+        assert_eq!(state.slot_related(4), [3]);
+        assert_eq!(state.slot_related(6), [5]);
+        assert!(state.slot_followers(4).is_empty());
+        assert!(state.slot_followers(99).is_empty());
+        assert!(state.slot_related(99).is_empty());
+    }
+
+    #[test]
+    fn v2_text_slot_relationships_and_hints_preserve_the_original_format() {
+        let boxed_text = |position| LabelElement::Text {
+            content: "PORT".into(),
+            font_size: None,
+            align: TextAlign::Center,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            text_box: Some(TextBox {
+                x_mm: 5.0,
+                gap_mm: 3.0,
+                position,
+                ..TextBox::default()
+            }),
+        };
+        let mut state = AppState {
+            document_version: 2,
+            elements: vec![
+                boxed_text(PositionMode::Absolute),
+                boxed_text(PositionMode::Relative),
+                boxed_text(PositionMode::Relative),
+                LabelElement::Padding { pixels: 20 },
+                boxed_text(PositionMode::Relative),
+                boxed_text(PositionMode::Absolute),
+                boxed_text(PositionMode::Relative),
+            ],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        let before = state.document().to_toml_string().unwrap();
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
+        assert_eq!(state.slot_followers(0), [1, 2]);
+        assert_eq!(state.slot_related(0), [1, 2]);
+        assert_eq!(state.slot_related(1), [0, 2]);
+        assert_eq!(state.slot_related(2), [1]);
+        assert!(state.slot_followers(2).is_empty());
+        assert_eq!(state.slot_related(4), [3]);
+        assert!(state.slot_followers(4).is_empty());
+        assert_eq!(state.slot_related(5), [6]);
+        assert!(state.canvas_hint().unwrap().contains("2 following objects"));
+        assert_eq!(state.element_rect_mm(2), Some((31.0, 0.0, 10.0, 8.0)));
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.document().version, 2);
+        assert_eq!(state.document_version, 2);
+        assert!(!state.needs_rerender);
+        assert!(
+            state
+                .elements
+                .iter()
+                .all(|element| element.as_object().is_none())
+        );
+    }
+
+    #[test]
+    fn canvas_hints_prioritize_drag_then_hover_then_selection_and_explain_effects() {
+        let mut state = AppState {
+            elements: vec![
+                LabelElement::Object(LabelObject::text("A", TextBox::default())),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        ..TextBox::default()
+                    },
+                )),
+            ],
+            status_message: "Render error: keep this visible".into(),
+            ..AppState::default()
+        };
+        let selected = CanvasTarget {
+            element: 1,
+            edit: CanvasEditTarget::Slot,
+        };
+        let hovered = CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Content,
+        };
+        let dragged = CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        };
+        state.select_canvas_target(Some(selected));
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Selected Slot 2"));
+        assert!(hint.contains("0 following objects"));
+        assert!(hint.contains("Drag border to move."));
+        state.canvas_hover_target = Some(hovered);
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Candidate Object 1"));
+        assert!(hint.contains("Spacing unchanged"));
+        assert!(hint.contains("Click to select."));
+        state.canvas_drag_target = Some(dragged);
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Dragging Slot 1"));
+        assert!(hint.contains("1 following object"));
+        state.overall_flip_h = true;
+        assert!(
+            state
+                .canvas_hint()
+                .unwrap()
+                .contains("Turn off label horizontal mirroring")
+        );
+        state.canvas_drag_target = None;
+        state.canvas_hover_target = None;
+        state.elements[0] = LabelElement::CutMark;
+        assert!(state.canvas_hint().unwrap().contains("Legacy layout"));
+        assert_eq!(state.status_message, "Render error: keep this visible");
+    }
 
     #[test]
     fn new_objects_have_independent_frames_after_the_furthest_right_edge() {

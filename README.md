@@ -209,8 +209,19 @@ size and center offsets. In **Object** mode, dragging moves the content within
 or beyond its slot. Its square handle scales proportionally, including an
 explicit text font size; its round handle rotates the object and its handles
 without shrinking it back into the slot. **Slot** mode moves or resizes the
-template frame without scaling a manually sized object. Hold Shift while
-rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
+template frame without scaling a manually sized object. Hover an object to
+preview its selection; elsewhere on the paper, its slot's X interval selects
+the slot. Overlapping slots prefer the nearest Y range, then list order.
+Only hovered/selected outlines appear, with dashed related slots shown faintly.
+Click selects the target; dragging keeps that target until release. Selection
+handles stay visible while hovering another element.
+
+Click an element row to select its object, or use its **Slot** button or the
+context menu. A selected dashed border also acts as a move handle when another
+object covers it. Moving a slot horizontally or changing its width updates the
+X positions of consecutive **After previous** objects; an absolute slot ends
+that chain. The bottom hint identifies the target and affected follower count.
+Hold Shift while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
 allow fine position adjustments (Shift moves 1 mm).
 Turn off whole-label horizontal mirroring before using mouse transforms or
 arrow-key movement. Numeric properties remain available; each object's own
