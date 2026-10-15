@@ -237,6 +237,8 @@ impl PtouchApp {
                 });
             });
 
+        duplicate_shortcut(&ctx, &mut self.state);
+
         // Commit the old selection's numeric input before selecting/reordering
         // another element. The panels keep their usual visual positions.
         egui::Panel::left("sidebar")
@@ -287,6 +289,15 @@ impl PtouchApp {
 impl eframe::App for PtouchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show_editor(ui);
+    }
+}
+
+fn duplicate_shortcut(ctx: &egui::Context, state: &mut AppState) {
+    if !ctx.text_edit_focused()
+        && !ctx.input(|input| input.pointer.any_down())
+        && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::D))
+    {
+        state.duplicate_selected();
     }
 }
 
@@ -350,6 +361,49 @@ mod tests {
                 quality_modes: false,
                 tape_width_px: 128,
             },
+        }
+    }
+
+    #[test]
+    fn duplicate_shortcut_respects_text_editing_focus() {
+        for editing in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = AppState::default();
+            state.add_text();
+            let mut text = "PORT".to_string();
+            for step in 0..3 {
+                let events = if step == 2 {
+                    vec![egui::Event::Key {
+                        key: egui::Key::D,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            ctrl: true,
+                            command: true,
+                            ..Default::default()
+                        },
+                    }]
+                } else {
+                    vec![]
+                };
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if editing {
+                            ui.text_edit_singleline(&mut text).request_focus();
+                        } else {
+                            ui.button("Selected object").request_focus();
+                        }
+                        duplicate_shortcut(&ctx, &mut state);
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert_eq!(state.elements.len(), if editing { 1 } else { 2 });
         }
     }
 
