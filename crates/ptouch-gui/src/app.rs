@@ -262,50 +262,53 @@ impl eframe::App for PtouchApp {
         self.drain_printer_responses();
         crate::editor::begin_frame(&ctx, &mut self.state);
 
-        // Top toolbar
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            panels::toolbar::show_toolbar(ui, &mut self.state);
-        });
-
-        // Bottom status bar
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            panels::status_bar::show_status_bar(ui, &self.state);
-        });
-
-        // Left sidebar
-        egui::Panel::left("sidebar")
-            .default_size(200.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                panels::sidebar::show_sidebar(ui, &mut self.state);
+        ui.add_enabled_ui(!self.state.symbol_picker.is_open(), |ui| {
+            // Top toolbar
+            egui::Panel::top("toolbar").show(ui, |ui| {
+                panels::toolbar::show_toolbar(ui, &mut self.state);
             });
 
-        // Reordering or opening a file invalidates geometry by element index.
-        // Properties must freeze the current object's geometry on first edit.
-        if self.state.needs_rerender {
-            self.update_preview(&ctx);
-        }
+            // Bottom status bar
+            egui::Panel::bottom("status_bar").show(ui, |ui| {
+                panels::status_bar::show_status_bar(ui, &self.state);
+            });
 
-        // Right properties panel
-        egui::Panel::right("properties")
-            .default_size(250.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    panels::properties::show_properties(ui, &mut self.state);
+            // Left sidebar
+            egui::Panel::left("sidebar")
+                .default_size(200.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    panels::sidebar::show_sidebar(ui, &mut self.state);
                 });
+
+            // Reordering or opening a file invalidates geometry by element index.
+            // Properties must freeze the current object's geometry on first edit.
+            if self.state.needs_rerender {
+                self.update_preview(&ctx);
+            }
+
+            // Right properties panel
+            egui::Panel::right("properties")
+                .default_size(250.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        panels::properties::show_properties(ui, &mut self.state);
+                    });
+                });
+
+            if self.state.needs_rerender {
+                self.update_preview(&ctx);
+            }
+
+            // Central canvas
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = panels::canvas::show_canvas(ui, &mut self.state);
             });
-
-        if self.state.needs_rerender {
-            self.update_preview(&ctx);
-        }
-
-        // Central canvas
-        egui::CentralPanel::default().show(ui, |ui| {
-            let _ = panels::canvas::show_canvas(ui, &mut self.state);
         });
 
         crate::profile_ui::show(&ctx, &mut self.state);
+        crate::symbols::show(&ctx, &mut self.state);
         crate::editor::end_frame(&ctx, &mut self.state);
         if let Some(drag) = self.state.element_drag(&ctx) {
             crate::preview::paint_drag_ghost(&ctx, self.state.elements[drag.index].display_name());
@@ -350,8 +353,15 @@ impl eframe::App for PtouchApp {
                         element: 0,
                         edit: crate::state::CanvasEditTarget::Slot,
                     }));
+                let symbol = crate::symbols::catalogue()
+                    .icons
+                    .iter()
+                    .find(|symbol| symbol.id == "ethernet")
+                    .unwrap();
+                self.state.add_image_bytes(None, symbol.svg());
+                self.state.open_symbol_picker(Some(2));
             }
-            if *frames >= 5 {
+            if *frames >= 7 {
                 println!("PTOUCH_GUI_SMOKE_OK");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.smoke_frames = None;

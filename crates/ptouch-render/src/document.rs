@@ -507,11 +507,19 @@ impl LabelElement {
                     format!("Text: {}", preview)
                 }
             }
-            LabelElement::Image { path, .. }
+            LabelElement::Image {
+                path, image_data, ..
+            }
             | LabelElement::Object(LabelObject {
-                content: ObjectContent::Image { path, .. },
+                content:
+                    ObjectContent::Image {
+                        path, image_data, ..
+                    },
                 ..
             }) => {
+                if let Some(symbol) = crate::symbol::metadata(image_data) {
+                    return format!("Symbol: {}", symbol.name);
+                }
                 let name = path
                     .as_ref()
                     .and_then(|p| p.file_name())
@@ -865,6 +873,9 @@ fn render_image_segment(
     target_height: Option<u32>,
     tape_width_px: u32,
 ) -> Option<LabelBitmap> {
+    // A symbol's eager 24-unit cache is only a loading check. Rasterize its
+    // vector source at the actual print size in legacy layouts as well.
+    let cached = cached.filter(|_| crate::symbol::metadata(image_data).is_none());
     let bmp = if let Some(bmp) = cached {
         bmp.clone()
     } else if !image_data.is_empty() {

@@ -123,6 +123,10 @@ pub fn show_add_controls(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
 
+        if ui.button("Add Symbol").clicked() {
+            state.open_symbol_picker(None);
+        }
+
         if ui.button("Cut Mark").clicked() {
             state.add_cut_mark();
             info!("Added cut mark");

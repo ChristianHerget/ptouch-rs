@@ -224,6 +224,7 @@ pub fn begin_frame(ctx: &egui::Context, state: &mut AppState) {
     let owns_focus = !auxiliary_input;
     if owns_focus
         && !state.profiles.open
+        && !state.symbol_picker.is_open()
         && !egui::DragAndDrop::has_any_payload(ctx)
         && ctx.dragged_id().is_none()
         && !ctx.input(|input| input.pointer.any_pressed())
@@ -259,6 +260,7 @@ fn structure_shortcuts(ctx: &egui::Context, state: &mut AppState) {
     let owns_surface = focus.is_some_and(|id| state.editor.surfaces.contains(&id));
     if owns_surface
         && !state.profiles.open
+        && !state.symbol_picker.is_open()
         && !egui::DragAndDrop::has_any_payload(ctx)
         && ctx.dragged_id().is_none()
         && !egui::Popup::is_any_open(ctx)
@@ -294,6 +296,9 @@ fn structure_shortcuts(ctx: &egui::Context, state: &mut AppState) {
 }
 
 pub fn end_frame(ctx: &egui::Context, state: &mut AppState) {
+    if state.symbol_picker.is_open() {
+        return;
+    }
     structure_shortcuts(ctx, state);
     if state.editor.focus_after_action {
         if let Some(id) = state.editor.preferred_focus {
@@ -307,6 +312,13 @@ pub fn end_frame(ctx: &egui::Context, state: &mut AppState) {
         ctx.input(|input| input.pointer.primary_down()),
         ctx.input(|input| input.time),
     );
+}
+
+/// Return from an auxiliary dialog to a registered editor surface. In
+/// particular, do not leave keyboard undo attached to its old search field.
+pub fn focus_editor(ctx: &egui::Context, state: &mut AppState) {
+    state.editor.focus_after_action = true;
+    ctx.request_repaint();
 }
 
 pub fn history_buttons(ui: &mut egui::Ui, state: &mut AppState) {

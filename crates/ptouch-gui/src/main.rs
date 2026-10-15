@@ -17,6 +17,7 @@ mod preview;
 mod printer_worker;
 mod profile_ui;
 mod state;
+mod symbols;
 mod widgets;
 
 /// Decode the embedded application icon for the running window.

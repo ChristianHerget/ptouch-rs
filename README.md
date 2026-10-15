@@ -186,8 +186,9 @@ runs CLI startup and GUI rendering checks. These checks do not exercise a printe
 The Linux ARM64 packages use Debian `arm64` and RPM `aarch64` metadata.
 Nix checks cover both Linux architectures.
 
-`ptouch-gui --smoke-test` renders five frames across legacy and free layouts, then exits without starting the
-printer worker. This mode requires a working display and OpenGL context.
+`ptouch-gui --smoke-test` renders seven frames across legacy and free layouts,
+including the symbol picker, then exits without starting the printer worker.
+This mode requires a working display and OpenGL context.
 
 ## GUI
 
@@ -205,7 +206,7 @@ The offline preview uses the layout's saved design DPI.
 - Legacy labels retain canvas drag-to-reorder and dimension guides
 - Duplicate or delete objects through row action menus or right-click menus
 - Undo/redo in the top toolbar for content, formatting, object transforms, and explicit layout conversion
-- Add Text, Add Image, and Cut Mark directly below the Objects list
+- Add Text, Add Image, Add Symbol, and Cut Mark directly below the Objects list
 - Pan free layouts with Space+drag, middle-drag, or scroll; legacy labels also allow dragging empty canvas
 - Add/edit text, images, cut marks, and legacy padding
 - Free-angle text rotation with auto font sizing
@@ -220,6 +221,32 @@ or Backspace to delete, and Alt+Up/Down to reorder. Undo with Ctrl/Cmd+Z and red
 with Ctrl/Cmd+Shift+Z (also Ctrl+Y on Windows/Linux). History retains up to 100
 edits for the current layout and resets when another layout is opened. Printer
 and tape settings remain outside content history. Saved design DPI is undoable.
+
+### Symbols
+
+Use **Add Symbol** to browse 7,188 black-and-white symbols from
+[Material Design Icons 7.4.47](https://pictogrammers.com/library/mdi/). Choose a
+category or search by name, alias, or category. Select a symbol to inspect its
+print preview, then press **Add**. Each symbol is a separate object with the
+same frame, movement, sizing, rotation, and mirroring controls as an image.
+
+Use **Change Symbol…** in image or symbol properties to replace the artwork
+while retaining its frame, content dimensions and offsets, rotation, and
+mirroring. Add and Replace support undo/redo. Cancel and Escape leave the
+label unchanged.
+
+The catalogue is bundled with the GUI and works offline. Saved `.ptl` files
+embed the SVG artwork, name, author, source, and license; reopening, exporting,
+and printing require neither the catalogue nor a symbol font. The layout
+format stays unchanged. Symbol rendering preserves black shapes, including
+dense filled artwork, without automatic inversion or dithering.
+
+The catalogue excludes deprecated icons and brand/logo artwork. Its 15 label
+categories combine upstream tags with supplemental rules for common technical
+symbols; unmatched icons appear in **Other**. Regenerate the pinned catalogue
+with `python3 scripts/import-symbols.py`, or verify it without writing files
+with `python3 scripts/import-symbols.py --check`. The importer verifies the
+archive and license checksums. Ordinary builds do not run it or download assets.
 
 ## CLI Usage
 
@@ -693,6 +720,7 @@ Per-directory licensing (each source file carries an SPDX header):
 | `crates/ptouch-profiles/` | MIT | Independent portable configuration storage. |
 | `crates/ptouch-cli/` | MIT | Original work. |
 | `crates/ptouch-gui/` | MIT | Original work. |
+| `crates/ptouch-gui/assets/symbols/mdi.json` | Apache-2.0 artwork | MDI symbols; see the bundled licenses and [NOTICE](NOTICE). |
 
 The MIT-licensed files are reusable on their own under the MIT license (see
 [LICENSE-MIT](LICENSE-MIT)). Any program that links `ptouch-core`, including the

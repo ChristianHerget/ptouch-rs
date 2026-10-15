@@ -50,3 +50,14 @@ The new ptouch-profiles crate is independent of printer protocol code and
 available under MIT. The independently written printer_model.rs capability
 selection and GUI profile editor are also MIT. These additional permissions
 do not change the GPL license of the combined application.
+
+The GUI bundles 7,188 non-deprecated, non-brand symbols from Material Design
+Icons 7.4.47 by the Pictogrammers contributors:
+    https://pictogrammers.com/library/mdi/
+    https://github.com/Templarian/MaterialDesign-SVG
+
+The icon artwork is licensed under Apache License 2.0. The original collection
+license and full Apache license are included in crates/ptouch-gui/assets/symbols
+and are available in the symbol picker's library credits. Individual author
+names are retained in the catalogue and embedded SVG metadata. Label categories
+and display names are generated locally; the path artwork is unchanged.

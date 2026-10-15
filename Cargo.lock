@@ -3165,6 +3165,7 @@ dependencies = [
  "ptouch-render",
  "rfd",
  "serde",
+ "serde_json",
  "winresource",
 ]
 
@@ -3190,6 +3191,7 @@ dependencies = [
  "log",
  "ptouch-core",
  "resvg",
+ "roxmltree 0.21.1",
  "serde",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",

@@ -178,6 +178,7 @@ pub struct AppState {
     /// Editing-only startup: no worker or printer connection attempts.
     pub offline: bool,
     pub editor: crate::editor::Editor,
+    pub symbol_picker: crate::symbols::SymbolPicker,
     pub profiles: crate::profile_ui::ProfilesUi,
     pub printer_model_id: String,
     pub media_code: u8,
@@ -269,6 +270,7 @@ impl Default for AppState {
         Self {
             offline: false,
             editor: crate::editor::Editor::default(),
+            symbol_picker: crate::symbols::SymbolPicker::default(),
             profiles: crate::profile_ui::ProfilesUi::default(),
             printer_model_id: String::new(),
             media_code: 0,

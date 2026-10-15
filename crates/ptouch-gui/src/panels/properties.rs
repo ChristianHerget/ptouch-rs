@@ -671,22 +671,26 @@ fn show_object_properties(
             image_data,
             bitmap,
         } => {
-            ui.label("Image");
-            let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
-                || "embedded".to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            );
-            ui.label(format!("File: {filename}"));
-            if let Some(bitmap) = bitmap {
-                ui.small(format!(
-                    "Original: {} x {} px",
-                    bitmap.width(),
-                    bitmap.height()
-                ));
+            if !show_image_identity(ui, image_data) {
+                let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
+                    || "embedded".to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                ui.label(format!("File: {filename}"));
+                if let Some(bitmap) = bitmap {
+                    ui.small(format!(
+                        "Original: {} x {} px",
+                        bitmap.width(),
+                        bitmap.height()
+                    ));
+                }
             }
             ui.small(
                 "The image keeps its aspect ratio inside the object box, then rotates with it.",
             );
+            if ui.button("Change Symbol…").clicked() {
+                state.open_symbol_picker(state.selected_element);
+            }
             if let Some(path) = path.clone()
                 && ui.button("Reload").clicked()
             {
@@ -773,6 +777,16 @@ fn load_image_into(
     }
 }
 
+fn show_image_identity(ui: &mut egui::Ui, image_data: &[u8]) -> bool {
+    if let Some(symbol) = ptouch_render::symbol::metadata(image_data) {
+        ui.label(format!("Symbol: {}", symbol.name));
+        true
+    } else {
+        ui.label("Image");
+        false
+    }
+}
+
 /// Show properties for an image element. Returns true if changed.
 fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppState) -> bool {
     let ImageProps {
@@ -786,20 +800,26 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     } = props;
     let mut changed = false;
 
-    ui.label("Image");
+    let is_symbol = show_image_identity(ui, image_data);
     ui.add_space(4.0);
 
-    let file_label = path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "embedded".to_string());
-    ui.label(format!("File: {}", file_label));
+    if !is_symbol {
+        let file_label = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "embedded".to_string());
+        ui.label(format!("File: {}", file_label));
 
-    if let &mut Some(ref bmp) = bitmap {
-        ui.label(format!("Original: {} x {} px", bmp.width(), bmp.height()));
+        if let &mut Some(ref bmp) = bitmap {
+            ui.label(format!("Original: {} x {} px", bmp.width(), bmp.height()));
+        }
     }
 
     ui.add_space(4.0);
+
+    if ui.button("Change Symbol…").clicked() {
+        state.open_symbol_picker(state.selected_element);
+    }
 
     // Reload re-reads the original file when its path is still known.
     if let Some(p) = path.clone()
