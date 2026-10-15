@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+# 12 mm tape: three fixed 10 x 8 mm boxes starting at 5, 18 and 31 mm.
+# Print as one composed label; no cut marks or cuts between ports.
+version = 3
+tape_width_mm = 12
+dpi = 180
+font_name = "DejaVu Sans"
+font_margin = 0
+
+[[elements]]
+type = "object"
+rotation = 0.0
+[elements.frame]
+width_mm = 10.0
+height_mm = 8.0
+position = "absolute"
+x_mm = 5.0
+y_mm = 1.0
+vertical_align = "center"
+[elements.content]
+type = "text"
+content = "{{port1}}"
+align = "center"
+
+[[elements]]
+type = "object"
+rotation = 0.0
+[elements.frame]
+width_mm = 10.0
+height_mm = 8.0
+position = "relative"
+gap_mm = 3.0
+y_mm = 1.0
+vertical_align = "center"
+[elements.content]
+type = "text"
+content = "{{port2}}"
+align = "center"
+
+[[elements]]
+type = "object"
+rotation = 0.0
+[elements.frame]
+width_mm = 10.0
+height_mm = 8.0
+position = "relative"
+gap_mm = 3.0
+y_mm = 1.0
+vertical_align = "center"
+[elements.content]
+type = "text"
+content = "{{port3}}"
+align = "center"

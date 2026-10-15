@@ -10,6 +10,8 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 - Print text labels with custom font, size, alignment and rotation
 - Print images (PNG, JPEG, GIF, BMP, TIFF, WebP, SVG, and more)
 - Compose multi-element labels (text + image + cut mark + padding)
+- Position fixed text boxes in millimeters, with absolute coordinates or gaps
+  after the previous box; preview with a millimeter ruler
 - Save and reload designs as self-contained `.ptl` layout files (images
   embedded), then print them from the GUI or CLI
 - Template layouts with `{{name}}` placeholders and batch-print from a CSV
@@ -149,6 +151,9 @@ printer worker. This mode requires a working display and OpenGL context.
 ptouch-gui
 ```
 
+Use `ptouch-gui --offline` to edit and export without opening or polling USB or
+Bluetooth devices. The preview uses the layout's saved design DPI.
+
 - Live label preview with zoom
 - Add/edit/reorder text, images, cut marks, padding
 - Free-angle text rotation with auto font sizing
@@ -196,10 +201,116 @@ ptouch info
 ptouch list
 ```
 
+### Free layout and precise patch-panel labels
+
+New GUI layouts give text, images, and cut marks a millimeter **slot** for
+template position and spacing, plus an independent **object** box for content
+size and center offsets. In **Object** mode, dragging moves the content within
+or beyond its slot. Its square handle scales proportionally, including an
+explicit text font size; its round handle rotates the object and its handles
+without shrinking it back into the slot. **Slot** mode moves or resizes the
+template frame without scaling a manually sized object. Hover an object to
+preview its selection; elsewhere on the paper, its slot's X interval selects
+the slot. Overlapping slots prefer the nearest Y range, then list order.
+Only hovered/selected outlines appear, with dashed related slots shown faintly.
+Click selects the target; dragging keeps that target until release. Selection
+handles stay visible while hovering another element.
+
+Click an element row to select its object, or use its **Slot** button or the
+context menu. A selected dashed border also acts as a move handle when another
+object covers it. Moving a slot horizontally or changing its width updates the
+X positions of consecutive **After previous** objects; an absolute slot ends
+that chain. The bottom hint identifies the target and affected follower count.
+Hold Shift while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
+allow fine position adjustments (Shift moves 1 mm).
+Turn off whole-label horizontal mirroring before using mouse transforms or
+arrow-key movement. Numeric properties remain available; each object's own
+mirroring and whole-label vertical mirroring also allow mouse transforms. This
+avoids an ambiguous origin when the horizontally mirrored label changes length.
+The X and Y millimeter rulers remain visible while scrolling and follow the
+original print pixels even when a long preview texture is reduced for display.
+The Y endpoint shows the actual printable height at the current DPI, which can
+be smaller than the nominal tape width.
+
+New text starts as a 10 mm wide box with automatic font size; its height is
+8 mm or the printable height, whichever is smaller. The first object starts at
+X=0, Y=0. Subsequent slots start 3 mm after the rightmost slot, using absolute
+coordinates. Images keep their aspect ratio inside their object boxes.
+
+Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
+The source bytes are embedded in the saved `.ptl`, so reopening does not require
+the original image file. SVG sources should embed any linked images as well.
+
+Choose **After previous** to position a slot after the previous slot's right
+edge with a specified gap. Empty text still reserves the whole slot, so template
+values do not shift later ports. Dragging a relative slot changes its gap; if
+it crosses to the left of its predecessor's right edge, it becomes absolute to
+allow overlap. Dragging list rows or using Up/Down changes composition order:
+absolute coordinates stay fixed, while relative objects follow their new
+predecessors. Black pixels combine at overlaps; white pixels do not erase other
+objects. The list order also determines which overlapping object is selected.
+
+Object width and height describe the unrotated content box; offsets move its
+center relative to the slot center. Auto font size fits that box without
+stretching letters; an explicit size uses points and clipped text raises a
+warning. Rotation keeps the object size and slot spacing. Content can overlap
+neighboring slots or extend the label length; the printable tape edges clip it
+with a warning. **Auto fit slot** restores the older fit-inside-slot behavior.
+
+The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
+at 5, 18, and 31 mm, with 3 mm gaps:
+
+```sh
+# Offline preview at the saved design DPI; an empty second port retains its box
+ptouch print --layout examples/patch-panel.ptl \
+  --set port1=LAN1 --set port2= --set port3=UPLINK -o patch-panel.png
+
+# Print the complete layout as one label, with no cuts between ports
+ptouch print --layout examples/patch-panel.ptl \
+  --set port1=LAN1 --set port2=LAN2 --set port3=UPLINK
+```
+
+Coordinates start at the **printable area's top-left**, not the physical tape
+edge or cut. Printer feed and cutter offsets can add leading tape; verify those
+on the device before using the first coordinate as a cut-edge measurement.
+Each slot sets the next relative start to its own right edge, even if it was
+moved backwards with absolute positioning. Negative/non-finite slot coordinates,
+zero or excessive dimensions, and slots beyond the printable tape height are
+errors; object center offsets may be negative. Bounds are rounded from absolute
+physical positions, so repeated ports do not accumulate pixel-rounding drift.
+
+New free layouts use format version 4, which older builds reject. Versions 1,
+2, and 3 retain their original rendering and version when opened and saved
+unchanged. Objects without a `content_box` keep fitting inside their slots;
+their first Object move, resize, or rotation fixes the current content size and
+saves it as v4. Content previously clipped by the slot may reappear on that
+first edit. **Convert to free layout** preserves the exact dimensions of
+existing millimeter frames and resolves their positions without rounding
+through preview pixels. Legacy natural dimensions are frozen into physical
+frames at the selected preview DPI.
+Review the result before saving: legacy automatic text sizing and rotated
+images may fit differently in fixed frames. Conversion keeps Padding as an
+empty physical frame, preserving its occupied space. On labels with existing
+content, zero-width padding and empty natural text receive selectable blank
+frames inside the original label length; an entirely empty label receives a
+default frame. New free layouts use coordinates/gaps and do not offer a Padding
+insertion button; legacy layouts retain it.
+
+Legacy unboxed text, padding, image sizes, and font margins keep their existing
+pixel units. Fixed text frame font sizes use points (1/72 inch).
+Offline export uses the saved `dpi`; printing uses the device DPI to preserve
+millimeter positions. The GUI saves a separate design DPI and shows the current
+preview DPI. A printer disconnect keeps the last printer preview until **Use
+design DPI** is selected. `--tape-width` changes the exported printable height in
+pixels, not the layout DPI or its millimeter coordinates.
+
 ### Layout templates and batch printing
 
-Text in a layout may contain `{{name}}` placeholders. Fill them per print, or
-drive a batch from a CSV file.
+Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
+per print, or drive a batch from a CSV file. The GUI edits and saves placeholders
+but does not have a variable-value form; its preview shows the literal tokens.
+CLI substitution changes only text content, preserving slots, independent
+object dimensions, offsets, and rotation.
 
 By default, USB CSV batches print as one continuous strip, including all
 `--copies`, with final feed/cut only after the last row. `--chain` skips that final step. Printers

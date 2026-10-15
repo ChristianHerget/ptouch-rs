@@ -22,8 +22,13 @@ use crate::compose;
 use crate::image_loader::{self, ImageLoadOptions};
 use crate::text::{TextAlign, TextRenderer};
 
+pub use crate::layout::{
+    ContentBox, ContentGeometry, ElementBounds, PositionMode, RenderedLabel, TextBox,
+    VerticalAlign, render_document,
+};
+
 /// Current on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 1;
+pub const DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
 fn default_dpi() -> u16 {
@@ -37,9 +42,9 @@ pub struct LabelDocument {
     pub version: u32,
     /// Tape width in millimeters the design was created for.
     pub tape_width_mm: u8,
-    /// Print resolution in dpi the design was created for. Element sizes
-    /// and positions are pixels at this resolution. Layouts from before
-    /// this field default to 180 dpi.
+    /// Resolution used for offline rendering. Physical object frames are
+    /// converted at the output device's DPI when printing. Legacy pixel
+    /// dimensions retain their original behavior. Defaults to 180 dpi.
     #[serde(default = "default_dpi")]
     pub dpi: u16,
     /// Font family name used for text elements.
@@ -54,14 +59,30 @@ pub struct LabelDocument {
     /// after all elements are composed, independently of per-element flips.
     #[serde(default)]
     pub flip_v: bool,
-    /// Elements in composition order (left to right).
+    /// Elements in composition order; relative placement follows this order.
     pub elements: Vec<LabelElement>,
 }
 
 impl LabelDocument {
     /// Serialize the document to a TOML string.
     pub fn to_toml_string(&self) -> Result<String> {
-        Ok(toml::to_string(self)?)
+        // Never write positioning fields under v1: older builds would silently
+        // ignore them. Ordinary v1 documents can still round-trip as v1.
+        let mut doc = self.clone();
+        if doc.has_text_boxes() {
+            doc.version = doc.version.max(2);
+        }
+        if doc
+            .elements
+            .iter()
+            .any(|element| element.as_object().is_some())
+        {
+            doc.version = doc.version.max(3);
+        }
+        if doc.has_content_boxes() {
+            doc.version = doc.version.max(4);
+        }
+        Ok(toml::to_string(&doc)?)
     }
 
     /// Parse a document from a TOML string.
@@ -76,8 +97,57 @@ impl LabelDocument {
                 doc.version, DOCUMENT_VERSION
             )));
         }
+        if doc.version < 2 && doc.has_text_boxes() {
+            return Err(RenderError::Layout(
+                "text boxes require layout version 2".into(),
+            ));
+        }
+        if doc.version < 3
+            && doc
+                .elements
+                .iter()
+                .any(|element| element.as_object().is_some())
+        {
+            return Err(RenderError::Layout(
+                "free-layout objects require layout version 3".into(),
+            ));
+        }
+        if doc.dpi == 0 {
+            return Err(RenderError::Layout(
+                "design dpi must be greater than zero".into(),
+            ));
+        }
+        if doc.version < 4 && doc.has_content_boxes() {
+            return Err(RenderError::Layout(
+                "independent content boxes require layout version 4".into(),
+            ));
+        }
+        for object in doc.elements.iter().filter_map(LabelElement::as_object) {
+            if let Some(content_box) = &object.content_box {
+                content_box.validate()?;
+            }
+        }
         doc.decode_image_caches()?;
         Ok(doc)
+    }
+
+    fn has_text_boxes(&self) -> bool {
+        self.elements.iter().any(|element| {
+            matches!(
+                element,
+                LabelElement::Text {
+                    text_box: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    fn has_content_boxes(&self) -> bool {
+        self.elements
+            .iter()
+            .filter_map(LabelElement::as_object)
+            .any(|object| object.content_box.is_some())
     }
 
     /// Decode every image element's embedded bytes into its render cache.
@@ -86,9 +156,7 @@ impl LabelDocument {
     /// layout fails loudly rather than rendering blank.
     pub fn decode_image_caches(&mut self) -> Result<()> {
         for element in &mut self.elements {
-            if let LabelElement::Image {
-                image_data, bitmap, ..
-            } = element
+            if let Some((image_data, bitmap)) = element.image_data_and_cache_mut()
                 && bitmap.is_none()
                 && !image_data.is_empty()
             {
@@ -108,7 +176,7 @@ impl LabelDocument {
     pub fn placeholders(&self) -> Vec<String> {
         let mut names = BTreeSet::new();
         for element in &self.elements {
-            if let LabelElement::Text { content, .. } = element {
+            if let Some(content) = element.text_content() {
                 collect_placeholder_names(content, &mut names);
             }
         }
@@ -122,10 +190,30 @@ impl LabelDocument {
     /// [`LabelDocument::placeholders`] against the provided keys first.
     pub fn apply_values(&mut self, values: &BTreeMap<String, String>) {
         for element in &mut self.elements {
-            if let LabelElement::Text { content, .. } = element {
+            if let Some(content) = element.text_content_mut() {
                 *content = substitute_placeholders(content, |name| values.get(name).cloned());
             }
         }
+    }
+
+    /// Explicitly convert the current layout into editable physical objects.
+    ///
+    /// Existing physical geometry is preserved exactly; legacy pixel positions
+    /// and sizes (including padding) are frozen at the supplied output DPI.
+    /// Text and image content stays editable; legacy auto
+    /// sizing and image cropping can change under the new fixed-frame fitting
+    /// rules. Opening or saving an old document never invokes this conversion.
+    /// Empty legacy text and zero-width padding receive selectable frames
+    /// inside the existing extent, preserving whole-label mirror positions.
+    /// If the original label has no extent, empty text gets a default frame.
+    pub fn convert_to_free_layout(
+        &mut self,
+        tape_width_px: u32,
+        target_dpi: u16,
+        renderer: &mut TextRenderer,
+    ) -> Result<()> {
+        *self = crate::layout::convert_to_objects(self, tape_width_px, target_dpi, renderer)?;
+        Ok(())
     }
 }
 
@@ -183,13 +271,19 @@ fn substitute_placeholders(content: &str, lookup: impl Fn(&str) -> Option<String
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LabelElement {
+    /// A physical object; v4 optionally separates content geometry from its slot.
+    Object(LabelObject),
     /// A text block with content, optional font size, alignment, and rotation.
     Text {
         /// Text content; newlines separate lines.
         content: String,
-        /// Explicit font size in points. `None` means auto-fit to tape height.
+        /// Explicit font size: points for a text box, legacy raster pixels
+        /// otherwise. `None` auto-fits the box or legacy tape height.
         #[serde(skip_serializing_if = "Option::is_none")]
         font_size: Option<f32>,
+        /// Optional fixed physical container. Absent preserves v1 layout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_box: Option<TextBox>,
         /// Horizontal alignment of the text block.
         align: TextAlign,
         /// Rotation angle in degrees (clockwise). 0.0 = horizontal.
@@ -237,7 +331,141 @@ pub enum LabelElement {
     },
 }
 
+/// A physical object with a fixed, axis-aligned template slot. Without a
+/// `content_box`, content rotates and fits inside that slot. With one, content
+/// rotates independently and may extend beyond it. Object mirroring reflects
+/// the content and its offset around the slot center afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelObject {
+    pub frame: TextBox,
+    /// Independent, unrotated content dimensions and offset from the slot center.
+    /// Absent in v3: retain the original fit-to-slot rendering behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_box: Option<ContentBox>,
+    #[serde(default)]
+    pub rotation: f32,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+    pub content: ObjectContent,
+}
+
+/// Editable content of a physical object. Geometry and transforms are stored
+/// only on the containing [`LabelObject`], never recursively on the content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectContent {
+    Text {
+        content: String,
+        /// Font size in typographic points; absent means fit to the frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_size: Option<f32>,
+        align: TextAlign,
+    },
+    Image {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+        #[serde(with = "crate::base64_bytes")]
+        image_data: Vec<u8>,
+        #[serde(skip)]
+        bitmap: Option<LabelBitmap>,
+    },
+    CutMark,
+    /// An empty physical frame which still occupies its full width.
+    Padding,
+}
+
+impl LabelObject {
+    pub fn text(content: impl Into<String>, frame: TextBox) -> Self {
+        Self {
+            frame,
+            content_box: None,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            content: ObjectContent::Text {
+                content: content.into(),
+                font_size: None,
+                align: TextAlign::Left,
+            },
+        }
+    }
+
+    pub fn image_from_bytes(path: Option<PathBuf>, image_data: Vec<u8>, frame: TextBox) -> Self {
+        let bitmap = image_loader::load_image_from_reader(
+            Cursor::new(&image_data),
+            &ImageLoadOptions::default(),
+        )
+        .ok();
+        Self {
+            frame,
+            content_box: None,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            content: ObjectContent::Image {
+                path,
+                image_data,
+                bitmap,
+            },
+        }
+    }
+}
+
 impl LabelElement {
+    pub fn as_object(&self) -> Option<&LabelObject> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    pub fn as_object_mut(&mut self) -> Option<&mut LabelObject> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn text_content(&self) -> Option<&str> {
+        match self {
+            Self::Text { content, .. }
+            | Self::Object(LabelObject {
+                content: ObjectContent::Text { content, .. },
+                ..
+            }) => Some(content),
+            _ => None,
+        }
+    }
+
+    fn text_content_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Text { content, .. }
+            | Self::Object(LabelObject {
+                content: ObjectContent::Text { content, .. },
+                ..
+            }) => Some(content),
+            _ => None,
+        }
+    }
+
+    fn image_data_and_cache_mut(&mut self) -> Option<(&mut Vec<u8>, &mut Option<LabelBitmap>)> {
+        match self {
+            Self::Image {
+                image_data, bitmap, ..
+            }
+            | Self::Object(LabelObject {
+                content:
+                    ObjectContent::Image {
+                        image_data, bitmap, ..
+                    },
+                ..
+            }) => Some((image_data, bitmap)),
+            _ => None,
+        }
+    }
     /// Build an image element from decoded source bytes, decoding a render
     /// cache eagerly so previews and rendering are fast.
     pub fn image_from_bytes(path: Option<PathBuf>, image_data: Vec<u8>) -> Self {
@@ -259,7 +487,7 @@ impl LabelElement {
 
     /// Set the decoded render cache for an image element.
     pub fn set_image_bitmap(&mut self, decoded: Option<LabelBitmap>) {
-        if let LabelElement::Image { bitmap, .. } = self {
+        if let Some((_, bitmap)) = self.image_data_and_cache_mut() {
             *bitmap = decoded;
         }
     }
@@ -267,7 +495,11 @@ impl LabelElement {
     /// Returns a short display name for the element list.
     pub fn display_name(&self) -> String {
         match self {
-            LabelElement::Text { content, .. } => {
+            LabelElement::Text { content, .. }
+            | LabelElement::Object(LabelObject {
+                content: ObjectContent::Text { content, .. },
+                ..
+            }) => {
                 let preview: String = content.chars().take(20).collect();
                 if content.chars().count() > 20 {
                     format!("Text: {}...", preview)
@@ -275,7 +507,11 @@ impl LabelElement {
                     format!("Text: {}", preview)
                 }
             }
-            LabelElement::Image { path, .. } => {
+            LabelElement::Image { path, .. }
+            | LabelElement::Object(LabelObject {
+                content: ObjectContent::Image { path, .. },
+                ..
+            }) => {
                 let name = path
                     .as_ref()
                     .and_then(|p| p.file_name())
@@ -283,8 +519,17 @@ impl LabelElement {
                     .unwrap_or_else(|| "embedded".to_string());
                 format!("Image: {}", name)
             }
-            LabelElement::CutMark => "Cut Mark".to_string(),
+            LabelElement::CutMark
+            | LabelElement::Object(LabelObject {
+                content: ObjectContent::CutMark,
+                ..
+            }) => "Cut Mark".to_string(),
             LabelElement::Padding { pixels } => format!("Padding: {} px", pixels),
+            LabelElement::Object(LabelObject {
+                frame,
+                content: ObjectContent::Padding,
+                ..
+            }) => format!("Padding: {:.2} mm", frame.width_mm),
         }
     }
 }
@@ -303,6 +548,7 @@ struct FontSettings<'a> {
 /// to right. Per-element rendering failures (empty text, undecodable image) are
 /// logged and skipped rather than aborting the whole label. Returns `None` when
 /// no element produced any output.
+/// Physical text boxes must use [`render_document`] with a target DPI instead.
 pub fn render_elements(
     elements: &[LabelElement],
     tape_width_px: u32,
@@ -314,6 +560,11 @@ pub fn render_elements(
 
     for element in elements {
         let segment = match element {
+            LabelElement::Object(_) => {
+                return Err(RenderError::Layout(
+                    "free-layout objects require render_document with a target DPI".into(),
+                ));
+            }
             LabelElement::Text {
                 content,
                 font_size,
@@ -321,21 +572,29 @@ pub fn render_elements(
                 rotation,
                 flip_h,
                 flip_v,
-            } => match render_text_segment(
-                renderer,
-                content,
-                *font_size,
-                *align,
-                *rotation,
-                tape_width_px,
-                &FontSettings {
-                    name: font_name,
-                    margin: font_margin,
-                },
-            ) {
-                Some(seg) => seg.mirrored(*flip_h, *flip_v),
-                None => continue,
-            },
+                text_box,
+            } => {
+                if text_box.is_some() {
+                    return Err(RenderError::Layout(
+                        "text boxes require render_document with a target DPI".into(),
+                    ));
+                }
+                match render_text_segment(
+                    renderer,
+                    content,
+                    *font_size,
+                    *align,
+                    *rotation,
+                    tape_width_px,
+                    &FontSettings {
+                        name: font_name,
+                        margin: font_margin,
+                    },
+                ) {
+                    Some(seg) => seg.mirrored(*flip_h, *flip_v),
+                    None => continue,
+                }
+            }
             LabelElement::Image {
                 image_data,
                 bitmap,
@@ -578,6 +837,148 @@ mod tests {
     }
 
     #[test]
+    fn v3_objects_round_trip_embedded_images_geometry_and_template_content() {
+        let frame = TextBox {
+            x_mm: 5.0,
+            y_mm: 1.0,
+            width_mm: 10.0,
+            height_mm: 8.0,
+            position: PositionMode::Relative,
+            gap_mm: 3.0,
+            vertical_align: VerticalAlign::Bottom,
+        };
+        let mut text = LabelObject::text("{{port}}", frame.clone());
+        text.rotation = 45.0;
+        text.flip_h = true;
+        text.flip_v = true;
+        let mut doc = LabelDocument {
+            version: 3,
+            tape_width_mm: 12,
+            dpi: 360,
+            font_name: String::new(),
+            font_margin: 1,
+            flip_h: true,
+            flip_v: false,
+            elements: vec![
+                LabelElement::Object(text),
+                LabelElement::Object(LabelObject::image_from_bytes(
+                    Some("missing-original-image.png".into()),
+                    png_left_black(12, 8),
+                    frame.clone(),
+                )),
+                LabelElement::Object(LabelObject {
+                    frame: frame.clone(),
+                    content_box: None,
+                    rotation: 90.0,
+                    flip_h: false,
+                    flip_v: false,
+                    content: ObjectContent::CutMark,
+                }),
+                LabelElement::Object(LabelObject {
+                    frame: frame.clone(),
+                    content_box: None,
+                    rotation: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                    content: ObjectContent::Padding,
+                }),
+            ],
+        };
+        let encoded = doc.to_toml_string().unwrap();
+        let decoded = LabelDocument::from_toml_str(&encoded).unwrap();
+        assert_eq!(decoded.to_toml_string().unwrap(), encoded);
+        assert_eq!(decoded.placeholders(), vec!["port"]);
+        assert!(matches!(
+            &decoded.elements[1].as_object().unwrap().content,
+            ObjectContent::Image {
+                bitmap: Some(_),
+                ..
+            }
+        ));
+        for object in &decoded.elements {
+            assert_eq!(object.as_object().unwrap().frame, frame);
+        }
+        for invalid_version in [1, 2] {
+            assert!(
+                LabelDocument::from_toml_str(&encoded.replacen(
+                    "version = 3",
+                    &format!("version = {invalid_version}"),
+                    1
+                ))
+                .is_err()
+            );
+        }
+        doc.apply_values(&BTreeMap::from([("port".into(), String::new())]));
+        assert_eq!(doc.elements[0].text_content(), Some(""));
+        assert_eq!(doc.elements[0].as_object().unwrap().frame, frame);
+        doc.version = 1;
+        assert!(doc.to_toml_string().unwrap().contains("version = 3"));
+    }
+
+    #[test]
+    fn independent_content_boxes_require_v4_and_preserve_v3_without_them() {
+        let mut object = LabelObject::text("{{port}}", TextBox::default());
+        let mut doc = LabelDocument {
+            version: 3,
+            tape_width_mm: 12,
+            dpi: 180,
+            font_name: String::new(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::Object(object.clone())],
+        };
+        let old = doc.to_toml_string().unwrap();
+        assert!(old.contains("version = 3"));
+        assert!(!old.contains("content_box"));
+        object.content_box = Some(ContentBox {
+            width_mm: 12.0,
+            height_mm: 3.5,
+            offset_x_mm: -2.25,
+            offset_y_mm: 1.0,
+        });
+        doc.elements[0] = LabelElement::Object(object.clone());
+        let saved = doc.to_toml_string().unwrap();
+        assert!(saved.contains("version = 4"));
+        let decoded = LabelDocument::from_toml_str(&saved).unwrap();
+        assert_eq!(
+            decoded.elements[0].as_object().unwrap().content_box,
+            object.content_box
+        );
+        assert!(
+            LabelDocument::from_toml_str(&saved.replace("version = 4", "version = 3")).is_err()
+        );
+        assert!(
+            LabelDocument::from_toml_str(&saved.replace("width_mm = 12.0", "width_mm = -12.0"))
+                .is_err()
+        );
+        assert_eq!(
+            LabelDocument::from_toml_str(&old)
+                .unwrap()
+                .to_toml_string()
+                .unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn saving_legacy_layouts_keeps_their_version_and_element_representation() {
+        for version in [1, 2] {
+            let text = format!(
+                "version = {version}\ntape_width_mm = 12\nfont_name = \"\"\nfont_margin = 0\n[[elements]]\ntype = \"padding\"\npixels = 17\n"
+            );
+            let doc = LabelDocument::from_toml_str(&text).unwrap();
+            let saved = doc.to_toml_string().unwrap();
+            assert!(saved.contains(&format!("version = {version}")));
+            assert!(!saved.contains("object"));
+            assert!(matches!(
+                doc.elements[0],
+                LabelElement::Padding { pixels: 17 }
+            ));
+        }
+    }
+
+    #[test]
     fn test_per_element_flip_h_mirrors_image() {
         let mut renderer = TextRenderer::new();
         let data = png_left_black(40, 40);
@@ -692,6 +1093,7 @@ mod tests {
         let elements = vec![LabelElement::Text {
             content: String::new(),
             font_size: Some(24.0),
+            text_box: None,
             align: TextAlign::Left,
             rotation: 0.0,
             flip_h: false,
@@ -753,6 +1155,7 @@ mod tests {
                 LabelElement::Text {
                     content: "Hi".into(),
                     font_size: Some(24.0),
+                    text_box: None,
                     align: TextAlign::Center,
                     rotation: 0.0,
                     flip_h: false,
@@ -860,6 +1263,7 @@ mod tests {
             elements: vec![LabelElement::Text {
                 content: content.into(),
                 font_size: Some(24.0),
+                text_box: None,
                 align: TextAlign::Left,
                 rotation: 0.0,
                 flip_h: false,

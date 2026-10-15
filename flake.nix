@@ -35,11 +35,15 @@
           version = (builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"))).workspace.package.version;
 
           # crane's filterCargoSources keeps Rust sources, TOML files and
-          # Cargo.lock, so it drops the assets ptouch-gui embeds with
-          # include_bytes!; keep anything below an assets directory.
+          # Cargo.lock, so also retain embedded GUI assets and the .ptl layout
+          # examples used by CLI integration tests.
           cargoSrc = lib.cleanSourceWith {
             inherit src;
-            filter = path: type: craneLib.filterCargoSources path type || lib.hasInfix "/assets/" path;
+            filter =
+              path: type:
+              craneLib.filterCargoSources path type
+              || lib.hasInfix "/assets/" path
+              || lib.hasSuffix ".ptl" path;
           };
 
           # libusb1-sys (vendored) probes libudev with pkg-config, so the build
