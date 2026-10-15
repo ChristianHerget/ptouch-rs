@@ -134,9 +134,11 @@ sends each supplied raster column once in every mode. HG tape requirements on
 legacy models are enforced by the printer's existing quality commands.
 PT-P750W does not expose draft; PT-P900W/PT-P950NW remain standard-only.
 
-GUI previews and image exports retain their square document resolution. Saved
-profile and layout formats and CLI quality names are unchanged. Library callers
-must adopt the explicit raster resolution argument; see the
+Connected GUI previews use the selected head/feed resolution. Image exports
+retain physical proportions using square pixels. Offline layout exports use
+the saved design DPI. Printer-profile formats and CLI quality names are
+unchanged; new free layouts use format v4 and legacy layouts keep their version.
+Library callers must adopt the explicit raster resolution argument; see the
 [Rust raster API migration](raster-api.md).
 
 A plain CLI image export without `--tape-width` uses the selected/default

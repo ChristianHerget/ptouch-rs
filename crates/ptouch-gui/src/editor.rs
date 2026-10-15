@@ -5,10 +5,12 @@ mod history;
 
 use crate::state::{AppState, LabelElement};
 use egui::{Id, Key, Modifiers, Response};
-use history::{ContentHistory, ContentSelection, ContentSnapshot, EditGroup};
+pub(crate) use history::EditGroup;
+use history::{ContentHistory, ContentSelection, ContentSnapshot};
 use std::collections::HashSet;
 
 pub enum EditorAction {
+    SelectCanvas(crate::state::CanvasTarget),
     Add(LabelElement),
     Duplicate(usize),
     Delete(usize),
@@ -76,12 +78,13 @@ impl AppState {
             &self.elements,
             &self.font_name,
             self.font_margin,
-            self.overall_flip_h,
-            self.overall_flip_v,
+            (self.overall_flip_h, self.overall_flip_v),
             ContentSelection {
                 element: self.selected_element,
                 cursor: self.editor.text_cursor,
+                target: self.canvas_edit_target,
             },
+            (self.document_version, self.design_dpi),
         )
     }
 
@@ -100,6 +103,10 @@ impl AppState {
 
     pub fn apply_editor_action(&mut self, action: EditorAction) -> bool {
         match action {
+            EditorAction::SelectCanvas(target) => {
+                self.select_canvas_target(Some(target));
+                return true;
+            }
             EditorAction::Undo | EditorAction::Redo => {
                 let snapshot = if matches!(action, EditorAction::Undo) {
                     self.editor.history.undo()
@@ -161,7 +168,9 @@ impl AppState {
                 self.select_element(Some(destination));
                 "Reorder element"
             }
-            EditorAction::Undo | EditorAction::Redo => unreachable!(),
+            EditorAction::Undo | EditorAction::Redo | EditorAction::SelectCanvas(_) => {
+                unreachable!()
+            }
         };
         let after = self.content_snapshot();
         self.editor.history.record_action(before, after, name);
@@ -208,7 +217,9 @@ fn shortcut(ctx: &egui::Context, modifiers: Modifiers, key: Key) -> String {
 pub fn begin_frame(ctx: &egui::Context, state: &mut AppState) {
     let focus = ctx.memory(|memory| memory.focused());
     let auxiliary_input = focus.is_some_and(|id| {
-        egui::TextEdit::load_state(ctx, id).is_some() && !state.editor.content_inputs.contains(&id)
+        egui::TextEdit::load_state(ctx, id).is_some()
+            && !state.editor.content_inputs.contains(&id)
+            && !state.editor.surfaces.contains(&id)
     });
     let owns_focus = !auxiliary_input;
     if owns_focus
@@ -353,7 +364,23 @@ fn menu_contents(ui: &mut egui::Ui, state: &AppState, target: MenuTarget) -> Opt
         return None;
     }
     let action = if let Some(index) = target.index.filter(|&index| index < state.elements.len()) {
-        if ui
+        if ui.button("Select object").clicked() {
+            Some(EditorAction::SelectCanvas(crate::state::CanvasTarget {
+                element: index,
+                edit: crate::state::CanvasEditTarget::Content,
+            }))
+        } else if ui
+            .add_enabled(
+                crate::state::slot_frame(&state.elements[index]).is_some(),
+                egui::Button::new("Select slot"),
+            )
+            .clicked()
+        {
+            Some(EditorAction::SelectCanvas(crate::state::CanvasTarget {
+                element: index,
+                edit: crate::state::CanvasEditTarget::Slot,
+            }))
+        } else if ui
             .add(egui::Button::new("Duplicate").shortcut_text(shortcut(
                 ui.ctx(),
                 Modifiers::COMMAND,
@@ -503,6 +530,7 @@ mod tests {
     fn fixture() -> AppState {
         AppState {
             elements: vec![LabelElement::Text {
+                text_box: None,
                 content: "A".into(),
                 font_size: Some(24.0),
                 align: ptouch_render::text::TextAlign::Left,

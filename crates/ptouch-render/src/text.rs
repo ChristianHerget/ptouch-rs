@@ -59,6 +59,117 @@ impl TextRenderer {
         }
     }
 
+    /// Render a complete, unwrapped text block without tape-height clipping.
+    /// The tight ink bounds include glyph bearings and preserve the alignment
+    /// of explicit newline-separated lines. Used before box rotation/fitting.
+    pub(crate) fn render_unbounded(
+        &mut self,
+        text: &str,
+        font_name: &str,
+        font_size_px: f32,
+        align: TextAlign,
+    ) -> Result<LabelBitmap> {
+        if !font_size_px.is_finite() || font_size_px <= 0.0 || font_size_px > 4096.0 {
+            return Err(RenderError::Text(
+                "font size must be in (0, 4096] pixels".into(),
+            ));
+        }
+        if text.trim().is_empty() {
+            return Ok(LabelBitmap::new(1, 1));
+        }
+        let family = if font_name.is_empty() {
+            Family::SansSerif
+        } else {
+            Family::Name(font_name)
+        };
+        let attrs = Attrs::new().family(family);
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(font_size_px, (font_size_px * 1.2).ceil()),
+        );
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, None);
+        buffer.set_text(text, &attrs, Shaping::Advanced, Some(align.to_cosmic()));
+        buffer.shape_until_scroll(&mut self.font_system, true);
+        let width = buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max);
+        let height = text.split('\n').count() as f32 * (font_size_px * 1.2).ceil();
+        if !width.is_finite() || width > 1_000_000.0 || width * height > 16_777_216.0 {
+            return Err(RenderError::DimensionMismatch(
+                "text raster is too large".into(),
+            ));
+        }
+        // Reflow alignment within the actual longest line instead of an
+        // arbitrary large measurement surface. Never wrap long port names.
+        buffer.set_size(Some(width.ceil().max(1.0)), None);
+        buffer.shape_until_scroll(&mut self.font_system, true);
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        buffer.draw(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            Color::rgb(0, 0, 0),
+            |x, y, w, h, color| {
+                if color.a() >= 128 {
+                    let right = x + w as i32;
+                    let bottom = y + h as i32;
+                    bounds = Some(match bounds {
+                        Some((left, top, r, b)) => {
+                            (left.min(x), top.min(y), r.max(right), b.max(bottom))
+                        }
+                        None => (x, y, right, bottom),
+                    });
+                }
+            },
+        );
+        let Some((left, top, right, bottom)) = bounds else {
+            if font_size_px < 4.0 {
+                return Ok(LabelBitmap::new(1, 1));
+            }
+            return Err(RenderError::Text(
+                "no visible glyphs; select an installed font".into(),
+            ));
+        };
+        let width = (right - left) as u32;
+        let height = (bottom - top) as u32;
+        if u64::from(width) * u64::from(height) > 16_777_216 {
+            return Err(RenderError::DimensionMismatch(
+                "text raster is too large".into(),
+            ));
+        }
+        let mut bitmap = LabelBitmap::new(width, height);
+        buffer.draw(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            Color::rgb(0, 0, 0),
+            |x, y, w, h, color| {
+                if color.a() >= 128 {
+                    for dy in 0..h {
+                        for dx in 0..w {
+                            bitmap.set_pixel((x - left) as u32 + dx, (y - top) as u32 + dy, true);
+                        }
+                    }
+                }
+            },
+        );
+        Ok(bitmap)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_font() -> Self {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../../ptouch-gui/assets/fonts/DroidSansFallback.ttf").to_vec(),
+        );
+        db.set_sans_serif_family("Droid Sans Fallback");
+        let font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        Self {
+            font_system,
+            swash_cache: SwashCache::new(),
+        }
+    }
+
     /// Render one or more lines of text into a [`LabelBitmap`].
     ///
     /// - `lines`: text lines to render (joined with newlines)
@@ -66,7 +177,8 @@ impl TextRenderer {
     ///   height; called "print_width" for compatibility with the C API where
     ///   the tape width is the printable width)
     /// - `font_name`: font family name to use (e.g. "DejaVu Sans")
-    /// - `font_size`: explicit font size in points, or `None` for auto-detect
+    /// - `font_size`: explicit font size in raster pixels (legacy behavior),
+    ///   or `None` for auto-detect; physical boxes convert points separately
     /// - `font_margin`: margin in pixels on each side (top and bottom)
     /// - `align`: horizontal text alignment
     ///
@@ -252,6 +364,7 @@ mod tests {
                 ("PT-9700PC", 360, 150),
             ] {
                 let elements = [LabelElement::Text {
+                    text_box: None,
                     content: content.clone(),
                     font_size: Some(24.0),
                     align: TextAlign::Left,

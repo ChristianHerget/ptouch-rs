@@ -40,9 +40,10 @@ impl RenderedPreview {
         }
     }
 
+    #[cfg(test)]
     pub fn from_rendered(
         ctx: &egui::Context,
-        rendered: ptouch_render::document::RenderedLabel,
+        rendered: ptouch_render::document::RenderedElements,
         resolution: PrintResolution,
     ) -> Self {
         let mut preview = Self::new(ctx, rendered.bitmap, resolution);

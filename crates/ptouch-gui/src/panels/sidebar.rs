@@ -7,7 +7,7 @@ use log::info;
 
 use ptouch_core::tape;
 
-use crate::state::{AppState, PrinterCommand};
+use crate::state::{AppState, CanvasEditTarget, CanvasTarget, PrinterCommand};
 
 /// Render the left sidebar.
 pub fn show_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
@@ -92,7 +92,10 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
     if ui
-        .add_enabled(!state.is_printer_busy(), egui::Button::new("Refresh"))
+        .add_enabled(
+            !state.is_printer_busy() && state.printer_cmd_tx.is_some(),
+            egui::Button::new("Refresh"),
+        )
         .clicked()
         && let Some(ref tx) = state.printer_cmd_tx
     {
@@ -108,29 +111,61 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Tape");
     ui.add_space(4.0);
 
-    let tapes = tape::supported_tapes(state.printer_dpi);
+    let tapes = tape::supported_tapes(state.target_dpi());
     let current_label = format!("{} mm ({} px)", state.tape_width_mm, state.tape_width_px);
 
-    ui.add_enabled_ui(
-        !state.printer_connected && !state.printer_target.is_bluetooth(),
-        |ui| {
-            egui::ComboBox::from_label("Width")
-                .selected_text(&current_label)
-                .show_ui(ui, |ui| {
-                    for t in tapes {
-                        let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
-                        if ui
-                            .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
-                            .clicked()
-                        {
-                            state.update_tape_pixels();
-                            state.mark_dirty();
-                            info!("Tape changed: {} mm", t.width_mm);
-                        }
+    ui.add_enabled_ui(!state.printer_connected, |ui| {
+        egui::ComboBox::from_label("Width")
+            .selected_text(&current_label)
+            .show_ui(ui, |ui| {
+                for t in tapes {
+                    let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
+                    if ui
+                        .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
+                        .clicked()
+                    {
+                        state.update_tape_pixels();
+                        state.mark_dirty();
+                        info!("Tape changed: {} mm", t.width_mm);
                     }
-                });
-        },
-    );
+                }
+            });
+    });
+
+    let before = state.content_snapshot();
+    let old_dpi = state.design_dpi;
+    egui::ComboBox::from_label("Design DPI")
+        .selected_text(state.design_dpi.to_string())
+        .show_ui(ui, |ui| {
+            for dpi in [180, 360] {
+                ui.selectable_value(&mut state.design_dpi, dpi, dpi.to_string());
+            }
+        })
+        .response
+        .on_hover_text("Saved with the layout; used for offline preview and export.");
+    if state.design_dpi != old_dpi {
+        if !state.printer_connected {
+            state.preview_uses_printer = false;
+            state.update_tape_pixels();
+        }
+        state.record_content(before, "Design DPI", None, ui.input(|i| i.time));
+    }
+    let source = if state.printer_connected {
+        "printer"
+    } else if state.preview_uses_printer {
+        "last printer"
+    } else {
+        "design"
+    };
+    ui.label(format!("Preview: {} DPI ({source})", state.target_dpi()));
+    if !state.printer_connected
+        && state.preview_uses_printer
+        && ui.button("Use design DPI").clicked()
+    {
+        state.preview_uses_printer = false;
+        state.update_tape_pixels();
+        state.mark_dirty();
+    }
 }
 
 /// Print options: auto-cut toggle and quality selection.
@@ -211,6 +246,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     let mut action = None;
     let mut rows = Vec::new();
     let mut selection = None;
+    let content_target = |element| CanvasTarget {
+        element,
+        edit: CanvasEditTarget::Content,
+    };
     for idx in 0..state.elements.len() {
         let is_selected = state.selected_element == Some(idx);
         let label = format!("{}. {}", idx + 1, state.elements[idx].display_name());
@@ -227,9 +266,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 });
                 if handle.drag_started() {
                     handle.request_focus();
-                    selection = Some(idx);
+                    selection = Some(content_target(idx));
                 }
-                let width = (ui.available_width() - 30.0).max(1.0);
+                let width = (ui.available_width() - 78.0).max(1.0);
                 let response = ui
                     .add_sized(
                         [width, ui.spacing().interact_size.y],
@@ -239,21 +278,39 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 state.editor.surface(&response);
                 if response.clicked() {
                     response.request_focus();
-                    selection = Some(idx);
+                    selection = Some(content_target(idx));
+                }
+                if crate::state::slot_frame(&state.elements[idx]).is_some()
+                    && ui
+                        .selectable_label(
+                            state.selected_canvas_target()
+                                == Some(CanvasTarget {
+                                    element: idx,
+                                    edit: CanvasEditTarget::Slot,
+                                }),
+                            "Slot",
+                        )
+                        .on_hover_text("Select template position and spacing")
+                        .clicked()
+                {
+                    selection = Some(CanvasTarget {
+                        element: idx,
+                        edit: CanvasEditTarget::Slot,
+                    });
                 }
                 let context = crate::editor::context_menu(&response, state, Some(idx));
-                selection = context.selection.or(selection);
+                selection = context.selection.map(content_target).or(selection);
                 action = context.action.or(action.take());
                 let (menu_response, menu) = crate::editor::row_menu(ui, state, idx);
                 state.editor.surface(&menu_response);
-                selection = menu.selection.or(selection);
+                selection = menu.selection.map(content_target).or(selection);
                 action = menu.action.or(action.take());
             })
         });
         rows.push(row.inner.response.rect);
     }
-    if let Some(index) = selection {
-        state.select_element(Some(index));
+    if let Some(target) = selection {
+        state.select_canvas_target(Some(target));
         ui.ctx().request_repaint();
     }
     if let (Some(drag), Some(pointer), Some(first), Some(last)) = (
@@ -439,5 +496,185 @@ mod tests {
             LabelElement::Padding { pixels: 30 }
         ));
         assert_eq!(state.selected_element, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod free_layout_tests {
+    use super::*;
+    use ptouch_render::document::{LabelElement, LabelObject, PositionMode, TextBox};
+
+    fn list_frame(
+        context: &egui::Context,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 500.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| show_elements_section(ui, state),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn key_events(key: egui::Key) -> Vec<egui::Event> {
+        [true, false]
+            .into_iter()
+            .map(|pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            })
+            .collect()
+    }
+
+    fn pointer_event(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    fn text_position(output: &egui::FullOutput, text: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape) if shape.galley.text().starts_with(text) => {
+                    Some(shape.pos + shape.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing text: {text}"))
+    }
+
+    #[test]
+    fn slot_keyboard_entry_row_click_and_context_menu_select_without_pinning() {
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "PORT1",
+                TextBox::default(),
+            ))],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        let before = state.document().to_toml_string().unwrap();
+        let context = egui::Context::default();
+        list_frame(&context, &mut state, vec![]);
+        list_frame(&context, &mut state, key_events(egui::Key::Tab));
+        list_frame(&context, &mut state, key_events(egui::Key::Tab));
+        list_frame(&context, &mut state, key_events(egui::Key::Tab));
+        let output = list_frame(&context, &mut state, key_events(egui::Key::Enter));
+        assert_eq!(
+            state.selected_canvas_target(),
+            Some(CanvasTarget {
+                element: 0,
+                edit: CanvasEditTarget::Slot,
+            })
+        );
+        let row = text_position(&output, "1. ");
+        list_frame(
+            &context,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(row),
+                pointer_event(row, egui::PointerButton::Primary, true),
+            ],
+        );
+        list_frame(
+            &context,
+            &mut state,
+            vec![pointer_event(row, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            state.selected_canvas_target().unwrap().edit,
+            CanvasEditTarget::Content
+        );
+        list_frame(
+            &context,
+            &mut state,
+            vec![pointer_event(row, egui::PointerButton::Secondary, true)],
+        );
+        list_frame(
+            &context,
+            &mut state,
+            vec![pointer_event(row, egui::PointerButton::Secondary, false)],
+        );
+        let menu = list_frame(&context, &mut state, vec![]);
+        let slot = text_position(&menu, "Select slot");
+        list_frame(
+            &context,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(slot),
+                pointer_event(slot, egui::PointerButton::Primary, true),
+            ],
+        );
+        list_frame(
+            &context,
+            &mut state,
+            vec![pointer_event(slot, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            state.selected_canvas_target().unwrap().edit,
+            CanvasEditTarget::Slot
+        );
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.document_version, 3);
+        assert!(!state.needs_rerender);
+    }
+
+    #[test]
+    fn reordering_keeps_absolute_coordinates_and_rebinds_relative_followers() {
+        let mut state = AppState {
+            elements: vec![
+                LabelElement::Object(LabelObject::text(
+                    "A",
+                    TextBox {
+                        x_mm: 5.0,
+                        ..TextBox::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        x_mm: 30.0,
+                        ..TextBox::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "C",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 3.0,
+                        ..TextBox::default()
+                    },
+                )),
+            ],
+            ..AppState::default()
+        };
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
+        state.apply_editor_action(crate::editor::EditorAction::Move { from: 0, before: 2 });
+        assert_eq!(state.selected_element, Some(1));
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 30.0);
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 18.0);
     }
 }

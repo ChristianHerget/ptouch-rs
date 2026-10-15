@@ -1,8 +1,8 @@
 # Rust raster API migration
 
 `print_raster` now requires the actual input raster resolution. This is a
-breaking Rust API change. CLI flags and saved profile/layout formats are
-unchanged.
+breaking Rust API change. CLI quality flags and saved printer-profile formats are unchanged. New free
+layouts use upstream format v4; unchanged legacy documents keep their version.
 
 Use a model's shared quality metadata to select the mode and render its input:
 
@@ -31,13 +31,26 @@ label mirroring once after rendering, then pack the resulting bitmap. The GUI
 uses the selected print resolution for previews, printing, and image exports.
 
 For interactive previews, `render_elements_with_layout_at_resolution` accepts
-the same arguments and returns `Option<RenderedLabel>`. This contains the print
+the same arguments and returns `Option<RenderedElements>`. This contains the print
 `bitmap` and `element_spans`: optional feed-column ranges indexed by source
 element. Skipped elements have no range; a draft element can have an empty
 range when none of its columns is sampled. Ranges are collected in the same
 rendering pass and follow the final resolution, including global draft sampling.
-Use `RenderedLabel::mirrored(horizontal, vertical)` to mirror the pixels and
+Use `RenderedElements::mirrored(horizontal, vertical)` to mirror the pixels and
 ranges together. The bitmap-only rendering functions remain available.
+
+For complete saved layouts, including v2 text boxes and v3/v4 objects, use
+`render_document_at_resolution(&document, printable_height, resolution, &mut renderer)`.
+The square-DPI `render_document` entrypoint remains available for offline rendering.
+Physical X coordinates use feed DPI; Y coordinates use head DPI. Rotations are
+rendered in square source pixels before sampling into printer dots. Legacy
+unboxed pixel dimensions retain their previous rendering behavior.
+
+Document rendering returns `RenderedLabel` with an optional bitmap, slot `bounds`,
+oriented `content_bounds`, and clipping `diagnostics`. It applies the document's
+whole-label mirrors to both pixels and geometry. Callers must not mirror again.
+The former legacy bitmap/span result is now named `RenderedElements` to keep
+these two interfaces distinct.
 
 Convert a span's column count with `resolution.length_mm` to measure its
 contribution to preview length, including whitespace. Preview dimensions omit

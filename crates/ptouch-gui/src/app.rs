@@ -29,6 +29,7 @@ impl PtouchApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         smoke_test: bool,
+        offline: bool,
         profiles_dir: std::path::PathBuf,
     ) -> Self {
         setup_fallback_fonts(&cc.egui_ctx);
@@ -36,7 +37,8 @@ impl PtouchApp {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (resp_tx, resp_rx) = mpsc::channel();
 
-        if !smoke_test {
+        let enable_printer = !smoke_test && !offline;
+        if enable_printer {
             let ctx = cc.egui_ctx.clone();
             std::thread::Builder::new()
                 .name("printer-worker".to_string())
@@ -48,8 +50,10 @@ impl PtouchApp {
 
         let mut app = Self {
             state: AppState {
+                offline,
                 available_fonts: ptouch_render::font::list_fonts(),
-                printer_cmd_tx: (!smoke_test).then_some(cmd_tx),
+                printer_cmd_tx: enable_printer.then_some(cmd_tx),
+                printer_status: (!enable_printer).then(|| "Offline mode".to_string()),
                 ..AppState::default()
             },
             renderer: TextRenderer::new(),
@@ -64,9 +68,11 @@ impl PtouchApp {
             app.state.printer_target = crate::state::PrinterTarget::Profile(profile);
             app.state.apply_target_preferences();
         }
-        if !smoke_test {
+        if enable_printer {
             app.state.select_target(app.state.printer_target.clone());
-        } else {
+        } else if smoke_test {
+            app.state.document_version = 1;
+            app.state.preview_uses_printer = true;
             // Exercise resolution-aware rendering and tiled texture uploads
             // in the real window renderer, without starting printer I/O.
             app.state.printer_quality = Some(ptouch_core::quality::QualityProfile::for_model(
@@ -75,6 +81,7 @@ impl PtouchApp {
             app.state
                 .set_print_quality(ptouch_core::PrintQuality::HighRes);
             app.state.elements.push(crate::state::LabelElement::Text {
+                text_box: None,
                 content: "Preview Wi-Fi W ".repeat(300),
                 font_size: Some(24.0),
                 align: ptouch_render::text::TextAlign::Left,
@@ -98,46 +105,48 @@ impl PtouchApp {
     pub fn update_preview(&mut self, ctx: &egui::Context) {
         self.state.needs_rerender = false;
 
-        if self.state.elements.is_empty() {
-            self.state.preview = None;
-            ctx.request_repaint();
-            return;
-        }
-
+        self.state.preview = None;
+        self.state.preview_bounds.clear();
+        self.state.preview_content_bounds.clear();
+        self.state.preview_diagnostics.clear();
         let result = self
             .state
             .preview_resolution()
             .map_err(|e| e.to_string())
             .and_then(|resolution| {
-                ptouch_render::document::render_elements_with_layout_at_resolution(
-                    &self.state.elements,
+                ptouch_render::document::render_document_at_resolution(
+                    &self.state.document(),
                     self.state.tape_width_px,
-                    &self.state.font_name,
-                    self.state.font_margin,
-                    &mut self.renderer,
                     resolution,
+                    &mut self.renderer,
                 )
-                .map(|rendered| rendered.map(|rendered| (rendered, resolution)))
+                .map(|rendered| (rendered, resolution))
                 .map_err(|e| e.to_string())
             });
-
-        self.state.preview = match result {
-            Ok(result) => result
-                .filter(|(rendered, _)| rendered.bitmap.width() > 0 && rendered.bitmap.height() > 0)
-                .map(|(rendered, resolution)| {
-                    // Apply whole-label mirroring once, after composition.
-                    crate::preview::RenderedPreview::from_rendered(
-                        ctx,
-                        rendered.mirrored(self.state.overall_flip_h, self.state.overall_flip_v),
-                        resolution,
-                    )
-                }),
+        match result {
+            Ok((rendered, resolution)) => {
+                self.state.preview_bounds = rendered.bounds;
+                self.state.preview_content_bounds = rendered.content_bounds;
+                self.state.preview_diagnostics = rendered.diagnostics;
+                if self.state.status_message.starts_with("Render error:") {
+                    self.state.status_message = "Preview updated".into();
+                }
+                if let Some(bitmap) = rendered.bitmap.filter(|b| b.width() > 0 && b.height() > 0) {
+                    let mut preview = crate::preview::RenderedPreview::new(ctx, bitmap, resolution);
+                    preview.element_spans = vec![None; self.state.elements.len()];
+                    for bound in &self.state.preview_bounds {
+                        preview.element_spans[bound.element_index] =
+                            Some(bound.x..bound.x + bound.width);
+                    }
+                    self.state.preview = Some(preview);
+                }
+            }
             Err(error) => {
                 error!("Render failed: {error}");
                 self.state.status_message = format!("Render error: {error}");
-                None
+                self.state.preview_diagnostics.push(error);
             }
-        };
+        }
         ctx.request_repaint();
         info!("Preview updated");
     }
@@ -180,6 +189,7 @@ impl PtouchApp {
                         self.state.media_code,
                     ) != (band_left, media_width, dpi, media_code);
                     self.state.printer_connected = true;
+                    self.state.preview_uses_printer = true;
                     self.state.connecting = false;
                     self.state.printer_max_px = max_px;
                     self.state.printer_dpi = dpi;
@@ -270,12 +280,20 @@ impl eframe::App for PtouchApp {
                 panels::sidebar::show_sidebar(ui, &mut self.state);
             });
 
+        // Reordering or opening a file invalidates geometry by element index.
+        // Properties must freeze the current object's geometry on first edit.
+        if self.state.needs_rerender {
+            self.update_preview(&ctx);
+        }
+
         // Right properties panel
         egui::Panel::right("properties")
             .default_size(250.0)
             .resizable(true)
             .show(ui, |ui| {
-                panels::properties::show_properties(ui, &mut self.state);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    panels::properties::show_properties(ui, &mut self.state);
+                });
             });
 
         if self.state.needs_rerender {
@@ -318,7 +336,22 @@ impl eframe::App for PtouchApp {
                 );
                 self.state.view.select(crate::preview::ZoomMode::Pixels);
             }
-            if *frames >= 3 {
+            if *frames == 3 {
+                // Exercise the free-layout canvas and native SVG rendering too.
+                self.state.elements.clear();
+                self.state.document_version = ptouch_render::document::DOCUMENT_VERSION;
+                self.state.add_text();
+                let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><path d="M1 3L7 1" stroke="black"/></svg>"#;
+                self.state.add_image_bytes(None, svg.to_vec());
+                self.state.view.select(crate::preview::ZoomMode::Fit);
+            } else if *frames == 4 {
+                self.state
+                    .select_canvas_target(Some(crate::state::CanvasTarget {
+                        element: 0,
+                        edit: crate::state::CanvasEditTarget::Slot,
+                    }));
+            }
+            if *frames >= 5 {
                 println!("PTOUCH_GUI_SMOKE_OK");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.smoke_frames = None;
@@ -401,6 +434,7 @@ mod tests {
             flip_v: true,
             elements: vec![
                 LabelElement::Text {
+                    text_box: None,
                     content: "Wi-Fi W\nshort".into(),
                     font_size: Some(24.0),
                     align: ptouch_render::text::TextAlign::Center,
@@ -443,7 +477,8 @@ mod tests {
                 crate::panels::toolbar::apply_layout(
                     &mut app.state,
                     LabelDocument::from_toml_str(&saved).unwrap(),
-                );
+                )
+                .unwrap();
                 assert_eq!(app.state.print_quality, ptouch_core::PrintQuality::HighRes);
                 assert!(app.state.needs_rerender);
                 let mut standard_width = 0;
@@ -551,6 +586,7 @@ mod tests {
         use ptouch_core::{PrintQuality, quality::QualityProfile};
         let (mut app, _) = app(AppState {
             elements: source_document(0.0).elements,
+            printer_connected: true,
             ..Default::default()
         });
         let ctx = egui::Context::default();
@@ -732,5 +768,175 @@ mod tests {
             app.state.printer_status.as_deref(),
             Some("USB open: Access denied")
         );
+    }
+
+    #[test]
+    fn changing_target_dpi_rerenders_even_when_printable_pixels_match() {
+        let (mut app, tx) = app(AppState {
+            design_dpi: 360,
+            tape_width_px: 128,
+            needs_rerender: false,
+            ..AppState::default()
+        });
+        tx.send(usb_status()).unwrap();
+        app.drain_printer_responses();
+        assert_eq!(app.state.target_dpi(), 180);
+        assert_eq!(app.state.design_dpi, 360);
+        assert!(app.state.needs_rerender);
+        app.state.needs_rerender = false;
+        tx.send(PrinterEvent {
+            target: Some(app.state.selection()),
+            response: PrinterResponse::ConnectionError("Disconnected".into()),
+        })
+        .unwrap();
+        app.drain_printer_responses();
+        assert_eq!(app.state.target_dpi(), 180);
+        assert!(!app.state.needs_rerender);
+        assert!(app.state.preview_uses_printer);
+    }
+
+    #[test]
+    fn preview_matches_shared_render_and_preserves_original_bitmap_after_downsampling() {
+        use ptouch_render::document::{LabelElement, TextBox, render_document};
+        use ptouch_render::text::TextAlign;
+        let (mut app, _tx) = app(AppState {
+            overall_flip_h: true,
+            elements: vec![LabelElement::Text {
+                content: "Port 1".into(),
+                font_size: None,
+                align: TextAlign::Center,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+                text_box: Some(TextBox {
+                    x_mm: 5.0,
+                    width_mm: 300.0,
+                    height_mm: 8.0,
+                    ..TextBox::default()
+                }),
+            }],
+            ..AppState::default()
+        });
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            max_texture_side: Some(1024),
+            ..Default::default()
+        });
+        app.update_preview(&ctx);
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        let expected = render_document(
+            &app.state.document(),
+            app.state.tape_width_px,
+            app.state.target_dpi(),
+            &mut TextRenderer::new(),
+        )
+        .unwrap();
+        let bitmap = &app.state.preview.as_ref().unwrap().bitmap;
+        assert_eq!(
+            bitmap.to_rgba_image(),
+            expected.bitmap.unwrap().to_rgba_image()
+        );
+        assert!(bitmap.width() > 1024);
+        assert!(app.state.preview.as_ref().unwrap().tiles.len() > 1);
+        assert!(
+            app.state
+                .preview
+                .as_ref()
+                .unwrap()
+                .tiles
+                .iter()
+                .all(|tile| tile.texture.size()[0] <= 1024)
+        );
+        let bound = &app.state.preview_bounds[0];
+        assert_eq!(
+            (bound.x, bound.width),
+            (expected.bounds[0].x, expected.bounds[0].width)
+        );
+        assert!(bound.width > 1024);
+    }
+
+    #[test]
+    fn reordered_auto_fit_object_uses_fresh_geometry_before_first_keyboard_edit() {
+        use eframe::App;
+        use ptouch_render::document::{LabelElement, LabelObject, TextBox};
+
+        let first_slot = TextBox {
+            x_mm: 5.0,
+            y_mm: 1.0,
+            width_mm: 6.0,
+            height_mm: 4.0,
+            ..TextBox::default()
+        };
+        let (mut app, _tx) = app(AppState {
+            document_version: 3,
+            selected_element: Some(0),
+            elements: vec![
+                LabelElement::Object(LabelObject::text("A", first_slot.clone())),
+                LabelElement::Object(LabelObject::text(
+                    "BBBBBBBBBBBB",
+                    TextBox {
+                        x_mm: 20.0,
+                        width_mm: 18.0,
+                        ..first_slot.clone()
+                    },
+                )),
+            ],
+            ..AppState::default()
+        });
+        let context = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run_frame = |app: &mut PtouchApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut frame),
+            );
+            output.textures_delta.clear();
+        };
+        run_frame(&mut app, vec![]);
+        let expected = app.state.resolved_content_box(0).unwrap();
+        let stale_index_geometry = app.state.resolved_content_box(1).unwrap();
+        assert!((expected.width_mm - stale_index_geometry.width_mm).abs() > 1.0);
+        assert_eq!(app.state.document_version, 3);
+
+        // This is the model mutation made by a sidebar reorder. The cached
+        // preview still describes the previous order when this UI frame begins.
+        app.state.elements.swap(0, 1);
+        app.state.selected_element = Some(1);
+        app.state.mark_dirty();
+        run_frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let edited = app.state.elements[1].as_object().unwrap();
+        let pinned = edited.content_box.as_ref().unwrap();
+        assert_eq!(
+            (pinned.width_mm, pinned.height_mm),
+            (expected.width_mm, expected.height_mm)
+        );
+        assert!((pinned.offset_x_mm - expected.offset_x_mm - 0.1).abs() < 1e-6);
+        assert_eq!(pinned.offset_y_mm, expected.offset_y_mm);
+        assert_eq!(edited.frame, first_slot);
+        assert!(
+            app.state.elements[0]
+                .as_object()
+                .unwrap()
+                .content_box
+                .is_none()
+        );
+        assert_eq!(app.state.document_version, 4);
     }
 }

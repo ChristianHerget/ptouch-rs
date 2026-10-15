@@ -2,6 +2,7 @@
 //! Content-only history. Image source bytes are shared; render caches stay out.
 
 use crate::state::{AppState, LabelElement};
+use ptouch_render::document::{ContentBox, LabelObject, ObjectContent, TextBox};
 use ptouch_render::text::TextAlign;
 use std::{
     collections::VecDeque,
@@ -11,7 +12,16 @@ use std::{
 
 #[derive(Clone, PartialEq)]
 enum ElementContent {
+    Object {
+        frame: TextBox,
+        content_box: Option<ContentBox>,
+        rotation: f32,
+        flip_h: bool,
+        flip_v: bool,
+        content: Box<ElementContent>,
+    },
     Text {
+        text_box: Option<TextBox>,
         content: String,
         font_size: Option<f32>,
         align: TextAlign,
@@ -34,7 +44,50 @@ enum ElementContent {
 impl ElementContent {
     fn restore(&self) -> LabelElement {
         match self {
+            Self::Object {
+                frame,
+                content_box,
+                rotation,
+                flip_h,
+                flip_v,
+                content,
+            } => {
+                let content = match content.restore() {
+                    LabelElement::Text {
+                        content,
+                        font_size,
+                        align,
+                        ..
+                    } => ObjectContent::Text {
+                        content,
+                        font_size,
+                        align,
+                    },
+                    LabelElement::Image {
+                        path,
+                        image_data,
+                        bitmap,
+                        ..
+                    } => ObjectContent::Image {
+                        path,
+                        image_data,
+                        bitmap,
+                    },
+                    LabelElement::CutMark => ObjectContent::CutMark,
+                    LabelElement::Padding { .. } => ObjectContent::Padding,
+                    LabelElement::Object(_) => unreachable!("object content is never nested"),
+                };
+                LabelElement::Object(LabelObject {
+                    frame: frame.clone(),
+                    content_box: content_box.clone(),
+                    rotation: *rotation,
+                    flip_h: *flip_h,
+                    flip_v: *flip_v,
+                    content,
+                })
+            }
             Self::Text {
+                text_box,
                 content,
                 font_size,
                 align,
@@ -42,6 +95,7 @@ impl ElementContent {
                 flip_h,
                 flip_v,
             } => LabelElement::Text {
+                text_box: text_box.clone(),
                 content: content.clone(),
                 font_size: *font_size,
                 align: *align,
@@ -83,10 +137,12 @@ impl ElementContent {
 pub(crate) struct ContentSelection {
     pub element: Option<usize>,
     pub cursor: Option<(egui::Id, egui::text::CCursorRange)>,
+    pub target: crate::state::CanvasEditTarget,
 }
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct ContentSnapshot {
+    document: (u32, u16),
     elements: Vec<ElementContent>,
     font_name: String,
     font_margin: u32,
@@ -97,7 +153,8 @@ pub(crate) struct ContentSnapshot {
 
 impl ContentSnapshot {
     fn same_content(&self, other: &Self) -> bool {
-        self.elements == other.elements
+        self.document == other.document
+            && self.elements == other.elements
             && self.font_name == other.font_name
             && self.font_margin == other.font_margin
             && self.flip_h == other.flip_h
@@ -105,12 +162,20 @@ impl ContentSnapshot {
     }
 
     pub fn restore(&self, state: &mut AppState) {
+        let old_dpi = state.design_dpi;
+        (state.document_version, state.design_dpi) = self.document;
+        if old_dpi != state.design_dpi && !state.printer_connected && !state.preview_uses_printer {
+            state.update_tape_pixels();
+        }
         state.elements = self.elements.iter().map(ElementContent::restore).collect();
         state.font_name.clone_from(&self.font_name);
         state.font_margin = self.font_margin;
         state.overall_flip_h = self.flip_h;
         state.overall_flip_v = self.flip_v;
         state.select_element(self.selection.element);
+        state.canvas_edit_target = self.selection.target;
+        state.canvas_drag_target = None;
+        state.canvas_hover_target = None;
         state.editor.text_cursor = self.selection.cursor;
         state.mark_dirty();
     }
@@ -154,80 +219,135 @@ impl ContentHistory {
         source
     }
 
+    fn image_bytes(
+        &mut self,
+        bytes: &[u8],
+        bitmap: Option<&ptouch_render::bitmap::LabelBitmap>,
+    ) -> Arc<[u8]> {
+        // Preserve bitmap-only callers without retaining decoded caches in history.
+        if bytes.is_empty()
+            && let Some(bitmap) = bitmap
+        {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(bitmap.to_rgba_image())
+                .write_to(&mut png, image::ImageFormat::Png)
+                .expect("encoding a bitmap into memory");
+            self.intern(png.get_ref())
+        } else {
+            self.intern(bytes)
+        }
+    }
+
+    fn capture_element(&mut self, element: &LabelElement) -> ElementContent {
+        match element {
+            LabelElement::Object(object) => {
+                let content = match &object.content {
+                    ObjectContent::Text {
+                        content,
+                        font_size,
+                        align,
+                    } => ElementContent::Text {
+                        content: content.clone(),
+                        font_size: *font_size,
+                        align: *align,
+                        text_box: None,
+                        rotation: 0.0,
+                        flip_h: false,
+                        flip_v: false,
+                    },
+                    ObjectContent::Image {
+                        path,
+                        image_data,
+                        bitmap,
+                    } => ElementContent::Image {
+                        path: path.clone(),
+                        bytes: self.image_bytes(image_data, bitmap.as_ref()),
+                        rotation: 0.0,
+                        target_height: None,
+                        flip_h: false,
+                        flip_v: false,
+                    },
+                    ObjectContent::CutMark => ElementContent::CutMark,
+                    ObjectContent::Padding => ElementContent::Padding(0),
+                };
+                ElementContent::Object {
+                    frame: object.frame.clone(),
+                    content_box: object.content_box.clone(),
+                    rotation: object.rotation,
+                    flip_h: object.flip_h,
+                    flip_v: object.flip_v,
+                    content: Box::new(content),
+                }
+            }
+            LabelElement::Text {
+                text_box,
+                content,
+                font_size,
+                align,
+                rotation,
+                flip_h,
+                flip_v,
+            } => ElementContent::Text {
+                text_box: text_box.clone(),
+                content: content.clone(),
+                font_size: *font_size,
+                align: *align,
+                rotation: *rotation,
+                flip_h: *flip_h,
+                flip_v: *flip_v,
+            },
+            LabelElement::Image {
+                path,
+                image_data,
+                bitmap,
+                rotation,
+                target_height,
+                flip_h,
+                flip_v,
+            } => ElementContent::Image {
+                path: path.clone(),
+                bytes: self.image_bytes(image_data, bitmap.as_ref()),
+                rotation: *rotation,
+                target_height: *target_height,
+                flip_h: *flip_h,
+                flip_v: *flip_v,
+            },
+            LabelElement::CutMark => ElementContent::CutMark,
+            LabelElement::Padding { pixels } => ElementContent::Padding(*pixels),
+        }
+    }
+
     pub fn capture(
         &mut self,
         elements: &[LabelElement],
         font_name: &str,
         font_margin: u32,
-        flip_h: bool,
-        flip_v: bool,
+        mirrors: (bool, bool),
         selection: ContentSelection,
+        document: (u32, u16),
     ) -> ContentSnapshot {
         let elements: Vec<_> = elements
             .iter()
-            .map(|element| match element {
-                LabelElement::Text {
-                    content,
-                    font_size,
-                    align,
-                    rotation,
-                    flip_h,
-                    flip_v,
-                } => ElementContent::Text {
-                    content: content.clone(),
-                    font_size: *font_size,
-                    align: *align,
-                    rotation: *rotation,
-                    flip_h: *flip_h,
-                    flip_v: *flip_v,
-                },
-                LabelElement::Image {
-                    path,
-                    image_data,
-                    bitmap,
-                    rotation,
-                    target_height,
-                    flip_h,
-                    flip_v,
-                } => {
-                    // In-memory callers can supply only a bitmap. Preserve that source
-                    // losslessly without retaining the decoded cache in history.
-                    let mut png = std::io::Cursor::new(Vec::new());
-                    let bytes = if image_data.is_empty()
-                        && let Some(bitmap) = bitmap
-                    {
-                        let _ = image::DynamicImage::ImageRgba8(bitmap.to_rgba_image())
-                            .write_to(&mut png, image::ImageFormat::Png);
-                        png.get_ref().as_slice()
-                    } else {
-                        image_data.as_slice()
-                    };
-                    ElementContent::Image {
-                        path: path.clone(),
-                        bytes: self.intern(bytes),
-                        rotation: *rotation,
-                        target_height: *target_height,
-                        flip_h: *flip_h,
-                        flip_v: *flip_v,
-                    }
-                }
-                LabelElement::CutMark => ElementContent::CutMark,
-                LabelElement::Padding { pixels } => ElementContent::Padding(*pixels),
-            })
+            .map(|element| self.capture_element(element))
             .collect();
         self.current_sources = elements
             .iter()
             .filter_map(|element| match element {
                 ElementContent::Image { bytes, .. } => Some(bytes.clone()),
+                ElementContent::Object { content, .. } => match content.as_ref() {
+                    ElementContent::Image { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
         ContentSnapshot {
+            document,
             elements,
             font_name: font_name.into(),
             font_margin,
-            flip_h,
-            flip_v,
+            flip_h: mirrors.0,
+            flip_v: mirrors.1,
             selection,
         }
     }
@@ -346,6 +466,7 @@ mod tests {
 
     fn text(content: &str) -> LabelElement {
         LabelElement::Text {
+            text_box: None,
             content: content.into(),
             font_size: Some(24.0),
             align: TextAlign::Left,
@@ -552,7 +673,7 @@ mod tests {
             flip_v: false,
             elements: vec![text("New")],
         };
-        crate::panels::toolbar::apply_layout(&mut state, document);
+        crate::panels::toolbar::apply_layout(&mut state, document).unwrap();
         assert!(state.editor.history.undo_name().is_none());
         assert!(state.editor.history.redo_name().is_none());
     }
@@ -567,5 +688,44 @@ mod tests {
             state.record_content(before, "Margin", Some(EditGroup::Typing(field)), time);
         }
         assert!(state.editor.history.undo_name().is_none());
+    }
+    #[test]
+    fn conversion_geometry_design_dpi_and_target_are_restored_together() {
+        use crate::state::{CanvasEditTarget, CanvasTarget};
+        let mut state = AppState {
+            document_version: 1,
+            elements: vec![text("Old")],
+            selected_element: Some(0),
+            ..Default::default()
+        };
+        let original = state.document().to_toml_string().unwrap();
+        state.convert_to_free_layout().unwrap();
+        let converted = state.document().to_toml_string().unwrap();
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
+        let before = state.content_snapshot();
+        state.pin_content_box(0);
+        let object = state.elements[0].as_object_mut().unwrap();
+        object.rotation = 37.0;
+        object.frame.x_mm = 5.75;
+        object.content_box.as_mut().unwrap().offset_x_mm = -2.25;
+        state.design_dpi = 360;
+        state.record_content(before, "Edit object", None, 1.0);
+        let edited = state.document().to_toml_string().unwrap();
+        state.apply_editor_action(EditorAction::Undo);
+        assert_eq!(state.document().to_toml_string().unwrap(), converted);
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+        assert_eq!(state.design_dpi, 180);
+        assert_eq!(state.tape_width_px, 76);
+        state.apply_editor_action(EditorAction::Undo);
+        assert_eq!(state.document().to_toml_string().unwrap(), original);
+        state.apply_editor_action(EditorAction::Redo);
+        state.apply_editor_action(EditorAction::Redo);
+        assert_eq!(state.document().to_toml_string().unwrap(), edited);
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+        assert_eq!(state.design_dpi, 360);
+        assert_eq!(state.tape_width_px, 150);
     }
 }

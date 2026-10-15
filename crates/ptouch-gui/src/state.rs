@@ -7,8 +7,28 @@ use std::sync::mpsc;
 
 use crate::preview::RenderedPreview;
 use ptouch_core::protocol::PrintQuality;
+use ptouch_render::document::{
+    ContentBox, ContentGeometry, DOCUMENT_VERSION, ElementBounds, LabelDocument, LabelObject,
+    ObjectContent, PositionMode, TextBox,
+};
+use ptouch_render::text::{TextAlign, TextRenderer};
 
 pub use ptouch_render::document::LabelElement;
+
+/// Select the visible object or the fixed template slot for canvas editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CanvasEditTarget {
+    #[default]
+    Content,
+    Slot,
+}
+
+/// A specific object or template slot addressed by the canvas and element list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasTarget {
+    pub element: usize,
+    pub edit: CanvasEditTarget,
+}
 
 /// Printer connection selected in the GUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,12 +175,16 @@ pub enum PrinterResponse {
 
 /// Central application state shared across all panels.
 pub struct AppState {
+    /// Editing-only startup: no worker or printer connection attempts.
+    pub offline: bool,
     pub editor: crate::editor::Editor,
     pub profiles: crate::profile_ui::ProfilesUi,
     pub printer_model_id: String,
     pub media_code: u8,
     pub job_timeout_secs: u32,
     pub band_left: Option<u16>,
+    /// Preserve an opened legacy format until the user explicitly converts it.
+    pub document_version: u32,
     /// List of label elements in composition order.
     pub elements: Vec<LabelElement>,
     /// Index of the currently selected element, if any.
@@ -169,6 +193,10 @@ pub struct AppState {
     pub tape_width_mm: u8,
     /// Current tape width in pixels (derived from tape_width_mm).
     pub tape_width_px: u32,
+    /// Saved design resolution, used when working offline.
+    pub design_dpi: u16,
+    /// Keep the last printer geometry through a transient disconnect.
+    pub preview_uses_printer: bool,
     /// Font name used for text rendering.
     pub font_name: String,
     /// Font top/bottom margin in pixels.
@@ -181,9 +209,19 @@ pub struct AppState {
     pub available_fonts: Vec<String>,
     /// Print pixels, their resolution, and display textures from one render.
     pub preview: Option<RenderedPreview>,
+    /// Bounds in original print pixels, independent of preview downsampling.
+    pub preview_bounds: Vec<ElementBounds>,
+    /// Oriented object geometry in original print pixels, after all mirrors.
+    pub preview_content_bounds: Vec<ContentGeometry>,
+    pub canvas_edit_target: CanvasEditTarget,
+    pub canvas_hover_target: Option<CanvasTarget>,
+    pub canvas_drag_target: Option<CanvasTarget>,
+    pub preview_diagnostics: Vec<String>,
     /// Flag indicating the preview needs to be re-rendered.
     pub needs_rerender: bool,
     pub view: crate::preview::PreviewView,
+    /// Head-pixel display scale of the latest free-layout canvas.
+    pub canvas_scale: f32,
     /// Invalidates drag payloads and cached element coordinates after edits.
     pub document_revision: u64,
     /// Printer connection status message.
@@ -229,24 +267,35 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            offline: false,
             editor: crate::editor::Editor::default(),
             profiles: crate::profile_ui::ProfilesUi::default(),
             printer_model_id: String::new(),
             media_code: 0,
             job_timeout_secs: 600,
             band_left: None,
+            document_version: DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
             tape_width_mm: 12,
             tape_width_px: 76,
+            design_dpi: 180,
+            preview_uses_printer: false,
             font_name: "DejaVuSans".to_string(),
             font_margin: 0,
             overall_flip_h: false,
             overall_flip_v: false,
             available_fonts: Vec::new(),
             preview: None,
+            preview_bounds: Vec::new(),
+            preview_content_bounds: Vec::new(),
+            canvas_edit_target: CanvasEditTarget::default(),
+            canvas_hover_target: None,
+            canvas_drag_target: None,
+            preview_diagnostics: Vec::new(),
             needs_rerender: true,
             view: crate::preview::PreviewView::default(),
+            canvas_scale: 1.0,
             document_revision: 0,
             printer_status: None,
             printer_model: None,
@@ -289,9 +338,11 @@ impl AppState {
         self.printer_model_id.clear();
         self.printer_quality = None;
         self.band_left = None;
-        self.connecting = !matches!(self.printer_target, PrinterTarget::Unavailable(_));
+        self.connecting =
+            !self.offline && !matches!(self.printer_target, PrinterTarget::Unavailable(_));
         self.printer_status = Some(match &self.printer_target {
             PrinterTarget::Unavailable(reason) => reason.clone(),
+            _ if self.offline => "Offline mode".into(),
             _ => "Connecting…".into(),
         });
         self.mark_dirty();
@@ -312,6 +363,334 @@ impl AppState {
             };
         }
     }
+    pub fn selected_canvas_target(&self) -> Option<CanvasTarget> {
+        self.selected_element
+            .filter(|index| *index < self.elements.len())
+            .map(|element| CanvasTarget {
+                element,
+                edit: self.canvas_edit_target,
+            })
+    }
+
+    /// Selecting a target is UI state only: never detach auto-fit content,
+    /// upgrade the file format, or request a different rendered bitmap.
+    pub fn select_canvas_target(&mut self, target: Option<CanvasTarget>) {
+        let target = target.filter(|target| target.element < self.elements.len());
+        self.select_element(target.map(|target| target.element));
+        if let Some(target) = target {
+            self.canvas_edit_target = target.edit;
+        }
+    }
+
+    /// Only the consecutive relative slots depend on this slot's right edge.
+    /// An absolute slot or an unboxed legacy element ends this chain.
+    pub fn slot_followers(&self, index: usize) -> Vec<usize> {
+        if index >= self.elements.len() {
+            return Vec::new();
+        }
+        self.elements
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .take_while(|(_, element)| {
+                slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Show the direct predecessor of a relative slot and its dependent chain,
+    /// excluding the target itself. Absolute predecessors remain anchors.
+    pub fn slot_related(&self, index: usize) -> Vec<usize> {
+        let Some(element) = self.elements.get(index) else {
+            return Vec::new();
+        };
+        let mut related = Vec::new();
+        if index > 0
+            && slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
+        {
+            related.push(index - 1);
+        }
+        related.extend(self.slot_followers(index));
+        related
+    }
+
+    /// An interaction hint independent of save/error/printer status messages.
+    pub fn canvas_hint(&self) -> Option<String> {
+        let valid = |target: &CanvasTarget| target.element < self.elements.len();
+        let (phase, target) = if let Some(target) = self.canvas_drag_target.filter(valid) {
+            ("Dragging", target)
+        } else if let Some(target) = self.canvas_hover_target.filter(valid) {
+            ("Candidate", target)
+        } else {
+            ("Selected", self.selected_canvas_target()?)
+        };
+        let name = match target.edit {
+            CanvasEditTarget::Content => "Object",
+            CanvasEditTarget::Slot => "Slot",
+        };
+        let consequence = match target.edit {
+            CanvasEditTarget::Content => "Spacing unchanged.".to_string(),
+            CanvasEditTarget::Slot => {
+                let count = self.slot_followers(target.element).len();
+                format!(
+                    "Horizontal move affects {count} following {}.",
+                    if count == 1 { "object" } else { "objects" }
+                )
+            }
+        };
+        let action = if !self.is_free_layout() {
+            " Legacy layout: drag to reorder; convert to free layout to position objects."
+        } else if self.overall_flip_h {
+            " Turn off label horizontal mirroring to drag."
+        } else if phase == "Candidate" {
+            " Click to select."
+        } else if phase == "Selected" && target.edit == CanvasEditTarget::Slot {
+            " Drag border to move."
+        } else {
+            ""
+        };
+        Some(format!(
+            "{phase} {name} {}: {consequence}{action}",
+            target.element + 1
+        ))
+    }
+
+    pub fn target_dpi(&self) -> u16 {
+        if self.printer_connected || self.preview_uses_printer {
+            self.printer_dpi
+        } else {
+            self.design_dpi
+        }
+    }
+
+    pub fn document(&self) -> LabelDocument {
+        // A canvas edit can introduce new fields before the stored version is
+        // updated. Render and save must both see the minimum required version.
+        let version = self
+            .elements
+            .iter()
+            .fold(self.document_version, |version, element| {
+                version.max(match element {
+                    LabelElement::Object(object) if object.content_box.is_some() => 4,
+                    LabelElement::Object(_) => 3,
+                    LabelElement::Text {
+                        text_box: Some(_), ..
+                    } => 2,
+                    _ => 1,
+                })
+            });
+        LabelDocument {
+            version,
+            tape_width_mm: self.tape_width_mm,
+            dpi: self.design_dpi,
+            font_name: self.font_name.clone(),
+            font_margin: self.font_margin,
+            flip_h: self.overall_flip_h,
+            flip_v: self.overall_flip_v,
+            elements: self.elements.clone(),
+        }
+    }
+
+    pub fn is_free_layout(&self) -> bool {
+        self.document_version >= 3
+            && self
+                .elements
+                .iter()
+                .all(|element| element.as_object().is_some())
+    }
+
+    /// Resolve the unrotated physical object box without changing old files.
+    /// Auto-fit objects use the renderer's current geometry on their first edit.
+    pub fn resolved_content_box(&self, index: usize) -> Option<ContentBox> {
+        let object = self.elements.get(index)?.as_object()?;
+        object
+            .content_box
+            .clone()
+            .or_else(|| {
+                self.preview_content_bounds
+                    .iter()
+                    .find(|geometry| geometry.element_index == index)
+                    .map(|geometry| geometry.edit_box.clone())
+            })
+            .or_else(|| Some(content_box_for_frame(&object.frame)))
+    }
+
+    /// Explicitly detach object sizing from its slot on the first transform.
+    /// Opening, viewing, and converting a legacy file never call this method.
+    pub fn pin_content_box(&mut self, index: usize) -> Option<ContentBox> {
+        let resolved = self.resolved_content_box(index)?;
+        let object = self.elements.get_mut(index)?.as_object_mut()?;
+        let changed = object.content_box.is_none();
+        object.content_box = Some(resolved.clone());
+        self.document_version = self.document_version.max(4);
+        if changed {
+            self.mark_dirty();
+        }
+        Some(resolved)
+    }
+
+    /// Resolve a model rectangle before whole-label mirroring. Millimeter
+    /// frames do not depend on the previous preview or raster rounding.
+    pub fn element_rect_mm(&self, index: usize) -> Option<(f64, f64, f64, f64)> {
+        let mut cursor = 0.0;
+        for (i, element) in self.elements.iter().enumerate().take(index + 1) {
+            let frame = slot_frame(element);
+            let rect = if let Some(frame) = frame {
+                let x = match frame.position {
+                    PositionMode::Absolute => frame.x_mm,
+                    PositionMode::Relative => cursor + frame.gap_mm,
+                };
+                Some((x, frame.y_mm, frame.width_mm, frame.height_mm))
+            } else {
+                self.preview_bounds
+                    .iter()
+                    .find(|bound| bound.element_index == i)
+                    .map(|bound| {
+                        let x = if self.overall_flip_h {
+                            self.preview.as_ref().map_or(bound.x, |preview| {
+                                preview.bitmap.width().saturating_sub(bound.x + bound.width)
+                            })
+                        } else {
+                            bound.x
+                        };
+                        let y = if self.overall_flip_v {
+                            self.tape_width_px.saturating_sub(bound.y + bound.height)
+                        } else {
+                            bound.y
+                        };
+                        let resolution = self
+                            .preview_resolution()
+                            .unwrap_or(ptouch_core::PrintResolution::square(self.target_dpi()));
+                        let mm = 25.4 / f64::from(resolution.head_dpi);
+                        let feed_mm = 25.4 / f64::from(resolution.feed_dpi);
+                        (
+                            f64::from(x) * feed_mm,
+                            f64::from(y) * mm,
+                            f64::from(bound.width) * feed_mm,
+                            f64::from(bound.height) * mm,
+                        )
+                    })
+            };
+            if let Some((x, _, width, _)) = rect {
+                cursor = x + width;
+            }
+            if i == index {
+                return rect;
+            }
+        }
+        None
+    }
+
+    pub fn printable_height_mm(&self) -> f64 {
+        f64::from(self.tape_width_px) * 25.4 / f64::from(self.target_dpi())
+    }
+
+    /// New objects are independent absolute frames, placed after the furthest
+    /// existing right edge with a 3 mm gap. This also works before a rerender.
+    pub fn default_object_frame(&self, width_mm: f64, height_mm: f64) -> TextBox {
+        let right = (0..self.elements.len())
+            .filter_map(|index| self.element_rect_mm(index))
+            .map(|(x, _, width, _)| x + width)
+            .reduce(f64::max);
+        TextBox {
+            width_mm,
+            height_mm: height_mm.min(self.printable_height_mm()),
+            x_mm: right.map_or(0.0, |right| right + 3.0),
+            ..TextBox::default()
+        }
+    }
+
+    fn add_element(&mut self, element: LabelElement) {
+        self.apply_editor_action(crate::editor::EditorAction::Add(element));
+        self.canvas_edit_target = CanvasEditTarget::Content;
+    }
+
+    pub fn add_text(&mut self) {
+        let element = if self.is_free_layout() {
+            let mut object =
+                LabelObject::text("Label".to_string(), self.default_object_frame(10.0, 8.0));
+            object.content_box = Some(content_box_for_frame(&object.frame));
+            LabelElement::Object(object)
+        } else {
+            LabelElement::Text {
+                content: "Label".to_string(),
+                font_size: None,
+                align: TextAlign::Left,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+                text_box: None,
+            }
+        };
+        self.add_element(element);
+    }
+
+    pub fn add_image_bytes(&mut self, path: Option<std::path::PathBuf>, bytes: Vec<u8>) -> bool {
+        let element = if self.is_free_layout() {
+            let mut object = LabelObject::image_from_bytes(
+                path,
+                bytes,
+                self.default_object_frame(10.0, self.printable_height_mm()),
+            );
+            let ObjectContent::Image {
+                bitmap: Some(bitmap),
+                ..
+            } = &object.content
+            else {
+                return false;
+            };
+            // Fit the original aspect ratio inside a useful initial footprint.
+            let aspect = f64::from(bitmap.width()) / f64::from(bitmap.height().max(1));
+            let height = self.printable_height_mm().min(40.0 / aspect);
+            object.frame.width_mm = (height * aspect).max(25.4 / f64::from(self.target_dpi()));
+            object.frame.height_mm = height.max(25.4 / f64::from(self.target_dpi()));
+            object.content_box = Some(content_box_for_frame(&object.frame));
+            LabelElement::Object(object)
+        } else {
+            let element = LabelElement::image_from_bytes(path, bytes);
+            if matches!(element, LabelElement::Image { bitmap: None, .. }) {
+                return false;
+            }
+            element
+        };
+        self.add_element(element);
+        true
+    }
+
+    pub fn add_cut_mark(&mut self) {
+        let element = if self.is_free_layout() {
+            let frame = self.default_object_frame(1.27, self.printable_height_mm());
+            LabelElement::Object(LabelObject {
+                content_box: Some(content_box_for_frame(&frame)),
+                frame,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+                content: ObjectContent::CutMark,
+            })
+        } else {
+            LabelElement::CutMark
+        };
+        self.add_element(element);
+    }
+
+    /// Conversion is explicit: opening or saving an older label never changes
+    /// its flow layout. The shared renderer resolves positions for all callers.
+    pub fn convert_to_free_layout(&mut self) -> ptouch_render::Result<()> {
+        let before = self.content_snapshot();
+        let mut document = self.document();
+        document.convert_to_free_layout(
+            self.tape_width_px,
+            self.target_dpi(),
+            &mut TextRenderer::new(),
+        )?;
+        self.document_version = document.version;
+        self.elements = document.elements;
+        self.record_content(before, "Convert to free layout", None, 0.0);
+        Ok(())
+    }
+
     pub fn is_printer_busy(&self) -> bool {
         self.operation_in_progress || self.connecting
     }
@@ -319,9 +698,11 @@ impl AppState {
     /// Update the tape width in pixels based on the current tape_width_mm
     /// and the connected printer's resolution.
     pub fn update_tape_pixels(&mut self) {
-        if let Some(tape) = ptouch_core::tape::find_tape(self.tape_width_mm, self.printer_dpi) {
+        if let Some(tape) = ptouch_core::tape::find_tape(self.tape_width_mm, self.target_dpi()) {
             let px = u32::from(tape.pixels);
-            self.tape_width_px = if self.printer_max_px > 0 {
+            self.tape_width_px = if (self.printer_connected || self.preview_uses_printer)
+                && self.printer_max_px > 0
+            {
                 px.min(u32::from(self.printer_max_px))
             } else {
                 px
@@ -343,9 +724,11 @@ impl AppState {
         }
         self.selected_element = selection.filter(|&index| index < self.elements.len());
         self.rotation_input = match self.selected_element.map(|index| &self.elements[index]) {
-            Some(LabelElement::Text { rotation, .. } | LabelElement::Image { rotation, .. }) => {
-                rotation.to_string()
-            }
+            Some(
+                LabelElement::Text { rotation, .. }
+                | LabelElement::Image { rotation, .. }
+                | LabelElement::Object(LabelObject { rotation, .. }),
+            ) => rotation.to_string(),
             _ => String::new(),
         };
     }
@@ -368,8 +751,10 @@ impl AppState {
 
     pub fn preview_resolution(&self) -> ptouch_core::Result<ptouch_core::PrintResolution> {
         match self.printer_quality {
-            Some(profile) => Ok(profile.mode(self.print_quality)?.resolution),
-            None => Ok(ptouch_core::PrintResolution::square(self.printer_dpi)),
+            Some(profile) if self.printer_connected || self.preview_uses_printer => {
+                Ok(profile.mode(self.print_quality)?.resolution)
+            }
+            _ => Ok(ptouch_core::PrintResolution::square(self.target_dpi())),
         }
     }
 
@@ -427,6 +812,7 @@ mod editor_tests {
     fn selection_updates_properties_without_invalidating_print_pixels() {
         let mut state = AppState {
             elements: vec![LabelElement::Text {
+                text_box: None,
                 content: "Angle".into(),
                 font_size: None,
                 align: ptouch_render::text::TextAlign::Left,
@@ -461,5 +847,404 @@ mod editor_tests {
         state.mark_dirty();
         assert!(state.element_drag(&ctx).is_none());
         assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+    }
+}
+
+/// Both v2 text boxes and newer objects define physical template slots.
+pub(crate) fn slot_frame(element: &LabelElement) -> Option<&TextBox> {
+    match element {
+        LabelElement::Object(object) => Some(&object.frame),
+        LabelElement::Text { text_box, .. } => text_box.as_ref(),
+        _ => None,
+    }
+}
+
+fn content_box_for_frame(frame: &TextBox) -> ContentBox {
+    ContentBox {
+        width_mm: frame.width_mm,
+        height_mm: frame.height_mm,
+        offset_x_mm: 0.0,
+        offset_y_mm: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selecting_and_hovering_targets_never_pin_or_change_the_saved_layout() {
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "PORT1",
+                TextBox::default(),
+            ))],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        let before = state.document().to_toml_string().unwrap();
+        for edit in [CanvasEditTarget::Content, CanvasEditTarget::Slot] {
+            let target = CanvasTarget { element: 0, edit };
+            state.select_canvas_target(Some(target));
+            assert_eq!(state.selected_canvas_target(), Some(target));
+            state.canvas_hover_target = Some(target);
+            state.canvas_drag_target = Some(target);
+            assert!(state.canvas_hint().unwrap().starts_with("Dragging"));
+        }
+        state.select_canvas_target(None);
+        assert!(state.selected_canvas_target().is_none());
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 99,
+            edit: CanvasEditTarget::Slot,
+        }));
+        assert!(state.selected_canvas_target().is_none());
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.document_version, 3);
+        assert!(!state.needs_rerender);
+        assert!(state.elements[0].as_object().unwrap().content_box.is_none());
+    }
+
+    #[test]
+    fn slot_relationships_stop_at_absolute_slots_and_exclude_the_target() {
+        let mut state = AppState::default();
+        for position in [
+            PositionMode::Absolute,
+            PositionMode::Relative,
+            PositionMode::Relative,
+            PositionMode::Absolute,
+            PositionMode::Relative,
+        ] {
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "",
+                TextBox {
+                    position,
+                    ..TextBox::default()
+                },
+            )));
+        }
+        state.elements.push(LabelElement::CutMark);
+        state.elements.push(LabelElement::Object(LabelObject::text(
+            "",
+            TextBox {
+                position: PositionMode::Relative,
+                ..TextBox::default()
+            },
+        )));
+        assert_eq!(state.slot_followers(0), [1, 2]);
+        assert_eq!(state.slot_related(0), [1, 2]);
+        assert_eq!(state.slot_related(1), [0, 2]);
+        assert_eq!(state.slot_related(2), [1]);
+        assert_eq!(state.slot_related(3), [4]);
+        assert_eq!(state.slot_related(4), [3]);
+        assert_eq!(state.slot_related(6), [5]);
+        assert!(state.slot_followers(4).is_empty());
+        assert!(state.slot_followers(99).is_empty());
+        assert!(state.slot_related(99).is_empty());
+    }
+
+    #[test]
+    fn v2_text_slot_relationships_and_hints_preserve_the_original_format() {
+        let boxed_text = |position| LabelElement::Text {
+            content: "PORT".into(),
+            font_size: None,
+            align: TextAlign::Center,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            text_box: Some(TextBox {
+                x_mm: 5.0,
+                gap_mm: 3.0,
+                position,
+                ..TextBox::default()
+            }),
+        };
+        let mut state = AppState {
+            document_version: 2,
+            elements: vec![
+                boxed_text(PositionMode::Absolute),
+                boxed_text(PositionMode::Relative),
+                boxed_text(PositionMode::Relative),
+                LabelElement::Padding { pixels: 20 },
+                boxed_text(PositionMode::Relative),
+                boxed_text(PositionMode::Absolute),
+                boxed_text(PositionMode::Relative),
+            ],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        let before = state.document().to_toml_string().unwrap();
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
+        assert_eq!(state.slot_followers(0), [1, 2]);
+        assert_eq!(state.slot_related(0), [1, 2]);
+        assert_eq!(state.slot_related(1), [0, 2]);
+        assert_eq!(state.slot_related(2), [1]);
+        assert!(state.slot_followers(2).is_empty());
+        assert_eq!(state.slot_related(4), [3]);
+        assert!(state.slot_followers(4).is_empty());
+        assert_eq!(state.slot_related(5), [6]);
+        assert!(state.canvas_hint().unwrap().contains("2 following objects"));
+        assert_eq!(state.element_rect_mm(2), Some((31.0, 0.0, 10.0, 8.0)));
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.document().version, 2);
+        assert_eq!(state.document_version, 2);
+        assert!(!state.needs_rerender);
+        assert!(
+            state
+                .elements
+                .iter()
+                .all(|element| element.as_object().is_none())
+        );
+    }
+
+    #[test]
+    fn canvas_hints_prioritize_drag_then_hover_then_selection_and_explain_effects() {
+        let mut state = AppState {
+            elements: vec![
+                LabelElement::Object(LabelObject::text("A", TextBox::default())),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        ..TextBox::default()
+                    },
+                )),
+            ],
+            status_message: "Render error: keep this visible".into(),
+            ..AppState::default()
+        };
+        let selected = CanvasTarget {
+            element: 1,
+            edit: CanvasEditTarget::Slot,
+        };
+        let hovered = CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Content,
+        };
+        let dragged = CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        };
+        state.select_canvas_target(Some(selected));
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Selected Slot 2"));
+        assert!(hint.contains("0 following objects"));
+        assert!(hint.contains("Drag border to move."));
+        state.canvas_hover_target = Some(hovered);
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Candidate Object 1"));
+        assert!(hint.contains("Spacing unchanged"));
+        assert!(hint.contains("Click to select."));
+        state.canvas_drag_target = Some(dragged);
+        let hint = state.canvas_hint().unwrap();
+        assert!(hint.starts_with("Dragging Slot 1"));
+        assert!(hint.contains("1 following object"));
+        state.overall_flip_h = true;
+        assert!(
+            state
+                .canvas_hint()
+                .unwrap()
+                .contains("Turn off label horizontal mirroring")
+        );
+        state.canvas_drag_target = None;
+        state.canvas_hover_target = None;
+        state.elements[0] = LabelElement::CutMark;
+        assert!(state.canvas_hint().unwrap().contains("Legacy layout"));
+        assert_eq!(state.status_message, "Render error: keep this visible");
+    }
+
+    #[test]
+    fn new_objects_have_independent_frames_after_the_furthest_right_edge() {
+        let mut state = AppState::default();
+        assert_eq!(state.document_version, DOCUMENT_VERSION);
+        state.add_text();
+        state.add_text();
+        let first = state.elements[0].as_object_mut().unwrap();
+        first.frame.x_mm = 40.0;
+        state.add_text();
+        let positions: Vec<_> = state
+            .elements
+            .iter()
+            .map(|element| {
+                let object = element.as_object().unwrap();
+                let frame = &object.frame;
+                assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
+                assert_eq!(frame.position, PositionMode::Absolute);
+                assert_eq!(
+                    (frame.width_mm, frame.height_mm, frame.y_mm),
+                    (10.0, 8.0, 0.0)
+                );
+                frame.x_mm
+            })
+            .collect();
+        assert_eq!(positions, [40.0, 13.0, 53.0]);
+        assert!(state.needs_rerender);
+    }
+
+    #[test]
+    fn mixed_v3_documents_still_offer_explicit_conversion() {
+        let mut state = AppState::default();
+        state.add_text();
+        state.elements.push(LabelElement::CutMark);
+        assert!(!state.is_free_layout());
+        state.convert_to_free_layout().unwrap();
+        assert!(state.is_free_layout());
+    }
+
+    #[test]
+    fn relative_frames_resolve_in_millimeters_without_preview_rounding() {
+        let mut state = AppState::default();
+        for _ in 0..300 {
+            let frame = TextBox {
+                position: PositionMode::Relative,
+                gap_mm: 3.0,
+                ..TextBox::default()
+            };
+            state
+                .elements
+                .push(LabelElement::Object(LabelObject::text("", frame)));
+        }
+        assert!(state.preview_bounds.is_empty());
+        assert_eq!(state.element_rect_mm(299), Some((3890.0, 0.0, 10.0, 8.0)));
+        assert_eq!(state.default_object_frame(10.0, 8.0).x_mm, 3903.0);
+    }
+
+    #[test]
+    fn initial_image_frame_fits_tape_preserves_aspect_and_embeds_bytes() {
+        use std::io::Cursor;
+        let source = image::GrayImage::from_pixel(200, 100, image::Luma([0]));
+        let mut bytes = Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = bytes.into_inner();
+        let mut state = AppState::default();
+        assert!(state.add_image_bytes(None, bytes.clone()));
+        let object = state.elements[0].as_object().unwrap();
+        assert_eq!(
+            object.content_box,
+            Some(content_box_for_frame(&object.frame))
+        );
+        assert!((object.frame.width_mm / object.frame.height_mm - 2.0).abs() < 1e-9);
+        assert_eq!(object.frame.height_mm, state.printable_height_mm());
+        let ObjectContent::Image {
+            image_data, bitmap, ..
+        } = &object.content
+        else {
+            panic!()
+        };
+        assert_eq!(*image_data, bytes);
+        assert!(bitmap.is_some());
+        let count = state.elements.len();
+        assert!(!state.add_image_bytes(None, b"invalid image".to_vec()));
+        assert_eq!(state.elements.len(), count);
+    }
+
+    #[test]
+    fn every_new_object_fits_narrow_tape_height() {
+        let mut state = AppState {
+            tape_width_px: 32,
+            tape_width_mm: 6,
+            ..AppState::default()
+        };
+        state.add_text();
+        state.add_cut_mark();
+        for element in &state.elements {
+            let object = element.as_object().unwrap();
+            let frame = &object.frame;
+            assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
+            assert!(frame.height_mm <= state.printable_height_mm());
+            assert_eq!(frame.y_mm, 0.0);
+        }
+    }
+
+    #[test]
+    fn first_object_edit_pins_preview_geometry_without_changing_its_slot() {
+        let slot = TextBox {
+            x_mm: 5.0,
+            ..TextBox::default()
+        };
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "PORT1",
+                slot.clone(),
+            ))],
+            needs_rerender: false,
+            ..AppState::default()
+        };
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Content);
+        assert_eq!(
+            state.resolved_content_box(0),
+            Some(content_box_for_frame(&slot))
+        );
+        let actual = ContentBox {
+            width_mm: 8.7,
+            height_mm: 3.9,
+            offset_x_mm: -0.2,
+            offset_y_mm: 0.1,
+        };
+        state.preview_content_bounds.push(ContentGeometry {
+            element_index: 0,
+            corners: [[0.0; 2]; 4],
+            edit_box: actual.clone(),
+        });
+        assert_eq!(state.resolved_content_box(0), Some(actual.clone()));
+        assert_eq!(state.document_version, 3);
+        assert!(!state.needs_rerender);
+        assert_eq!(state.pin_content_box(0), Some(actual.clone()));
+        assert_eq!(state.document_version, 4);
+        assert!(state.needs_rerender);
+        assert_eq!(state.elements[0].as_object().unwrap().frame, slot);
+        // Once manual, a stale preview must never replace the stored geometry.
+        state.preview_content_bounds[0].edit_box.width_mm = 1.0;
+        assert_eq!(state.resolved_content_box(0), Some(actual));
+        assert!(state.resolved_content_box(1).is_none());
+    }
+
+    #[test]
+    fn manual_geometry_upgrades_document_and_survives_save_without_moving_slot() {
+        let mut state = AppState {
+            document_version: 3,
+            ..AppState::default()
+        };
+        let mut object = LabelObject::text("PORT1", TextBox::default());
+        let content_box = ContentBox {
+            width_mm: 12.3,
+            height_mm: 4.5,
+            offset_x_mm: -1.2,
+            offset_y_mm: 0.7,
+        };
+        object.content_box = Some(content_box.clone());
+        object.rotation = 45.0;
+        state.elements.push(LabelElement::Object(object));
+        let document = state.document();
+        assert_eq!(document.version, 4);
+        let reopened = LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap();
+        assert_eq!(reopened.version, 4);
+        let object = reopened.elements[0].as_object().unwrap();
+        assert_eq!(object.content_box, Some(content_box));
+        assert_eq!(object.frame, TextBox::default());
+        assert_eq!(object.rotation, 45.0);
+    }
+
+    #[test]
+    fn explicit_legacy_conversion_does_not_enable_independent_object_sizing() {
+        let mut state = AppState {
+            document_version: 1,
+            elements: vec![LabelElement::CutMark, LabelElement::Padding { pixels: 20 }],
+            ..AppState::default()
+        };
+        state.convert_to_free_layout().unwrap();
+        assert!(state.is_free_layout());
+        assert!(
+            state
+                .elements
+                .iter()
+                .all(|element| element.as_object().unwrap().content_box.is_none())
+        );
     }
 }

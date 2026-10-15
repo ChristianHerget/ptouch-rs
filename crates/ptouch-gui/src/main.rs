@@ -56,11 +56,13 @@ fn main() -> eframe::Result<()> {
     }
     env_logger::init();
     let mut smoke_test = false;
+    let mut offline = false;
     let mut profiles_dir = ptouch_profiles::default_directory();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--smoke-test" => smoke_test = true,
+            "--offline" => offline = true,
             "--profiles-dir" => {
                 profiles_dir = args
                     .next()
@@ -71,7 +73,7 @@ fn main() -> eframe::Result<()> {
                     })
             }
             "--help" | "-h" => {
-                println!("ptouch-gui [--profiles-dir DIRECTORY] [--smoke-test]");
+                println!("ptouch-gui [--profiles-dir DIRECTORY] [--offline] [--smoke-test]");
                 return Ok(());
             }
             _ => {
@@ -99,6 +101,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "P-Touch Label Printer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::PtouchApp::new(cc, smoke_test, profiles_dir)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::PtouchApp::new(
+                cc,
+                smoke_test,
+                offline,
+                profiles_dir,
+            )))
+        }),
     )
 }

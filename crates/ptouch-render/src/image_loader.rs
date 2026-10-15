@@ -83,18 +83,33 @@ pub fn load_image(path: &Path, options: &ImageLoadOptions) -> Result<LabelBitmap
 
 /// Load an image from a reader and convert to a 1-bit [`LabelBitmap`].
 ///
-/// The reader contents are buffered into memory for format detection and
-/// decoding.
+/// The reader contents are buffered for format detection. Raster magic is
+/// checked first; XML and gzip data are parsed as SVG/SVGZ without requiring
+/// the original path, so embedded layout images remain self-contained.
 pub fn load_image_from_reader<R: Read>(
     mut reader: R,
     options: &ImageLoadOptions,
 ) -> Result<LabelBitmap> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
-    let img = match image::guess_format(&buf) {
-        Ok(format) => image::load_from_memory_with_format(&buf, format)?,
-        // Reuse the SVG parser for embedded vector sources, including SVGZ.
-        Err(_) => render_svg_data(&buf, options.target_height)?,
+    let img = if let Ok(format) = image::guess_format(&buf) {
+        // A recognized but corrupt raster must retain its decoder error; do
+        // not hide that error by retrying it as a different image format.
+        image::ImageReader::with_format(std::io::Cursor::new(&buf), format).decode()?
+    } else if buf.starts_with(&[0x1f, 0x8b])
+        || buf
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(&buf)
+            .trim_ascii_start()
+            .starts_with(b"<")
+    {
+        // Let the XML parser validate the root element, declarations and
+        // comments; searching for an <svg substring could misclassify data.
+        render_svg_data(&buf, options.target_height)?
+    } else {
+        image::ImageReader::new(std::io::Cursor::new(&buf))
+            .with_guessed_format()?
+            .decode()?
     };
     Ok(convert_to_bitmap(img, options))
 }
@@ -140,26 +155,31 @@ fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicIma
         .map_err(|e| crate::RenderError::Text(format!("SVG parse error: {}", e)))?;
 
     let svg_size = tree.size();
-    let (mut w, mut h) = (svg_size.width() as u32, svg_size.height() as u32);
-    if w == 0 || h == 0 {
-        return Ok(DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1)));
+    // Preserve fractional SVG viewports when calculating the scale. Truncating
+    // first can turn a valid subpixel viewport into an empty bitmap.
+    let scale = target_height
+        .filter(|height| *height > 0)
+        .map_or(1.0, |height| {
+            f64::from(height) / f64::from(svg_size.height())
+        });
+    let width = (f64::from(svg_size.width()) * scale).round().max(1.0);
+    let height = (f64::from(svg_size.height()) * scale).round().max(1.0);
+    // The RGBA pixmap uses four bytes per pixel, before grayscale conversion
+    // and dithering buffers. Reject excessive output before allocating it.
+    if !scale.is_finite()
+        || scale > f64::from(f32::MAX)
+        || !width.is_finite()
+        || !height.is_finite()
+        || width > 1_000_000.0
+        || height > 1_000_000.0
+        || width * height > 16_777_216.0
+    {
+        return Err(crate::RenderError::DimensionMismatch(
+            "SVG raster is too large".into(),
+        ));
     }
-
-    // Scale to target height if requested.
-    let scale = if let Some(th) = target_height {
-        if th > 0 && th != h {
-            let s = th as f32 / h as f32;
-            w = (w as f32 * s).round() as u32;
-            h = th;
-            s
-        } else {
-            1.0
-        }
-    } else {
-        1.0
-    };
-
-    let pixmap = tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or_else(|| {
+    let (w, h) = (width as u32, height as u32);
+    let pixmap = tiny_skia::Pixmap::new(w, h).ok_or_else(|| {
         crate::RenderError::Text(format!("Failed to create {}x{} pixmap for SVG", w, h))
     })?;
 
@@ -167,7 +187,7 @@ fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicIma
     let mut pixmap = pixmap;
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let transform = tiny_skia::Transform::from_scale(scale, scale);
+    let transform = tiny_skia::Transform::from_scale(scale as f32, scale as f32);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let rgba = image::RgbaImage::from_raw(w, h, pixmap.take()).ok_or_else(|| {
@@ -420,7 +440,138 @@ fn detect_binarize_mode(gray: &GrayImage) -> BinarizeMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use image::{GrayImage, Luma};
+
+    const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect x="4" y="2" width="4" height="4" fill="black"/></svg>"#;
+
+    fn svgz() -> Vec<u8> {
+        // gzip-compressed SVG above, with a fixed zero timestamp.
+        base64::engine::general_purpose::STANDARD
+            .decode("H4sIAAAAAAAC/0XMSw7CMAyE4atYc4DalK5QnLtAKUlEeKi1cLk96absRvo/TVg+idZHfS6KbPY+Mbt758fuNSfuRYSbAHm5Wlb0AspTSdkUB0EM8zQarYoB9G15h8PftXkrtSou9TzewTFsl/EH0/DhBHoAAAA=")
+            .unwrap()
+    }
+
+    #[test]
+    fn reader_detects_svg_xml_prefixes_and_svgz_without_a_path() {
+        let mut prefixed =
+            b"\xef\xbb\xbf<?xml version=\"1.0\"?>\n<!-- embedded logo -->\n".to_vec();
+        prefixed.extend_from_slice(SVG);
+        let options = ImageLoadOptions {
+            target_height: Some(20),
+            ..Default::default()
+        };
+        for bytes in [SVG.to_vec(), prefixed, svgz()] {
+            let bitmap = load_image_from_reader(bytes.as_slice(), &options).unwrap();
+            assert_eq!((bitmap.width(), bitmap.height()), (40, 20));
+            assert!(bitmap.get_pixel(10, 8));
+            assert!(!bitmap.get_pixel(0, 0));
+        }
+    }
+
+    #[test]
+    fn corrupt_raster_keeps_decoder_error_and_invalid_svg_is_rejected() {
+        let options = ImageLoadOptions::default();
+        let truncated_png = b"\x89PNG\r\n\x1a\n<svg>";
+        assert!(matches!(
+            load_image_from_reader(truncated_png.as_slice(), &options),
+            Err(crate::RenderError::Image(_))
+        ));
+        for data in [b"<svg".as_slice(), b"<not-svg/>", &[0x1f, 0x8b, 0]] {
+            assert!(matches!(
+                load_image_from_reader(data, &options),
+                Err(crate::RenderError::Text(message)) if message.starts_with("SVG parse error:")
+            ));
+        }
+    }
+
+    #[test]
+    fn embedded_png_svg_and_svgz_survive_legacy_and_object_layout_roundtrips() {
+        use crate::document::{LabelDocument, LabelElement, LabelObject, TextBox, render_document};
+        use crate::text::TextRenderer;
+
+        let mut pixels = GrayImage::from_pixel(20, 10, Luma([255]));
+        for y in 2..6 {
+            for x in 4..8 {
+                pixels.put_pixel(x, y, Luma([0]));
+            }
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut renderer = TextRenderer::new();
+        for bytes in [png.into_inner(), SVG.to_vec(), svgz()] {
+            for version in [1, 3] {
+                let element = if version == 1 {
+                    LabelElement::image_from_bytes(None, bytes.clone())
+                } else {
+                    LabelElement::Object(LabelObject::image_from_bytes(
+                        None,
+                        bytes.clone(),
+                        TextBox {
+                            width_mm: 8.0,
+                            height_mm: 4.0,
+                            ..Default::default()
+                        },
+                    ))
+                };
+                let document = LabelDocument {
+                    version,
+                    tape_width_mm: 12,
+                    dpi: 180,
+                    font_name: String::new(),
+                    font_margin: 0,
+                    flip_h: false,
+                    flip_v: false,
+                    elements: vec![element],
+                };
+                let saved = document.to_toml_string().unwrap();
+                let reopened = LabelDocument::from_toml_str(&saved).unwrap();
+                assert_eq!(reopened.to_toml_string().unwrap(), saved);
+                let before = render_document(&document, 76, 180, &mut renderer)
+                    .unwrap()
+                    .bitmap
+                    .unwrap();
+                let after = render_document(&reopened, 76, 180, &mut renderer)
+                    .unwrap()
+                    .bitmap
+                    .unwrap();
+                assert_eq!(
+                    (before.width(), before.height()),
+                    (after.width(), after.height())
+                );
+                assert_eq!(before.data(), after.data());
+                assert!(after.data().iter().any(|byte| *byte != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn svg_raster_limits_apply_after_scaling_and_preserve_fractional_viewports() {
+        let huge = br#"<svg xmlns="http://www.w3.org/2000/svg" width="50000" height="50000"/>"#;
+        assert!(matches!(
+            render_svg_data(huge, None),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        assert_eq!(render_svg_data(huge, Some(20)).unwrap().width(), 20);
+        assert!(matches!(
+            render_svg_data(SVG, Some(u32::MAX)),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        let fractional = br#"<svg xmlns="http://www.w3.org/2000/svg" width="0.5" height="0.25"><rect width="0.5" height="0.25"/></svg>"#;
+        let bitmap = load_image_from_reader(
+            fractional.as_slice(),
+            &ImageLoadOptions {
+                target_height: Some(10),
+                auto_invert: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((bitmap.width(), bitmap.height()), (20, 10));
+        assert!(bitmap.get_pixel(10, 5));
+    }
 
     #[test]
     fn test_convert_bright_background() {

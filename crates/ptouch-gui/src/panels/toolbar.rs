@@ -9,23 +9,30 @@ use log::{error, info};
 
 use ptouch_render::document::LabelDocument;
 use ptouch_render::raster;
-use ptouch_render::text::TextAlign;
 
 use crate::state::{AppState, LabelElement, PrinterCommand};
 
 /// Render the top toolbar.
 pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
+    if !state.is_free_layout() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Legacy objects (format v{})", state.document_version));
+            if ui.button("Convert to free layout")
+                .on_hover_text("Fix every object's current position in millimeters. Natural font sizing and rotated image fitting may change; review the preview before saving.")
+                .clicked()
+            {
+                match state.convert_to_free_layout() {
+                    Ok(()) => state.status_message = "Converted to free layout. Review text sizing and rotated images before saving.".into(),
+                    Err(error) => state.status_message = format!("Conversion error: {error}"),
+                }
+            }
+            ui.small("Legacy spacing stays unchanged until converted.");
+        });
+    }
     ui.horizontal(|ui| {
         // -- Element addition buttons --
         if ui.button("Add Text").clicked() {
-            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Text {
-                content: "Label".to_string(),
-                font_size: None,
-                align: TextAlign::Left,
-                rotation: 0.0,
-                flip_h: false,
-                flip_v: false,
-            }));
+            state.add_text();
             info!("Added text element");
         }
 
@@ -36,15 +43,11 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             // label and stays self-contained when saved to a layout file.
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    let element = LabelElement::image_from_bytes(Some(path.clone()), bytes);
-                    // Reject files that do not decode, so a saved layout can
-                    // always be reopened.
-                    if matches!(element, LabelElement::Image { bitmap: None, .. }) {
+                    if state.add_image_bytes(Some(path.clone()), bytes) {
+                        info!("Loaded image: {}", path.display());
+                    } else {
                         error!("Unsupported or corrupt image: {}", path.display());
                         state.status_message = format!("Image load error: {}", path.display());
-                    } else {
-                        info!("Loaded image: {}", path.display());
-                        state.apply_editor_action(crate::editor::EditorAction::Add(element));
                     }
                 }
                 Err(e) => {
@@ -55,11 +58,11 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         if ui.button("Cut Mark").clicked() {
-            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::CutMark));
+            state.add_cut_mark();
             info!("Added cut mark");
         }
 
-        if ui.button("Padding").clicked() {
+        if !state.is_free_layout() && ui.button("Padding").clicked() {
             state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Padding {
                 pixels: 20,
             }));
@@ -170,16 +173,7 @@ fn do_save_layout(state: &mut AppState) {
         return;
     }
 
-    let document = LabelDocument {
-        version: ptouch_render::document::DOCUMENT_VERSION,
-        tape_width_mm: state.tape_width_mm,
-        dpi: state.printer_dpi,
-        font_name: state.font_name.clone(),
-        font_margin: state.font_margin,
-        flip_h: state.overall_flip_h,
-        flip_v: state.overall_flip_v,
-        elements: state.elements.clone(),
-    };
+    let document = state.document();
 
     let text = match document.to_toml_string() {
         Ok(text) => text,
@@ -227,9 +221,11 @@ fn do_open_layout(state: &mut AppState) {
         }
     };
 
-    match LabelDocument::from_toml_str(&text) {
-        Ok(document) => {
-            apply_layout(state, document);
+    match LabelDocument::from_toml_str(&text)
+        .map_err(|error| error.to_string())
+        .and_then(|document| apply_layout(state, document))
+    {
+        Ok(()) => {
             state.status_message = format!("Opened {}", path.display());
             info!("Opened layout: {}", path.display());
         }
@@ -240,8 +236,21 @@ fn do_open_layout(state: &mut AppState) {
     }
 }
 
-pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) {
+pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) -> Result<(), String> {
+    // Reject before touching the current design: an unknown width must not
+    // inherit the previous document's raster height or differ from CLI export.
+    if ptouch_core::tape::find_tape(document.tape_width_mm, document.dpi).is_none() {
+        return Err(format!(
+            "Unknown saved tape width: {} mm",
+            document.tape_width_mm
+        ));
+    }
     state.editor = crate::editor::Editor::default();
+    state.document_version = document.version;
+    state.design_dpi = document.dpi;
+    if !state.printer_connected {
+        state.preview_uses_printer = false;
+    }
     if !state.printer_connected {
         state.tape_width_mm = document.tape_width_mm;
         state.printer_dpi = document.dpi;
@@ -256,6 +265,7 @@ pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) {
     state.elements = document.elements;
     state.select_element(None);
     state.mark_dirty();
+    Ok(())
 }
 
 /// Export the current label preview as an image file.
@@ -301,6 +311,184 @@ mod tests {
     use super::*;
     use crate::state::PrinterTarget;
     use ptouch_render::text::TextRenderer;
+
+    fn layout(tape_width_mm: u8) -> LabelDocument {
+        let document = LabelDocument {
+            version: ptouch_render::document::DOCUMENT_VERSION,
+            tape_width_mm,
+            dpi: 180,
+            font_name: "DejaVuSans".into(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::CutMark],
+        };
+        LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn opening_unknown_tape_width_rejects_without_changing_the_current_design() {
+        let mut state = AppState::default();
+        state.add_text();
+        state.needs_rerender = false;
+        let before = state.document().to_toml_string().unwrap();
+        let mut document = layout(15);
+        document.dpi = 360;
+        assert_eq!(
+            apply_layout(&mut state, document).unwrap_err(),
+            "Unknown saved tape width: 15 mm"
+        );
+        assert_eq!(state.document().to_toml_string().unwrap(), before);
+        assert_eq!(state.tape_width_px, 76);
+        assert_eq!(state.selected_element, Some(0));
+        assert!(!state.needs_rerender);
+    }
+
+    #[test]
+    fn opening_and_saving_legacy_layout_keeps_version_and_flow() {
+        for version in [1, 2] {
+            let mut document = layout(12);
+            document.version = version;
+            document.elements = vec![LabelElement::Padding { pixels: 20 }];
+            let mut state = AppState::default();
+            apply_layout(&mut state, document).unwrap();
+            state.add_text();
+            assert!(!state.is_free_layout());
+            let saved = state.document();
+            assert_eq!(saved.version, version);
+            assert!(matches!(
+                saved.elements[1],
+                LabelElement::Text { text_box: None, .. }
+            ));
+            let reopened = LabelDocument::from_toml_str(&saved.to_toml_string().unwrap()).unwrap();
+            assert_eq!(reopened.version, version);
+        }
+    }
+
+    #[test]
+    fn explicit_conversion_is_saved_and_reopened_as_free_layout() {
+        let mut document = layout(12);
+        document.version = 1;
+        document.elements = vec![LabelElement::Padding { pixels: 20 }, LabelElement::CutMark];
+        let mut state = AppState::default();
+        apply_layout(&mut state, document).unwrap();
+        state.convert_to_free_layout().unwrap();
+        let saved = state.document().to_toml_string().unwrap();
+        let mut reopened = AppState::default();
+        apply_layout(&mut reopened, LabelDocument::from_toml_str(&saved).unwrap()).unwrap();
+        assert!(reopened.is_free_layout());
+        assert!(
+            reopened
+                .elements
+                .iter()
+                .all(|element| element.as_object().is_some())
+        );
+        assert_eq!(reopened.elements.len(), 2);
+    }
+
+    #[test]
+    fn opening_layout_keeps_bluetooth_tape_geometry() {
+        for width in [12, 24] {
+            let mut state = AppState {
+                printer_target: PrinterTarget::Bluetooth {
+                    name: "PT-P300BT".into(),
+                    address: "AA:BB:CC:DD:EE:FF".into(),
+                },
+                printer_connected: true,
+                printer_max_px: 128,
+                tape_width_mm: 12,
+                tape_width_px: 64,
+                ..AppState::default()
+            };
+            apply_layout(&mut state, layout(width)).unwrap();
+            assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 64));
+            let bitmap = ptouch_render::document::render_elements(
+                &state.elements,
+                state.tape_width_px,
+                &state.font_name,
+                state.font_margin,
+                &mut TextRenderer::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let lines = raster::bitmap_to_raster_lines(&bitmap, state.printer_max_px);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line[..4].iter().chain(&line[12..]).all(|&byte| byte == 0))
+            );
+        }
+    }
+
+    #[test]
+    fn opening_usb_layout_uses_saved_tape_width() {
+        let mut state = AppState {
+            tape_width_mm: 24,
+            tape_width_px: 128,
+            ..AppState::default()
+        };
+        apply_layout(&mut state, layout(12)).unwrap();
+        assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 76));
+    }
+
+    #[test]
+    fn opening_offline_layout_restores_design_dpi_after_printer_disconnect() {
+        let mut state = AppState {
+            printer_dpi: 180,
+            printer_max_px: 128,
+            preview_uses_printer: true,
+            ..AppState::default()
+        };
+        let mut document = layout(24);
+        document.dpi = 360;
+        apply_layout(&mut state, document).unwrap();
+        assert_eq!(state.design_dpi, 360);
+        assert_eq!(state.target_dpi(), 360);
+        assert_eq!(state.tape_width_px, 320);
+        assert_eq!(state.document().dpi, 360);
+    }
+
+    #[test]
+    fn connected_printer_overrides_preview_dpi_without_changing_saved_design() {
+        let mut state = AppState {
+            printer_connected: true,
+            printer_dpi: 180,
+            printer_max_px: 128,
+            tape_width_px: 128,
+            ..AppState::default()
+        };
+        let mut document = layout(24);
+        document.dpi = 360;
+        apply_layout(&mut state, document).unwrap();
+        assert_eq!(state.target_dpi(), 180);
+        assert_eq!(state.tape_width_px, 128);
+        let saved = state.document();
+        assert_eq!(saved.dpi, 360);
+        let reopened = LabelDocument::from_toml_str(&saved.to_toml_string().unwrap()).unwrap();
+        let mut offline = AppState::default();
+        apply_layout(&mut offline, reopened).unwrap();
+        assert_eq!(offline.target_dpi(), 360);
+        assert_eq!(offline.tape_width_px, 150);
+    }
+
+    #[test]
+    fn opening_layout_offline_releases_previous_bluetooth_geometry() {
+        let mut state = AppState {
+            printer_target: PrinterTarget::Bluetooth {
+                name: "PT-P300BT".into(),
+                address: "AA:BB:CC:DD:EE:FF".into(),
+            },
+            printer_max_px: 128,
+            preview_uses_printer: true,
+            tape_width_px: 64,
+            ..AppState::default()
+        };
+        let mut document = layout(24);
+        document.dpi = 360;
+        apply_layout(&mut state, document).unwrap();
+        assert_eq!(state.target_dpi(), 360);
+        assert_eq!((state.tape_width_mm, state.tape_width_px), (24, 320));
+    }
 
     #[test]
     fn print_submits_cached_pixels_and_rejects_stale_previews() {
@@ -369,7 +557,7 @@ mod tests {
         // Offline resolution remains square at the design DPI, independent
         // of any stale preferred quality before a printer is identified.
         let state = AppState {
-            printer_dpi: 360,
+            design_dpi: 360,
             print_quality: PrintQuality::HighRes,
             ..Default::default()
         };
@@ -377,20 +565,6 @@ mod tests {
             state.preview_resolution().unwrap(),
             PrintResolution::square(360)
         );
-    }
-
-    fn layout(tape_width_mm: u8) -> LabelDocument {
-        let document = LabelDocument {
-            version: ptouch_render::document::DOCUMENT_VERSION,
-            tape_width_mm,
-            dpi: 180,
-            font_name: "DejaVuSans".into(),
-            font_margin: 0,
-            flip_h: false,
-            flip_v: false,
-            elements: vec![LabelElement::CutMark],
-        };
-        LabelDocument::from_toml_str(&document.to_toml_string().unwrap()).unwrap()
     }
 
     #[test]
@@ -406,7 +580,7 @@ mod tests {
             ..AppState::default()
         };
         for width in [12, 24] {
-            apply_layout(&mut state, layout(width));
+            apply_layout(&mut state, layout(width)).unwrap();
             assert_eq!(
                 (
                     state.tape_width_mm,
@@ -433,50 +607,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn opening_layout_keeps_bluetooth_tape_geometry() {
-        for width in [12, 24] {
-            let mut state = AppState {
-                printer_target: PrinterTarget::Bluetooth {
-                    name: "PT-P300BT".into(),
-                    address: "AA:BB:CC:DD:EE:FF".into(),
-                },
-                printer_connected: true,
-                printer_max_px: 128,
-                tape_width_mm: 12,
-                tape_width_px: 64,
-                ..AppState::default()
-            };
-            apply_layout(&mut state, layout(width));
-            assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 64));
-            let bitmap = ptouch_render::document::render_elements(
-                &state.elements,
-                state.tape_width_px,
-                &state.font_name,
-                state.font_margin,
-                &mut TextRenderer::new(),
-            )
-            .unwrap()
-            .unwrap();
-            let lines = raster::bitmap_to_raster_lines(&bitmap, state.printer_max_px);
-            assert!(
-                lines
-                    .iter()
-                    .all(|line| line[..4].iter().chain(&line[12..]).all(|&byte| byte == 0))
-            );
-        }
-    }
-
-    #[test]
-    fn opening_usb_layout_uses_saved_tape_width() {
-        let mut state = AppState {
-            tape_width_mm: 24,
-            tape_width_px: 128,
-            ..AppState::default()
-        };
-        apply_layout(&mut state, layout(12));
-        assert_eq!((state.tape_width_mm, state.tape_width_px), (12, 76));
     }
 }
