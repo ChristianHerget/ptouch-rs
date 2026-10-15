@@ -60,7 +60,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) -> Option<PreviewGeo
         painter.text(
             canvas.center(),
             Align2::CENTER_CENTER,
-            "Add elements to preview",
+            "Add objects to preview",
             FontId::proportional(18.0),
             Color32::from_gray(100),
         );
@@ -162,7 +162,11 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) -> Option<PreviewGeo
         selection = Some(Some(index));
     }
     let clipped = painter.with_clip_rect(content);
-    clipped.rect_filled(geometry.tape, 0.0, Color32::WHITE);
+    let tape_geometry = crate::preview::TapeGeometry {
+        tape: geometry.tape,
+        print: geometry.print,
+    };
+    tape_geometry.paint_background(&clipped);
     let print_painter = clipped.with_clip_rect(content.intersect(geometry.tape));
     for tile in &preview.tiles {
         let rect = preview.tile_rect(tile, geometry.print, geometry.head_scale);
@@ -175,23 +179,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) -> Option<PreviewGeo
             );
         }
     }
-    for y in [geometry.print.top(), geometry.print.bottom()] {
-        let mut x = geometry.tape.left().max(content.left());
-        let end = geometry.tape.right().min(content.right());
-        while x < end {
-            clipped.line_segment(
-                [pos2(x, y), pos2((x + 4.0).min(end), y)],
-                Stroke::new(1.0, Color32::from_gray(165)),
-            );
-            x += 8.0;
-        }
-    }
-    clipped.rect_stroke(
-        geometry.tape,
-        0.0,
-        Stroke::new(1.0, Color32::from_gray(110)),
-        egui::StrokeKind::Outside,
-    );
+    tape_geometry.paint_outline(&clipped);
 
     let hovered = pointer
         .filter(|_| response.contains_pointer())
@@ -264,7 +252,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) -> Option<PreviewGeo
     painter.text(
         pos2(canvas.left() + 6.0, canvas.bottom() - 3.0),
         Align2::LEFT_BOTTOM,
-        "Drag elements to reorder · Space+drag or middle-drag to pan",
+        "Drag objects to reorder · Space+drag or middle-drag to pan",
         FontId::proportional(11.0),
         Color32::from_gray(75),
     );

@@ -12,6 +12,7 @@ const RULER_HEIGHT: f32 = 30.0;
 const RULER_WIDTH: f32 = 52.0;
 const ROTATE_RADIUS: f32 = 6.0;
 const HANDLE_MARGIN: f32 = 24.0;
+const TAPE_DIMENSION_WIDTH: f32 = 100.0;
 
 #[derive(Clone)]
 struct RotationDrag {
@@ -132,13 +133,13 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Add elements to preview",
+            "Add objects to preview",
             egui::FontId::proportional(18.0),
             egui::Color32::from_gray(100),
         );
         return;
     };
-    let original_size = preview.size();
+    let original_size = preview.tape_size(state.tape_width_mm);
     let feed_pixel_width = preview.feed_pixel_width();
     let display = DisplayScale::from_context(ui.ctx());
     let actual = display.actual_head_scale(preview.resolution);
@@ -177,7 +178,8 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         .collect();
     let viewport_size = canvas_size - egui::vec2(RULER_WIDTH, RULER_HEIGHT);
     let content_size = egui::vec2(
-        (display_size.x + PADDING * 2.0 + HANDLE_MARGIN).max(viewport_size.x - 12.0),
+        (display_size.x + PADDING * 2.0 + HANDLE_MARGIN + TAPE_DIMENSION_WIDTH)
+            .max(viewport_size.x - 12.0),
         (display_size.y + PADDING * 2.0).max(viewport_size.y - 12.0),
     );
     let dpi = state.target_dpi();
@@ -207,10 +209,15 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(200));
             // A stable left/top origin prevents auto-length changes from moving
             // the canvas under the pointer during a drag.
-            let label_rect =
-                egui::Rect::from_min_size(rect.min + egui::vec2(PADDING, PADDING), display_size);
+            let tape_geometry = crate::preview::TapeGeometry::new(
+                state.preview.as_ref().unwrap(),
+                state.tape_width_mm,
+                rect.min + egui::vec2(PADDING, PADDING),
+                state.canvas_scale,
+            );
+            let label_rect = tape_geometry.print;
             ruler_label = Some(label_rect);
-            painter.rect_filled(label_rect, 0.0, egui::Color32::WHITE);
+            tape_geometry.paint_background(painter);
             let pixel_scale = state.canvas_scale;
             for (id, origin, size) in &tiles {
                 let tile_rect = egui::Rect::from_min_size(
@@ -218,12 +225,14 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     *size * pixel_scale,
                 );
                 if tile_rect.intersects(painter.clip_rect()) {
-                    painter.image(
-                        *id,
-                        tile_rect,
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    painter
+                        .with_clip_rect(painter.clip_rect().intersect(label_rect))
+                        .image(
+                            *id,
+                            tile_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
                 }
             }
             state.editor.surface(&response);
@@ -237,12 +246,8 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             if response.contains_pointer() && panning {
                 ui.scroll_with_delta(ui.input(|i| i.pointer.delta()));
             }
-            painter.rect_stroke(
-                label_rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(128)),
-                egui::StrokeKind::Outside,
-            );
+            tape_geometry.paint_outline(painter);
+            draw_tape_dimension(painter, tape_geometry.tape, state.tape_width_mm);
             let geometry: Vec<_> = state
                 .preview_bounds
                 .iter()
@@ -393,7 +398,7 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         .iter()
                         .any(|g| g.element == target.element && g.has_slot);
                     if ui
-                        .add_enabled(has_slot, egui::Button::new("Select slot"))
+                        .add_enabled(has_slot, egui::Button::new("Select frame"))
                         .clicked()
                     {
                         state.select_canvas_target(Some(CanvasTarget {
@@ -553,7 +558,7 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                                 && frame.position == PositionMode::Absolute
                             {
                                 state.status_message =
-                                    "Moved before the previous slot; using absolute position"
+                                    "Moved before the previous frame; using absolute position"
                                         .into();
                             }
                             object.frame = frame;
@@ -953,7 +958,7 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
 fn fit_zoom(original_size: egui::Vec2, canvas_size: egui::Vec2) -> f32 {
     let available = canvas_size
         - egui::vec2(
-            PADDING * 2.0 + RULER_WIDTH + HANDLE_MARGIN + 12.0,
+            PADDING * 2.0 + RULER_WIDTH + HANDLE_MARGIN + TAPE_DIMENSION_WIDTH + 12.0,
             PADDING * 2.0 + RULER_HEIGHT + 12.0,
         );
     (available.x.max(1.0) / original_size.x)
@@ -1121,6 +1126,25 @@ fn ruler_ticks(
         })
         .collect();
     (step, ticks)
+}
+
+fn draw_tape_dimension(painter: &egui::Painter, tape: egui::Rect, width_mm: u8) {
+    let x = tape.right() + HANDLE_MARGIN + 12.0;
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(65));
+    painter.line_segment(
+        [egui::pos2(x, tape.top()), egui::pos2(x, tape.bottom())],
+        stroke,
+    );
+    for y in [tape.top(), tape.bottom()] {
+        painter.line_segment([egui::pos2(x - 4.0, y), egui::pos2(x + 4.0, y)], stroke);
+    }
+    painter.text(
+        egui::pos2(x + 8.0, tape.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{width_mm} mm tape"),
+        egui::FontId::proportional(12.0),
+        stroke.color,
+    );
 }
 
 fn draw_rulers(
@@ -2133,7 +2157,8 @@ mod tests {
 
     #[test]
     fn y_ruler_uses_printable_pixels_and_tracks_scrolled_original_coordinates() {
-        for (dpi, height, endpoint) in [(180, 76, "10.72"), (360, 150, "10.58")] {
+        for (dpi, height, endpoint) in [(180, 76, "10.72"), (360, 150, "10.58"), (360, 140, "9.88")]
+        {
             let context = egui::Context::default();
             let mut state = canvas_fixture(&context, false, 0);
             state.design_dpi = dpi;
@@ -2145,6 +2170,8 @@ mod tests {
             ));
             let output = canvas_event(&context, &mut state, vec![]);
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.job.text == endpoint)));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "12 mm tape")));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(r) if r.fill == egui::Color32::from_gray(225))));
             let scale = f32::from(dpi) / 25.4 * 2.0;
             let (_, ticks) = ruler_ticks(100.0, 400.0, -75.0, 1000.0, scale, 28.0);
             assert!(!ticks.is_empty());

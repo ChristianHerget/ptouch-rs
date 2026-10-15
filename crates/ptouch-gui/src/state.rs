@@ -427,7 +427,7 @@ impl AppState {
         };
         let name = match target.edit {
             CanvasEditTarget::Content => "Object",
-            CanvasEditTarget::Slot => "Slot",
+            CanvasEditTarget::Slot => "Frame",
         };
         let consequence = match target.edit {
             CanvasEditTarget::Content => "Spacing unchanged.".to_string(),
@@ -608,8 +608,10 @@ impl AppState {
 
     pub fn add_text(&mut self) {
         let element = if self.is_free_layout() {
-            let mut object =
-                LabelObject::text("Label".to_string(), self.default_object_frame(10.0, 8.0));
+            let mut object = LabelObject::text(
+                "Label".to_string(),
+                self.default_object_frame(10.0, self.printable_height_mm()),
+            );
             object.content_box = Some(content_box_for_frame(&object.frame));
             LabelElement::Object(object)
         } else {
@@ -646,6 +648,7 @@ impl AppState {
             object.frame.width_mm = (height * aspect).max(25.4 / f64::from(self.target_dpi()));
             object.frame.height_mm = height.max(25.4 / f64::from(self.target_dpi()));
             object.content_box = Some(content_box_for_frame(&object.frame));
+            object.frame.height_mm = self.printable_height_mm();
             LabelElement::Object(object)
         } else {
             let element = LabelElement::image_from_bytes(path, bytes);
@@ -873,6 +876,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_frames_use_printable_height_without_stretching_wide_images() {
+        for (dpi, pixels) in [(180, 32), (180, 76), (360, 150)] {
+            let mut state = AppState {
+                design_dpi: dpi,
+                tape_width_px: pixels,
+                ..AppState::default()
+            };
+            state.add_text();
+            let text = state.elements[0].as_object().unwrap();
+            assert_eq!(text.frame.height_mm, state.printable_height_mm());
+            let source = image::GrayImage::from_pixel(2000, 100, image::Luma([0]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            source
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            assert!(state.add_image_bytes(None, bytes.into_inner()));
+            let image = state.elements[1].as_object().unwrap();
+            assert_eq!(image.frame.height_mm, state.printable_height_mm());
+            assert_eq!(image.frame.y_mm, 0.0);
+            let content = image.content_box.as_ref().unwrap().clone();
+            assert!((content.width_mm / content.height_mm - 20.0).abs() < 1e-9);
+            assert_eq!(content.width_mm, 40.0);
+            let frame = image.frame.clone();
+            state.tape_width_mm = 24;
+            state.update_tape_pixels();
+            // Changing media affects the preview, never existing frame geometry.
+            let after = state.elements[1].as_object().unwrap();
+            assert_eq!(after.content_box.as_ref().unwrap(), &content);
+            assert_eq!(after.frame, frame);
+        }
+    }
+
+    #[test]
     fn selecting_and_hovering_targets_never_pin_or_change_the_saved_layout() {
         let mut state = AppState {
             document_version: 3,
@@ -1030,7 +1066,7 @@ mod tests {
         };
         state.select_canvas_target(Some(selected));
         let hint = state.canvas_hint().unwrap();
-        assert!(hint.starts_with("Selected Slot 2"));
+        assert!(hint.starts_with("Selected Frame 2"));
         assert!(hint.contains("0 following objects"));
         assert!(hint.contains("Drag border to move."));
         state.canvas_hover_target = Some(hovered);
@@ -1040,7 +1076,7 @@ mod tests {
         assert!(hint.contains("Click to select."));
         state.canvas_drag_target = Some(dragged);
         let hint = state.canvas_hint().unwrap();
-        assert!(hint.starts_with("Dragging Slot 1"));
+        assert!(hint.starts_with("Dragging Frame 1"));
         assert!(hint.contains("1 following object"));
         state.overall_flip_h = true;
         assert!(
@@ -1075,7 +1111,7 @@ mod tests {
                 assert_eq!(frame.position, PositionMode::Absolute);
                 assert_eq!(
                     (frame.width_mm, frame.height_mm, frame.y_mm),
-                    (10.0, 8.0, 0.0)
+                    (10.0, state.printable_height_mm(), 0.0)
                 );
                 frame.x_mm
             })

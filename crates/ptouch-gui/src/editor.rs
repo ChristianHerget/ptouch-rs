@@ -143,13 +143,13 @@ impl AppState {
             EditorAction::Add(element) => {
                 self.elements.push(element);
                 self.select_element(Some(self.elements.len() - 1));
-                "Add element"
+                "Add object"
             }
             EditorAction::Duplicate(index) => {
                 self.elements
                     .insert(index + 1, self.elements[index].clone());
                 self.select_element(Some(index + 1));
-                "Duplicate element"
+                "Duplicate object"
             }
             EditorAction::Delete(index) => {
                 self.elements.remove(index);
@@ -159,14 +159,14 @@ impl AppState {
                     Some(index.min(self.elements.len() - 1))
                 };
                 self.select_element(next);
-                "Delete element"
+                "Delete object"
             }
             EditorAction::Move { from, before } => {
                 let destination = if before > from { before - 1 } else { before };
                 let element = self.elements.remove(from);
                 self.elements.insert(destination, element);
                 self.select_element(Some(destination));
-                "Reorder element"
+                "Reorder object"
             }
             EditorAction::Undo | EditorAction::Redo | EditorAction::SelectCanvas(_) => {
                 unreachable!()
@@ -312,13 +312,13 @@ pub fn end_frame(ctx: &egui::Context, state: &mut AppState) {
 pub fn history_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     for (icon, name, shortcut, action) in [
         (
-            "↶",
+            crate::widgets::Icon::Undo,
             state.editor.history.undo_name(),
             shortcut(ui.ctx(), Modifiers::COMMAND, Key::Z),
             EditorAction::Undo,
         ),
         (
-            "↷",
+            crate::widgets::Icon::Redo,
             state.editor.history.redo_name(),
             shortcut(ui.ctx(), Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z),
             EditorAction::Redo,
@@ -333,9 +333,8 @@ pub fn history_buttons(ui: &mut egui::Ui, state: &mut AppState) {
             || format!("{verb} ({shortcut})"),
             |name| format!("{verb} {} ({shortcut})", name.to_lowercase()),
         );
-        let response = ui
-            .add_enabled(name.is_some(), egui::Button::new(icon))
-            .on_hover_text(help);
+        let response =
+            crate::widgets::icon_button(ui, icon, verb, name.is_some()).on_hover_text(help);
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, name.is_some(), verb)
         });
@@ -372,7 +371,7 @@ fn menu_contents(ui: &mut egui::Ui, state: &AppState, target: MenuTarget) -> Opt
         } else if ui
             .add_enabled(
                 crate::state::slot_frame(&state.elements[index]).is_some(),
-                egui::Button::new("Select slot"),
+                egui::Button::new("Select frame"),
             )
             .clicked()
         {
@@ -442,11 +441,11 @@ fn menu_contents(ui: &mut egui::Ui, state: &AppState, target: MenuTarget) -> Opt
 
 pub fn row_menu(ui: &mut egui::Ui, state: &AppState, index: usize) -> (Response, MenuResult) {
     let enabled = !egui::DragAndDrop::has_any_payload(ui.ctx()) && ui.ctx().dragged_id().is_none();
-    let response = ui
-        .add_enabled(enabled, egui::Button::new("⋯"))
-        .on_hover_text("Element actions");
+    let response =
+        crate::widgets::icon_button(ui, crate::widgets::Icon::Menu, "Object actions", enabled)
+            .on_hover_text("Object actions");
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Element actions")
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Object actions")
     });
     let key = response.id.with("target");
     let mut result = MenuResult::default();
@@ -768,8 +767,10 @@ mod menu_tests {
             },
             |ui| {
                 begin_frame(ui.ctx(), state);
-                egui::CentralPanel::default()
-                    .show(ui, |ui| crate::panels::sidebar::show_sidebar(ui, state));
+                egui::CentralPanel::default().show(ui, |ui| {
+                    crate::panels::toolbar::show_toolbar(ui, state);
+                    crate::panels::sidebar::show_sidebar(ui, state);
+                });
                 end_frame(ui.ctx(), state);
             },
         )
@@ -827,7 +828,7 @@ mod menu_tests {
         assert!(texts(&mut output, "Up").is_empty());
         assert!(texts(&mut output, "Down").is_empty());
         assert!(texts(&mut output, "Delete").is_empty());
-        let menus = texts(&mut output, "⋯");
+        let menus = crate::widgets::icon_positions(&ctx, crate::widgets::Icon::Menu);
         assert_eq!(menus.len(), 3);
         let mut output = click(&ctx, &mut state, menus[1]);
         assert_eq!(state.selected_element, Some(1));
@@ -839,14 +840,14 @@ mod menu_tests {
             state.elements[2],
             LabelElement::Padding { pixels: 20 }
         ));
-        let mut output = frame(&ctx, &mut state, vec![]);
-        let menu = texts(&mut output, "⋯")[2];
+        frame(&ctx, &mut state, vec![]).textures_delta.clear();
+        let menu = crate::widgets::icon_positions(&ctx, crate::widgets::Icon::Menu)[2];
         let mut output = click(&ctx, &mut state, menu);
         let delete = texts(&mut output, "Delete")[0];
         click(&ctx, &mut state, delete).textures_delta.clear();
         assert_eq!(state.elements.len(), 3);
-        let mut output = frame(&ctx, &mut state, vec![]);
-        let undo = texts(&mut output, "↶")[0];
+        frame(&ctx, &mut state, vec![]).textures_delta.clear();
+        let undo = crate::widgets::icon_positions(&ctx, crate::widgets::Icon::Undo)[0];
         click(&ctx, &mut state, undo).textures_delta.clear();
         assert_eq!(state.elements.len(), 4);
         assert_eq!(state.selected_element, Some(2));
@@ -857,8 +858,8 @@ mod menu_tests {
         let ctx = egui::Context::default();
         let mut state = fixture();
         frame(&ctx, &mut state, vec![]).textures_delta.clear();
-        let mut output = frame(&ctx, &mut state, vec![]);
-        let menu = texts(&mut output, "⋯")[0];
+        frame(&ctx, &mut state, vec![]).textures_delta.clear();
+        let menu = crate::widgets::icon_positions(&ctx, crate::widgets::Icon::Menu)[0];
         let mut output = click(&ctx, &mut state, menu);
         let old_duplicate = texts(&mut output, "Duplicate")[0];
         state.apply_editor_action(EditorAction::Duplicate(1));

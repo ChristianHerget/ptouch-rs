@@ -20,7 +20,7 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading(
         match state.selected_canvas_target().map(|target| target.edit) {
             Some(CanvasEditTarget::Content) => "Object properties",
-            Some(CanvasEditTarget::Slot) => "Slot properties",
+            Some(CanvasEditTarget::Slot) => "Frame properties",
             None => "Properties",
         },
     );
@@ -29,10 +29,30 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
     let selected = match state.selected_element {
         Some(idx) if idx < state.elements.len() => idx,
         _ => {
-            ui.label("Select an element to edit properties");
+            ui.label("Select an object to edit properties");
             return;
         }
     };
+
+    if state.elements[selected].as_object().is_some() {
+        ui.horizontal(|ui| {
+            for (edit, label) in [
+                (CanvasEditTarget::Content, "Object"),
+                (CanvasEditTarget::Slot, "Frame"),
+            ] {
+                let response = ui.selectable_label(state.canvas_edit_target == edit, label);
+                state.editor.surface(&response);
+                if response.clicked() {
+                    response.request_focus();
+                    state.select_canvas_target(Some(crate::state::CanvasTarget {
+                        element: selected,
+                        edit,
+                    }));
+                }
+            }
+        });
+        ui.separator();
+    }
 
     // We need to clone the element to avoid borrow issues, then write back.
     let before = state.content_snapshot();
@@ -206,8 +226,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
                 });
             TextBox {
                 x_mm,
-                height_mm: 8.0_f64
-                    .min(f64::from(state.tape_width_px) * 25.4 / f64::from(state.target_dpi())),
+                height_mm: state.printable_height_mm(),
                 ..TextBox::default()
             }
         });
@@ -226,7 +245,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     if let Some(bounds) = text_box {
         changed |= show_text_box(ui, bounds, state, true);
     } else {
-        ui.small("Natural width; follows the previous element.");
+        ui.small("Natural width; follows the previous object.");
     }
     ui.separator();
 
@@ -429,6 +448,15 @@ fn show_text_box(
     let minimum = 25.4 / f64::from(state.target_dpi());
     let printable_height = state.printable_height_mm();
     let mut height_changed = false;
+    let fill = ui.button("Fill printable height")
+        .on_hover_text("Set frame Y to 0 and height to the printable area. Manually sized content keeps its size and center offsets.");
+    state.editor.surface(&fill);
+    if fill.clicked() {
+        fill.request_focus();
+        state.editor.history.finish_group();
+        state.editor.changed_group = None;
+        changed |= fill_printable_height(bounds, printable_height);
+    }
     egui::Grid::new("object_frame_dimensions")
         .num_columns(2)
         .show(ui, |ui| {
@@ -497,6 +525,13 @@ fn show_text_box(
     changed
 }
 
+fn fill_printable_height(frame: &mut TextBox, printable_height: f64) -> bool {
+    let changed = frame.y_mm != 0.0 || frame.height_mm != printable_height;
+    frame.y_mm = 0.0;
+    frame.height_mm = printable_height;
+    changed
+}
+
 fn show_vertical_alignment(ui: &mut egui::Ui, align: &mut VerticalAlign) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -533,7 +568,7 @@ fn show_content_box(
 ) -> bool {
     let mut changed = false;
     let mut auto_fit = object.content_box.is_none();
-    if ui.checkbox(&mut auto_fit, "Auto fit slot").changed() {
+    if ui.checkbox(&mut auto_fit, "Auto fit frame").changed() {
         object.content_box = (!auto_fit).then(|| resolved.clone());
         changed = true;
     }
@@ -571,13 +606,13 @@ fn show_content_box(
         object.content_box = Some(dimensions);
     }
     ui.small(
-        "Offsets move the object's center from the slot center. Rotation keeps this object size.",
+        "Offsets move the object's center from the frame center. Rotation keeps this object size.",
     );
     if auto_fit {
-        ui.small("Auto fit follows the slot. Rotating or dragging fixes the current object size.");
-        ui.small("Previously clipped content may reappear when detached from the slot.");
+        ui.small("Auto fit follows the frame. Rotating or dragging fixes the current object size.");
+        ui.small("Previously clipped content may reappear when detached from the frame.");
     } else {
-        ui.small("Object content may extend beyond its slot. The printable tape edge clips it.");
+        ui.small("Object content may extend beyond its frame. The printable tape edge clips it.");
     }
     changed
 }
@@ -606,9 +641,9 @@ fn show_object_properties(
             changed
         }
         CanvasEditTarget::Slot => {
-            ui.label("Slot (template position and spacing)");
+            ui.label("Frame (template position and spacing)");
             let changed = show_text_box(ui, &mut object.frame, state, false);
-            ui.small("Slot dimensions control spacing. Resizing a slot does not scale a manually sized object.");
+            ui.small("Frame dimensions control spacing. Resizing a frame does not scale a manually sized object.");
             changed
         }
     };
@@ -628,7 +663,7 @@ fn show_object_properties(
                     .desired_rows(3),
             )
             .changed();
-            ui.small("Template variables such as {{port}} keep the slot in place.");
+            ui.small("Template variables such as {{port}} keep the frame in place.");
             changed |= show_font_properties(ui, font_size, align, true, state);
         }
         ObjectContent::Image {
@@ -677,7 +712,7 @@ fn show_object_properties(
             ui.small("A printed guide only; it does not trigger the cutter.");
         }
         ObjectContent::Padding => {
-            ui.label("Blank slot (converted padding)");
+            ui.label("Blank frame (converted padding)");
             ui.small("Keeps its extent and can anchor relative objects. Use positions or gaps for new spacing.");
         }
     }
@@ -915,6 +950,135 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32, state: &mut AppS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn properties_frame(
+        ctx: &egui::Context,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(340.0, 1100.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                crate::editor::begin_frame(ui.ctx(), state);
+                show_properties(ui, state);
+                crate::editor::end_frame(ui.ctx(), state);
+            },
+        )
+    }
+
+    fn click_property(ctx: &egui::Context, state: &mut AppState, label: &str) {
+        properties_frame(ctx, state, vec![]).textures_delta.clear();
+        let output = properties_frame(ctx, state, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing control: {label}"));
+        for pressed in [true, false] {
+            properties_frame(
+                ctx,
+                state,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        pressed,
+                        button: egui::PointerButton::Primary,
+                        modifiers: Default::default(),
+                    },
+                ],
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    #[test]
+    fn frame_switch_and_fill_preserve_manual_content_and_support_history() {
+        for manual in [false, true] {
+            let ctx = egui::Context::default();
+            let mut object = LabelObject::text(
+                "PORT1",
+                TextBox {
+                    x_mm: 5.0,
+                    y_mm: 2.0,
+                    width_mm: 14.0,
+                    height_mm: 4.0,
+                    ..TextBox::default()
+                },
+            );
+            if manual {
+                object.content_box = Some(ContentBox {
+                    width_mm: 8.0,
+                    height_mm: 3.0,
+                    offset_x_mm: 1.0,
+                    offset_y_mm: -0.5,
+                });
+            }
+            object.rotation = 17.0;
+            let mut state = AppState {
+                elements: vec![LabelElement::Object(object.clone())],
+                selected_element: Some(0),
+                needs_rerender: false,
+                ..AppState::default()
+            };
+            let before = state.document().to_toml_string().unwrap();
+            click_property(&ctx, &mut state, "Frame");
+            assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(state.editor.history.undo_name().is_none());
+            assert!(!state.needs_rerender);
+            click_property(&ctx, &mut state, "Fill printable height");
+            let filled = state.elements[0].as_object().unwrap();
+            assert_eq!(filled.frame.y_mm, 0.0);
+            assert_eq!(filled.frame.height_mm, state.printable_height_mm());
+            assert_eq!(filled.frame.width_mm, object.frame.width_mm);
+            assert_eq!(filled.frame.x_mm, object.frame.x_mm);
+            assert_eq!(filled.content_box, object.content_box);
+            assert_eq!(filled.rotation, object.rotation);
+            let history_key = |redo| egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    command: true,
+                    ctrl: !cfg!(target_os = "macos"),
+                    mac_cmd: cfg!(target_os = "macos"),
+                    shift: redo,
+                    ..Default::default()
+                },
+            };
+            properties_frame(&ctx, &mut state, vec![history_key(false)])
+                .textures_delta
+                .clear();
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(state.editor.history.undo_name().is_none());
+            properties_frame(&ctx, &mut state, vec![history_key(true)])
+                .textures_delta
+                .clear();
+            assert_eq!(
+                state.elements[0].as_object().unwrap().frame.height_mm,
+                state.printable_height_mm()
+            );
+            let filled_document = state.document().to_toml_string().unwrap();
+            click_property(&ctx, &mut state, "Object");
+            assert_eq!(state.canvas_edit_target, CanvasEditTarget::Content);
+            assert_eq!(state.document().to_toml_string().unwrap(), filled_document);
+        }
+    }
 
     #[test]
     fn viewing_properties_does_not_clamp_an_existing_design() {

@@ -123,6 +123,13 @@ impl RenderedPreview {
         f32::from(self.resolution.head_dpi) / f32::from(self.resolution.feed_dpi)
     }
 
+    pub fn tape_size(&self, tape_width_mm: u8) -> egui::Vec2 {
+        egui::vec2(
+            self.size().x,
+            f32::from(tape_width_mm) * f32::from(self.resolution.head_dpi) / 25.4,
+        )
+    }
+
     pub fn tile_rect(&self, tile: &PreviewTile, label_rect: egui::Rect, zoom: f32) -> egui::Rect {
         let pixel_scale = egui::vec2(self.feed_pixel_width() * zoom, zoom);
         let origin = egui::vec2(tile.origin[0] as f32, tile.origin[1] as f32);
@@ -190,6 +197,66 @@ impl DisplayScale {
 }
 
 /// One transform for print tiles, full tape, hit testing, and dimensions.
+pub struct TapeGeometry {
+    pub tape: egui::Rect,
+    pub print: egui::Rect,
+}
+
+impl TapeGeometry {
+    pub fn new(
+        preview: &RenderedPreview,
+        tape_width_mm: u8,
+        origin: egui::Pos2,
+        scale: f32,
+    ) -> Self {
+        let tape = egui::Rect::from_min_size(origin, preview.tape_size(tape_width_mm) * scale);
+        let print = egui::Rect::from_center_size(tape.center(), preview.size() * scale);
+        Self { tape, print }
+    }
+
+    pub fn paint_background(&self, painter: &egui::Painter) {
+        painter.rect_filled(self.tape, 0.0, egui::Color32::WHITE);
+        for (top, bottom) in [
+            (self.tape.top(), self.print.top()),
+            (self.print.bottom(), self.tape.bottom()),
+        ] {
+            if bottom > top {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(self.tape.left(), top),
+                        egui::pos2(self.tape.right(), bottom),
+                    ),
+                    0.0,
+                    egui::Color32::from_gray(225),
+                );
+            }
+        }
+    }
+
+    pub fn paint_outline(&self, painter: &egui::Painter) {
+        let visible = painter.clip_rect().intersect(self.tape);
+        for y in [self.print.top(), self.print.bottom()] {
+            let mut x = visible.left();
+            while x < visible.right() {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, y),
+                        egui::pos2((x + 4.0).min(visible.right()), y),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                );
+                x += 8.0;
+            }
+        }
+        painter.rect_stroke(
+            self.tape,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
 pub struct PreviewGeometry {
     pub tape: egui::Rect,
     pub print: egui::Rect,
@@ -212,10 +279,7 @@ impl PreviewView {
         content: egui::Rect,
         display: DisplayScale,
     ) -> PreviewGeometry {
-        let size = egui::vec2(
-            preview.size().x,
-            f32::from(tape_width_mm) * f32::from(preview.resolution.head_dpi) / 25.4,
-        );
+        let size = preview.tape_size(tape_width_mm);
         let actual = display.actual_head_scale(preview.resolution);
         let head_scale = match self.zoom {
             ZoomMode::Fit => (content.width() / size.x).min(content.height() / size.y),
@@ -234,7 +298,7 @@ impl PreviewView {
         }
         self.pan = self.pan.clamp(-limit, limit);
         let mut tape = egui::Rect::from_center_size(content.center() + self.pan, display_size);
-        let mut print = egui::Rect::from_center_size(tape.center(), preview.size() * head_scale);
+        let mut print = TapeGeometry::new(preview, tape_width_mm, tape.min, head_scale).print;
         if self.zoom == ZoomMode::Pixels {
             let origin = print.min;
             let snapped =
@@ -523,6 +587,47 @@ mod geometry_tests {
 
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 0.002, "{a} != {b}");
+    }
+
+    #[test]
+    fn tape_geometry_adds_margins_without_changing_print_coordinates() {
+        for (head, feed, height) in [
+            (180, 180, 76),
+            (180, 360, 76),
+            (360, 180, 150),
+            (360, 720, 150),
+        ] {
+            let preview = RenderedPreview::new(
+                &egui::Context::default(),
+                LabelBitmap::new(600, height),
+                PrintResolution {
+                    head_dpi: head,
+                    feed_dpi: feed,
+                },
+            );
+            for scale in [0.1, 1.0, 5.0] {
+                let origin = egui::pos2(-103.0, -27.0);
+                let geometry = TapeGeometry::new(&preview, 12, origin, scale);
+                close(
+                    geometry.tape.height() / (f32::from(head) / 25.4 * scale),
+                    12.0,
+                );
+                close(geometry.print.height(), height as f32 * scale);
+                close(
+                    geometry.print.top() - geometry.tape.top(),
+                    geometry.tape.bottom() - geometry.print.bottom(),
+                );
+                let tile = &preview.tiles[0];
+                close(
+                    preview.tile_rect(tile, geometry.print, scale).top(),
+                    geometry.print.top(),
+                );
+                close(
+                    preview.tile_rect(tile, geometry.print, scale).left(),
+                    geometry.print.left(),
+                );
+            }
+        }
     }
 
     #[test]

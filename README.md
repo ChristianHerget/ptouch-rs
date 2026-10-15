@@ -200,11 +200,12 @@ connections. Combine it with `--profiles-dir DIRECTORY` to select a profile coll
 The offline preview uses the layout's saved design DPI.
 
 - Label preview with Fit, approximate Actual size, and sharp Pixels presets
-- Millimeter rulers and Object/Slot editing for free layouts
-- Drag objects or slots to move them; drag list handles to reorder
+- Millimeter rulers and Object/Frame editing for free layouts
+- Drag objects or frames to move them; drag list handles to reorder
 - Legacy labels retain canvas drag-to-reorder and dimension guides
-- Duplicate or delete elements through row ⋯ menus or right-click menus
-- Undo/redo content, formatting, object transforms, and explicit layout conversion
+- Duplicate or delete objects through row action menus or right-click menus
+- Undo/redo in the top toolbar for content, formatting, object transforms, and explicit layout conversion
+- Add Text, Add Image, and Cut Mark directly below the Objects list
 - Pan free layouts with Space+drag, middle-drag, or scroll; legacy labels also allow dragging empty canvas
 - Add/edit text, images, cut marks, and legacy padding
 - Free-angle text rotation with auto font sizing
@@ -260,23 +261,24 @@ ptouch list
 
 ### Free layout and precise patch-panel labels
 
-New GUI layouts give text, images, and cut marks a millimeter **slot** for
-template position and spacing, plus an independent **object** box for content
+New GUI layouts give each text, image, or cut mark its own millimeter **frame**
+(the slot in the file format). A frame belongs to exactly one object. The frame controls
+template position and spacing. An independent **object** box controls content
 size and center offsets. In **Object** mode, dragging moves the content within
-or beyond its slot. Its square handle scales proportionally, including an
+or beyond its frame. Its square handle scales proportionally, including an
 explicit text font size; its round handle rotates the object and its handles
-without shrinking it back into the slot. **Slot** mode moves or resizes the
+without shrinking it back into the frame. **Frame** mode moves or resizes the
 template frame without scaling a manually sized object. Hover an object to
-preview its selection; elsewhere on the paper, its slot's X interval selects
-the slot. Overlapping slots prefer the nearest Y range, then list order.
-Only hovered/selected outlines appear, with dashed related slots shown faintly.
+preview its selection; elsewhere on the paper, its frame's X interval selects
+the frame. Overlapping frames prefer the nearest Y range, then list order.
+Only hovered/selected outlines appear, with dashed related frames shown faintly.
 Click selects the target; dragging keeps that target until release. Selection
 handles stay visible while hovering another element.
 
-Click an element row to select its object, or use its **Slot** button or the
-context menu. A selected dashed border also acts as a move handle when another
-object covers it. Moving a slot horizontally or changing its width updates the
-X positions of consecutive **After previous** objects; an absolute slot ends
+Click a row in **Objects** to select its object. Use the **Object / Frame**
+switch at the top of properties, or the context menu, to change editing targets.
+A selected dashed border also acts as a move handle when another object covers it. Moving a frame horizontally or changing its width updates the
+X positions of consecutive **After previous** objects; an absolute frame ends
 that chain. The bottom hint identifies the target and affected follower count.
 Hold Shift while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
 allow fine position adjustments (Shift moves 1 mm).
@@ -286,21 +288,26 @@ mirroring and whole-label vertical mirroring also allow mouse transforms. This
 avoids an ambiguous origin when the horizontally mirrored label changes length.
 The X and Y millimeter rulers remain visible while scrolling. Long previews
 use tiled textures, preserving every printer dot and its selection coordinates.
-The Y endpoint shows the actual printable height at the current DPI, which can
-be smaller than the nominal tape width.
+The preview shows the full tape with shaded unprintable margins. The Y ruler
+starts at the printable top and ends at the actual printable height; a separate
+dimension shows the nominal tape width. The Tape section reports printable
+height, dot count, DPI, and whether the preview uses a printer or design settings.
 
-New text starts as a 10 mm wide box with automatic font size; its height is
-8 mm or the printable height, whichever is smaller. The first object starts at
-X=0, Y=0. Subsequent slots start 3 mm after the rightmost slot, using absolute
+New text starts in a 10 mm wide frame with automatic font size and the full
+printable height. **Fill printable height** sets an existing frame to Y=0 and
+the printable height as one undoable edit. Auto-fit content follows the frame;
+manually sized content keeps its size and offsets from the frame center. Saved
+frames keep their dimensions when the tape or printer changes.
+The first object starts at X=0, Y=0. Subsequent frames start 3 mm after the rightmost frame, using absolute
 coordinates. Images keep their aspect ratio inside their object boxes.
 
 Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
 The source bytes are embedded in the saved `.ptl`, so reopening does not require
 the original image file. SVG sources should embed any linked images as well.
 
-Choose **After previous** to position a slot after the previous slot's right
-edge with a specified gap. Empty text still reserves the whole slot, so template
-values do not shift later ports. Dragging a relative slot changes its gap; if
+Choose **After previous** to position a frame after the previous frame's right
+edge with a specified gap. Empty text still reserves the whole frame, so template
+values do not shift later ports. Dragging a relative frame changes its gap; if
 it crosses to the left of its predecessor's right edge, it becomes absolute to
 allow overlap. Dragging list handles or using Alt+Up/Down changes composition order:
 absolute coordinates stay fixed, while relative objects follow their new
@@ -308,11 +315,11 @@ predecessors. Black pixels combine at overlaps; white pixels do not erase other
 objects. The list order also determines which overlapping object is selected.
 
 Object width and height describe the unrotated content box; offsets move its
-center relative to the slot center. Auto font size fits that box without
+center relative to the frame center. Auto font size fits that box without
 stretching letters; an explicit size uses points and clipped text raises a
-warning. Rotation keeps the object size and slot spacing. Content can overlap
-neighboring slots or extend the label length; the printable tape edges clip it
-with a warning. **Auto fit slot** restores the older fit-inside-slot behavior.
+warning. Rotation keeps the object size and frame spacing. Content can overlap
+neighboring frames or extend the label length; the printable tape edges clip it
+with a warning. **Auto fit frame** restores the older fit-inside-frame behavior.
 
 The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
 at 5, 18, and 31 mm, with 3 mm gaps:
@@ -330,17 +337,17 @@ ptouch print --layout examples/patch-panel.ptl \
 Coordinates start at the **printable area's top-left**, not the physical tape
 edge or cut. Printer feed and cutter offsets can add leading tape; verify those
 on the device before using the first coordinate as a cut-edge measurement.
-Each slot sets the next relative start to its own right edge, even if it was
-moved backwards with absolute positioning. Negative/non-finite slot coordinates,
-zero or excessive dimensions, and slots beyond the printable tape height are
+Each frame sets the next relative start to its own right edge, even if it was
+moved backwards with absolute positioning. Negative/non-finite frame coordinates,
+zero or excessive dimensions, and frames beyond the printable tape height are
 errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
 New free layouts use format version 4, which older builds reject. Versions 1,
 2, and 3 retain their original rendering and version when opened and saved
-unchanged. Objects without a `content_box` keep fitting inside their slots;
+unchanged. Objects without a `content_box` keep fitting inside their frames;
 their first Object move, resize, or rotation fixes the current content size and
-saves it as v4. Content previously clipped by the slot may reappear on that
+saves it as v4. Content previously clipped by the frame may reappear on that
 first edit. **Convert to free layout** preserves the exact dimensions of
 existing millimeter frames and resolves their positions without rounding
 through preview pixels. Legacy natural dimensions are frozen into physical
@@ -368,7 +375,7 @@ pixels, not the layout DPI or its millimeter coordinates.
 Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
 per print, or drive a batch from a CSV file. The GUI edits and saves placeholders
 but does not have a variable-value form; its preview shows the literal tokens.
-CLI substitution changes only text content, preserving slots, independent
+CLI substitution changes only text content, preserving frames, independent
 object dimensions, offsets, and rotation.
 
 By default, USB CSV batches print as one continuous strip, including all

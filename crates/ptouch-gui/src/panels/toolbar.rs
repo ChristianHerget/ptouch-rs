@@ -29,46 +29,8 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             ui.small("Legacy spacing stays unchanged until converted.");
         });
     }
-    ui.horizontal(|ui| {
-        // -- Element addition buttons --
-        if ui.button("Add Text").clicked() {
-            state.add_text();
-            info!("Added text element");
-        }
-
-        if ui.button("Add Image").clicked()
-            && let Some(path) = crate::widgets::image_file_dialog().pick_file()
-        {
-            // Read the original source bytes so the image is embedded in the
-            // label and stays self-contained when saved to a layout file.
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    if state.add_image_bytes(Some(path.clone()), bytes) {
-                        info!("Loaded image: {}", path.display());
-                    } else {
-                        error!("Unsupported or corrupt image: {}", path.display());
-                        state.status_message = format!("Image load error: {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to read image: {}", e);
-                    state.status_message = format!("Image read error: {}", e);
-                }
-            }
-        }
-
-        if ui.button("Cut Mark").clicked() {
-            state.add_cut_mark();
-            info!("Added cut mark");
-        }
-
-        if !state.is_free_layout() && ui.button("Padding").clicked() {
-            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Padding {
-                pixels: 20,
-            }));
-            info!("Added padding element");
-        }
-
+    ui.horizontal_wrapped(|ui| {
+        crate::editor::history_buttons(ui, state);
         ui.separator();
 
         // -- Action buttons --
@@ -128,6 +90,49 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
 
         if ui.button("Open Layout").clicked() {
             do_open_layout(state);
+        }
+    });
+}
+
+/// Creation controls live directly below the object list.
+pub fn show_add_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Add Text").clicked() {
+            state.add_text();
+            info!("Added text element");
+        }
+
+        if ui.button("Add Image").clicked()
+            && let Some(path) = crate::widgets::image_file_dialog().pick_file()
+        {
+            // Read the original source bytes so the image is embedded in the
+            // label and stays self-contained when saved to a layout file.
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if state.add_image_bytes(Some(path.clone()), bytes) {
+                        info!("Loaded image: {}", path.display());
+                    } else {
+                        error!("Unsupported or corrupt image: {}", path.display());
+                        state.status_message = format!("Image load error: {}", path.display());
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read image: {}", e);
+                    state.status_message = format!("Image read error: {}", e);
+                }
+            }
+        }
+
+        if ui.button("Cut Mark").clicked() {
+            state.add_cut_mark();
+            info!("Added cut mark");
+        }
+
+        if !state.is_free_layout() && ui.button("Padding").clicked() {
+            state.apply_editor_action(crate::editor::EditorAction::Add(LabelElement::Padding {
+                pixels: 20,
+            }));
+            info!("Added padding element");
         }
     });
 }

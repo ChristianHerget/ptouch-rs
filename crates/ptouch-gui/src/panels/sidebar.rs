@@ -21,6 +21,8 @@ pub fn show_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
         show_mirror_section(ui, state);
         ui.separator();
         show_elements_section(ui, state);
+        ui.add_space(6.0);
+        super::toolbar::show_add_controls(ui, state);
     });
     if state.element_drag(ui.ctx()).is_some()
         && let Some(pointer) = ui.ctx().pointer_interact_pos()
@@ -157,7 +159,12 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     } else {
         "design"
     };
-    ui.label(format!("Preview: {} DPI ({source})", state.target_dpi()));
+    ui.small(format!("Printable: {:.2} mm", state.printable_height_mm()));
+    ui.small(format!(
+        "{} dots at {} DPI ({source})",
+        state.tape_width_px,
+        state.target_dpi()
+    ));
     if !state.printer_connected
         && state.preview_uses_printer
         && ui.button("Use design DPI").clicked()
@@ -234,13 +241,10 @@ fn show_mirror_section(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Element list section with reorder and delete controls.
 fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        ui.heading("Elements");
-        crate::editor::history_buttons(ui, state);
-    });
+    ui.heading("Objects");
     ui.add_space(4.0);
     if state.elements.is_empty() {
-        ui.label("(no elements)");
+        ui.label("(no objects)");
         return;
     }
     let mut action = None;
@@ -255,10 +259,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         let label = format!("{}. {}", idx + 1, state.elements[idx].display_name());
         let row = ui.push_id(("element_row", idx), |ui| {
             ui.horizontal(|ui| {
-                let handle = ui
-                    .add(egui::Label::new("⠿").sense(egui::Sense::drag()))
+                let handle = crate::widgets::drag_handle(ui)
                     .on_hover_cursor(egui::CursorIcon::Grab)
-                    .on_hover_text("Drag to reorder; Alt+Up/Down moves the selected element");
+                    .on_hover_text("Drag to reorder; Alt+Up/Down moves the selected object");
                 state.editor.surface(&handle);
                 handle.dnd_set_drag_payload(crate::preview::ElementDrag {
                     index: idx,
@@ -268,7 +271,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                     handle.request_focus();
                     selection = Some(content_target(idx));
                 }
-                let width = (ui.available_width() - 78.0).max(1.0);
+                let width = (ui.available_width()
+                    - ui.spacing().interact_size.y
+                    - ui.spacing().item_spacing.x)
+                    .max(1.0);
                 let response = ui
                     .add_sized(
                         [width, ui.spacing().interact_size.y],
@@ -279,24 +285,6 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 if response.clicked() {
                     response.request_focus();
                     selection = Some(content_target(idx));
-                }
-                if crate::state::slot_frame(&state.elements[idx]).is_some()
-                    && ui
-                        .selectable_label(
-                            state.selected_canvas_target()
-                                == Some(CanvasTarget {
-                                    element: idx,
-                                    edit: CanvasEditTarget::Slot,
-                                }),
-                            "Slot",
-                        )
-                        .on_hover_text("Select template position and spacing")
-                        .clicked()
-                {
-                    selection = Some(CanvasTarget {
-                        element: idx,
-                        edit: CanvasEditTarget::Slot,
-                    });
                 }
                 let context = crate::editor::context_menu(&response, state, Some(idx));
                 selection = context.selection.map(content_target).or(selection);
@@ -372,16 +360,7 @@ mod tests {
                 egui::CentralPanel::default().show(ui, |ui| show_elements_section(ui, state));
             },
         );
-        let handles = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "⠿" => {
-                    Some(text.pos + text.galley.size() * 0.5)
-                }
-                _ => None,
-            })
-            .collect();
+        let handles = crate::widgets::icon_positions(ctx, crate::widgets::Icon::Grab);
         output.textures_delta.clear();
         handles
     }
@@ -524,19 +503,6 @@ mod free_layout_tests {
         output
     }
 
-    fn key_events(key: egui::Key) -> Vec<egui::Event> {
-        [true, false]
-            .into_iter()
-            .map(|pressed| egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed,
-                repeat: false,
-                modifiers: Default::default(),
-            })
-            .collect()
-    }
-
     fn pointer_event(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
             pos,
@@ -560,7 +526,7 @@ mod free_layout_tests {
     }
 
     #[test]
-    fn slot_keyboard_entry_row_click_and_context_menu_select_without_pinning() {
+    fn row_click_and_context_menu_select_without_pinning() {
         let mut state = AppState {
             document_version: 3,
             elements: vec![LabelElement::Object(LabelObject::text(
@@ -570,13 +536,14 @@ mod free_layout_tests {
             needs_rerender: false,
             ..AppState::default()
         };
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
         let before = state.document().to_toml_string().unwrap();
         let context = egui::Context::default();
         list_frame(&context, &mut state, vec![]);
-        list_frame(&context, &mut state, key_events(egui::Key::Tab));
-        list_frame(&context, &mut state, key_events(egui::Key::Tab));
-        list_frame(&context, &mut state, key_events(egui::Key::Tab));
-        let output = list_frame(&context, &mut state, key_events(egui::Key::Enter));
+        let output = list_frame(&context, &mut state, vec![]);
         assert_eq!(
             state.selected_canvas_target(),
             Some(CanvasTarget {
@@ -613,7 +580,7 @@ mod free_layout_tests {
             vec![pointer_event(row, egui::PointerButton::Secondary, false)],
         );
         let menu = list_frame(&context, &mut state, vec![]);
-        let slot = text_position(&menu, "Select slot");
+        let slot = text_position(&menu, "Select frame");
         list_frame(
             &context,
             &mut state,
