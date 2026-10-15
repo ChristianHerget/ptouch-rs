@@ -17,7 +17,13 @@ use crate::state::{AppState, CanvasEditTarget, LabelElement};
 
 /// Render the right-side properties panel.
 pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Properties");
+    ui.heading(
+        match state.selected_canvas_target().map(|target| target.edit) {
+            Some(CanvasEditTarget::Content) => "Object properties",
+            Some(CanvasEditTarget::Slot) => "Slot properties",
+            None => "Properties",
+        },
+    );
     ui.add_space(4.0);
 
     let selected = match state.selected_element {
@@ -572,19 +578,6 @@ fn show_object_properties(
             offset_x_mm: 0.0,
             offset_y_mm: 0.0,
         });
-    ui.horizontal(|ui| {
-        ui.label("Edit:");
-        ui.selectable_value(
-            &mut state.canvas_edit_target,
-            CanvasEditTarget::Content,
-            "Object",
-        );
-        ui.selectable_value(
-            &mut state.canvas_edit_target,
-            CanvasEditTarget::Slot,
-            "Slot",
-        );
-    });
     let mut changed = match state.canvas_edit_target {
         CanvasEditTarget::Content => {
             let mut changed = show_content_box(ui, object, &resolved, state);
