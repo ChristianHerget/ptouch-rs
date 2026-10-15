@@ -12,138 +12,166 @@ use ptouch_render::raster;
 
 use crate::state::{AppState, LabelElement, PrinterCommand};
 
-/// Render the top toolbar.
-pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
+/// Toolbar actions run after properties commit pending keyboard edits.
+#[derive(Clone, Copy)]
+pub enum ToolbarAction {
+    Convert,
+    AddText,
+    AddImage,
+    CutMark,
+    Padding,
+    Print,
+    Feed,
+    Cancel,
+    Export,
+    Save,
+    Open,
+}
+
+/// Render the toolbar without consuming a document that still has pending edits.
+pub fn show_toolbar(ui: &mut egui::Ui, state: &AppState) -> Option<ToolbarAction> {
+    let mut action = None;
     if !state.is_free_layout() {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Legacy objects (format v{})", state.document_version));
             if ui.button("Convert to free layout")
                 .on_hover_text("Fix every object's current position in millimeters. Natural font sizing and rotated image fitting may change; review the preview before saving.")
-                .clicked()
-            {
-                match state.convert_to_free_layout() {
-                    Ok(()) => state.status_message = "Converted to free layout. Review text sizing and rotated images before saving.".into(),
-                    Err(error) => state.status_message = format!("Conversion error: {error}"),
-                }
-            }
+                .clicked() { action = Some(ToolbarAction::Convert); }
             ui.small("Legacy spacing stays unchanged until converted.");
         });
     }
     ui.horizontal(|ui| {
-        // -- Element addition buttons --
-        if ui.button("Add Text").clicked() {
-            state.add_text();
-            info!("Added text element");
+        for (label, command) in [
+            ("Add Text", ToolbarAction::AddText),
+            ("Add Image", ToolbarAction::AddImage),
+            ("Cut Mark", ToolbarAction::CutMark),
+        ] {
+            if ui.button(label).clicked() {
+                action = Some(command);
+            }
         }
-
-        if ui.button("Add Image").clicked()
-            && let Some(path) = crate::widgets::image_file_dialog().pick_file()
+        if !state.is_free_layout() && ui.button("Padding").clicked() {
+            action = Some(ToolbarAction::Padding);
+        }
+        ui.separator();
+        let ready = state.printer_connected && !state.is_printer_busy();
+        let bitmap = state.preview_bitmap.is_some() && !state.needs_rerender;
+        if ui
+            .add_enabled(ready && bitmap, egui::Button::new("Print"))
+            .clicked()
         {
-            // Read the original source bytes so the image is embedded in the
-            // label and stays self-contained when saved to a layout file.
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    if state.add_image_bytes(Some(path.clone()), bytes) {
-                        info!("Loaded image: {}", path.display());
-                    } else {
-                        error!("Unsupported or corrupt image: {}", path.display());
-                        state.status_message = format!("Image load error: {}", path.display());
+            action = Some(ToolbarAction::Print);
+        }
+        if ui
+            .add_enabled(
+                ready && !state.printer_target.is_bluetooth(),
+                egui::Button::new("Feed & Cut"),
+            )
+            .clicked()
+        {
+            action = Some(ToolbarAction::Feed);
+        }
+        if state.operation_in_progress
+            && !state.printer_target.is_bluetooth()
+            && ui.button("Cancel").clicked()
+        {
+            action = Some(ToolbarAction::Cancel);
+        }
+        if ui
+            .add_enabled(bitmap, egui::Button::new("Export Image"))
+            .clicked()
+        {
+            action = Some(ToolbarAction::Export);
+        }
+        ui.separator();
+        if ui.button("Save Layout").clicked() {
+            action = Some(ToolbarAction::Save);
+        }
+        if ui.button("Open Layout").clicked() {
+            action = Some(ToolbarAction::Open);
+        }
+    });
+    action
+}
+
+pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
+    match action {
+        ToolbarAction::Convert => match state.convert_to_free_layout() {
+            Ok(()) => {
+                state.status_message =
+                    "Converted to free layout. Review text sizing and rotated images before saving."
+                        .into()
+            }
+            Err(error) => state.status_message = format!("Conversion error: {error}"),
+        },
+        ToolbarAction::AddText => state.add_text(),
+        ToolbarAction::AddImage => {
+            if let Some(path) = crate::widgets::image_file_dialog().pick_file() {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        if state.add_image_bytes(Some(path.clone()), bytes) {
+                            info!("Loaded image: {}", path.display());
+                        } else {
+                            state.status_message = format!("Image load error: {}", path.display());
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to read image: {}", e);
-                    state.status_message = format!("Image read error: {}", e);
+                    Err(error) => state.status_message = format!("Image read error: {error}"),
                 }
             }
         }
-
-        if ui.button("Cut Mark").clicked() {
-            state.add_cut_mark();
-            info!("Added cut mark");
-        }
-
-        if !state.is_free_layout() && ui.button("Padding").clicked() {
+        ToolbarAction::CutMark => state.add_cut_mark(),
+        ToolbarAction::Padding => {
             state.elements.push(LabelElement::Padding { pixels: 20 });
             state.selected_element = Some(state.elements.len() - 1);
             state.mark_dirty();
-            info!("Added padding element");
         }
-
-        ui.separator();
-
-        // -- Action buttons --
-        let connected = state.printer_connected;
-        let busy = state.is_printer_busy();
-        let has_bitmap = state.preview_bitmap.is_some() && !state.needs_rerender;
-
-        if ui
-            .add_enabled(connected && !busy && has_bitmap, egui::Button::new("Print"))
-            .clicked()
-            && let Some(ref bitmap) = state.preview_bitmap
-        {
-            let raster_lines = raster::bitmap_to_raster_lines(bitmap, state.printer_max_px);
-            let chain_print = !state.auto_cut;
-            let auto_cut = state.auto_cut;
-            if let Some(ref tx) = state.printer_cmd_tx {
+        ToolbarAction::Print => {
+            if !state.printer_connected || state.is_printer_busy() || state.needs_rerender {
+                return;
+            }
+            if let Some(bitmap) = &state.preview_bitmap
+                && let Some(tx) = &state.printer_cmd_tx
+            {
                 let cancellation = ptouch_core::CancellationToken::default();
                 state.cancellation = Some(cancellation.clone());
                 let _ = tx.send(PrinterCommand::Print {
-                    raster_lines,
-                    chain_print,
-                    auto_cut,
+                    raster_lines: raster::bitmap_to_raster_lines(bitmap, state.printer_max_px),
+                    chain_print: !state.auto_cut,
+                    auto_cut: state.auto_cut,
                     quality: state.print_quality,
                     target: state.printer_target.clone(),
                     cancellation,
                 });
                 state.operation_in_progress = true;
-                state.status_message = "Printing...".to_string();
+                state.status_message = "Printing...".into();
             }
         }
-
-        if ui
-            .add_enabled(
-                connected && !busy && !state.printer_target.is_bluetooth(),
-                egui::Button::new("Feed & Cut"),
-            )
-            .clicked()
-            && let Some(ref tx) = state.printer_cmd_tx
-        {
-            let cancellation = ptouch_core::CancellationToken::default();
-            state.cancellation = Some(cancellation.clone());
-            let _ = tx.send(PrinterCommand::FeedAndCut {
-                target: state.printer_target.clone(),
-                cancellation,
-            });
-            state.operation_in_progress = true;
-            state.status_message = "Feeding & cutting...".to_string();
+        ToolbarAction::Feed => {
+            if state.printer_connected
+                && !state.is_printer_busy()
+                && !state.printer_target.is_bluetooth()
+                && let Some(tx) = &state.printer_cmd_tx
+            {
+                let cancellation = ptouch_core::CancellationToken::default();
+                state.cancellation = Some(cancellation.clone());
+                let _ = tx.send(PrinterCommand::FeedAndCut {
+                    target: state.printer_target.clone(),
+                    cancellation,
+                });
+                state.operation_in_progress = true;
+                state.status_message = "Feeding & cutting...".into();
+            }
         }
-
-        if state.operation_in_progress
-            && !state.printer_target.is_bluetooth()
-            && ui.button("Cancel").clicked()
-            && let Some(token) = &state.cancellation
-        {
-            token.cancel();
+        ToolbarAction::Cancel => {
+            if let Some(token) = &state.cancellation {
+                token.cancel();
+            }
             state.status_message = "Cancelling; sent data may still print".into();
         }
-
-        if ui
-            .add_enabled(has_bitmap, egui::Button::new("Export Image"))
-            .clicked()
-        {
-            do_export_image(state);
-        }
-
-        ui.separator();
-
-        if ui.button("Save Layout").clicked() {
-            do_save_layout(state);
-        }
-
-        if ui.button("Open Layout").clicked() {
-            do_open_layout(state);
-        }
-    });
+        ToolbarAction::Export => do_export_image(state),
+        ToolbarAction::Save => do_save_layout(state),
+        ToolbarAction::Open => do_open_layout(state),
+    }
 }
 
 /// Save the current design to a `.ptl` layout file (TOML with embedded images).
@@ -239,7 +267,8 @@ fn apply_layout(state: &mut AppState, document: LabelDocument) -> Result<(), Str
     state.overall_flip_h = document.flip_h;
     state.overall_flip_v = document.flip_v;
     state.elements = document.elements;
-    state.selected_element = None;
+    state.select_canvas_target(None);
+    state.selection_revision = state.selection_revision.wrapping_add(1);
     state.mark_dirty();
     Ok(())
 }

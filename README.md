@@ -231,6 +231,10 @@ The X and Y millimeter rulers remain visible while scrolling and follow the
 original print pixels even when a long preview texture is reduced for display.
 The Y endpoint shows the actual printable height at the current DPI, which can
 be smaller than the nominal tape width.
+Numeric fields accept either `14.5` or `14,5`; press Enter or leave the field to
+apply the complete value. The tape panel shows the printable height separately.
+Object and slot outlines use their physical dimensions, independently of print
+pixel rounding, so equal boxes share an edge.
 
 New text starts as a 10 mm wide box with automatic font size; its height is
 8 mm or the printable height, whichever is smaller. The first object starts at

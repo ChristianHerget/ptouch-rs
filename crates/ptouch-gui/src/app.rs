@@ -208,31 +208,21 @@ impl PtouchApp {
     }
 }
 
-impl eframe::App for PtouchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl PtouchApp {
+    fn show_editor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_printer_responses();
 
         // Top toolbar
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            panels::toolbar::show_toolbar(ui, &mut self.state);
-        });
+        let toolbar_action = egui::Panel::top("toolbar")
+            .show(ui, |ui| panels::toolbar::show_toolbar(ui, &self.state))
+            .inner;
 
         // Bottom status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             panels::status_bar::show_status_bar(ui, &self.state);
         });
 
-        // Left sidebar
-        egui::Panel::left("sidebar")
-            .default_size(200.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                panels::sidebar::show_sidebar(ui, &mut self.state);
-            });
-
-        // Reordering or opening a file invalidates geometry by element index.
-        // Properties must freeze the current object's geometry on first edit.
         if self.state.needs_rerender {
             self.update_preview(&ctx);
         }
@@ -246,6 +236,22 @@ impl eframe::App for PtouchApp {
                     panels::properties::show_properties(ui, &mut self.state);
                 });
             });
+
+        // Commit the old selection's numeric input before selecting/reordering
+        // another element. The panels keep their usual visual positions.
+        egui::Panel::left("sidebar")
+            .default_size(200.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                panels::sidebar::show_sidebar(ui, &mut self.state);
+            });
+
+        if self.state.needs_rerender {
+            self.update_preview(&ctx);
+        }
+        if let Some(action) = toolbar_action {
+            panels::toolbar::execute_action(&mut self.state, action);
+        }
 
         // Numeric edits and pointer gestures can arrive in the same frame.
         if self.state.needs_rerender {
@@ -275,6 +281,12 @@ impl eframe::App for PtouchApp {
 
         // Periodic repaint so we pick up worker responses even when idle
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+}
+
+impl eframe::App for PtouchApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_editor(ui);
     }
 }
 
@@ -338,6 +350,131 @@ mod tests {
                 quality_modes: false,
                 tape_width_px: 128,
             },
+        }
+    }
+
+    #[test]
+    fn pending_numeric_edits_do_not_leak_through_toolbar_or_list_selection() {
+        use ptouch_render::document::{LabelElement, LabelObject, TextBox};
+        for add in [false, true] {
+            let mut state = AppState {
+                selected_element: Some(0),
+                canvas_edit_target: crate::state::CanvasEditTarget::Slot,
+                ..Default::default()
+            };
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "PORT",
+                TextBox {
+                    width_mm: 14.5,
+                    ..Default::default()
+                },
+            )));
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "NEXT",
+                TextBox {
+                    x_mm: 30.0,
+                    width_mm: 20.0,
+                    ..Default::default()
+                },
+            )));
+            let (mut app, _tx) = app(state);
+            let ctx = egui::Context::default();
+            let mut frame = |events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 680.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.show_editor(ui),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let center = |output: &egui::FullOutput, text: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|s| {
+                        if let egui::Shape::Text(t) = &s.shape
+                            && t.galley.job.text == text
+                        {
+                            Some(t.pos + t.galley.size() / 2.0)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing text: {text}; visible: {:?}",
+                            output
+                                .shapes
+                                .iter()
+                                .filter_map(|s| if let egui::Shape::Text(t) = &s.shape {
+                                    Some(&t.galley.job.text)
+                                } else {
+                                    None
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    })
+            };
+            let click = |pos| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            frame(vec![]);
+            let output = frame(vec![]);
+            let input = center(&output, "14.5");
+            let action = if add {
+                center(&output, "Add Text")
+            } else {
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|s| {
+                        if let egui::Shape::Text(t) = &s.shape
+                            && t.galley.job.text == "Slot"
+                        {
+                            Some(t.pos + t.galley.size() / 2.0)
+                        } else {
+                            None
+                        }
+                    })
+                    .nth(1)
+                    .unwrap()
+            };
+            frame(click(input));
+            frame(vec![]);
+            frame(vec![egui::Event::Text("14,6".into())]);
+            frame(click(action));
+            frame(vec![]);
+            assert_eq!(
+                app.state.elements[0].as_object().unwrap().frame.width_mm,
+                14.6
+            );
+            assert_eq!(app.state.elements.len(), if add { 3 } else { 2 });
+            assert_eq!(app.state.selected_element, Some(if add { 2 } else { 1 }));
+            assert_eq!(
+                app.state.elements[1].as_object().unwrap().frame.width_mm,
+                20.0
+            );
         }
     }
 
