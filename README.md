@@ -265,7 +265,10 @@ objects. The list order also determines which overlapping object is selected.
 Object width and height describe the unrotated content box; offsets move its
 center relative to the slot center. Auto font size fits that box without
 stretching letters; an explicit size uses points and clipped text raises a
-warning. Rotation keeps the object size and slot spacing. Content can overlap
+warning. **Line spacing** controls baseline distance as a multiple of font size
+(0.5–3.0); 1.20 preserves the original spacing. Reduce it for compact multiline
+labels. Custom values are saved as `line_spacing` in the text object's
+`[elements.content]` table. Rotation keeps the object size and slot spacing. Content can overlap
 neighboring slots or extend the label length; the printable tape edges clip it
 with a warning. **Auto fit slot** restores the older fit-inside-slot behavior.
 
@@ -291,9 +294,9 @@ zero or excessive dimensions, and slots beyond the printable tape height are
 errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
-New free layouts use format version 4, which older builds reject. Versions 1,
-2, and 3 retain their original rendering and version when opened and saved
-unchanged. Objects without a `content_box` keep fitting inside their slots;
+New free layouts use format version 4. Non-default line spacing requires version
+5, which older builds reject. Versions 1–4 retain their original rendering and
+version when opened and saved without using this new setting. Objects without a `content_box` keep fitting inside their slots;
 their first Object move, resize, or rotation fixes the current content size and
 saves it as v4. Content previously clipped by the slot may reappear on that
 first edit. **Convert to free layout** preserves the exact dimensions of
