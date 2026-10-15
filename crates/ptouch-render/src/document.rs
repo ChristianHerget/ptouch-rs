@@ -27,8 +27,10 @@ pub use crate::layout::{
     VerticalAlign, render_document,
 };
 
-/// Current on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 4;
+/// Newest supported on-disk layout format version.
+pub const DOCUMENT_VERSION: u32 = 5;
+/// New layouts need v5 only when custom line spacing is used.
+pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
 fn default_dpi() -> u16 {
@@ -69,18 +71,8 @@ impl LabelDocument {
         // Never write positioning fields under v1: older builds would silently
         // ignore them. Ordinary v1 documents can still round-trip as v1.
         let mut doc = self.clone();
-        if doc.has_text_boxes() {
-            doc.version = doc.version.max(2);
-        }
-        if doc
-            .elements
-            .iter()
-            .any(|element| element.as_object().is_some())
-        {
-            doc.version = doc.version.max(3);
-        }
-        if doc.has_content_boxes() {
-            doc.version = doc.version.max(4);
+        for element in &doc.elements {
+            doc.version = doc.version.max(element.minimum_version());
         }
         Ok(toml::to_string(&doc)?)
     }
@@ -123,6 +115,14 @@ impl LabelDocument {
             ));
         }
         for object in doc.elements.iter().filter_map(LabelElement::as_object) {
+            if let ObjectContent::Text { line_spacing, .. } = &object.content {
+                crate::text::validate_line_spacing(*line_spacing)?;
+                if *line_spacing != crate::text::DEFAULT_LINE_SPACING && doc.version < 5 {
+                    return Err(RenderError::Layout(
+                        "custom line spacing requires layout version 5".into(),
+                    ));
+                }
+            }
             if let Some(content_box) = &object.content_box {
                 content_box.validate()?;
             }
@@ -363,6 +363,12 @@ pub enum ObjectContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         font_size: Option<f32>,
         align: TextAlign,
+        /// Baseline distance in multiples of font size; custom values require v5.
+        #[serde(
+            default = "crate::text::default_line_spacing",
+            skip_serializing_if = "crate::text::is_default_line_spacing"
+        )]
+        line_spacing: f32,
     },
     Image {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -388,6 +394,7 @@ impl LabelObject {
             content: ObjectContent::Text {
                 content: content.into(),
                 font_size: None,
+                line_spacing: crate::text::DEFAULT_LINE_SPACING,
                 align: TextAlign::Left,
             },
         }
@@ -415,6 +422,27 @@ impl LabelObject {
 }
 
 impl LabelElement {
+    /// Minimum reader version needed to preserve this element's rendering.
+    pub fn minimum_version(&self) -> u32 {
+        match self {
+            Self::Object(object) => {
+                if let ObjectContent::Text { line_spacing, .. } = &object.content
+                    && *line_spacing != crate::text::DEFAULT_LINE_SPACING
+                {
+                    5
+                } else if object.content_box.is_some() {
+                    4
+                } else {
+                    3
+                }
+            }
+            Self::Text {
+                text_box: Some(_), ..
+            } => 2,
+            _ => 1,
+        }
+    }
+
     pub fn as_object(&self) -> Option<&LabelObject> {
         match self {
             Self::Object(object) => Some(object),
@@ -913,6 +941,53 @@ mod tests {
         assert_eq!(doc.elements[0].as_object().unwrap().frame, frame);
         doc.version = 1;
         assert!(doc.to_toml_string().unwrap().contains("version = 3"));
+    }
+
+    #[test]
+    fn custom_spacing_round_trips_templates_and_only_upgrades_when_needed() {
+        let mut doc = LabelDocument {
+            version: 3,
+            tape_width_mm: 12,
+            dpi: 180,
+            font_name: String::new(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::Object(LabelObject::text(
+                "{{port}}\nLAN\nSWITCH",
+                TextBox::default(),
+            ))],
+        };
+        let old = doc.to_toml_string().unwrap();
+        assert!(old.contains("version = 3"));
+        assert!(!old.contains("line_spacing"));
+        if let ObjectContent::Text { line_spacing, .. } =
+            &mut doc.elements[0].as_object_mut().unwrap().content
+        {
+            *line_spacing = 0.9;
+        }
+        let encoded = doc.to_toml_string().unwrap();
+        assert!(encoded.contains("version = 5"));
+        assert!(encoded.contains("line_spacing = 0.9"));
+        assert!(
+            LabelDocument::from_toml_str(&encoded.replace("version = 5", "version = 4")).is_err()
+        );
+        let mut restored = LabelDocument::from_toml_str(&encoded).unwrap();
+        assert_eq!(restored.to_toml_string().unwrap(), encoded);
+        restored.apply_values(&BTreeMap::from([("port".into(), "PORT 1".into())]));
+        assert_eq!(
+            restored.elements[0].text_content(),
+            Some("PORT 1\nLAN\nSWITCH")
+        );
+        assert!(
+            matches!(restored.elements[0].as_object().unwrap().content, ObjectContent::Text { line_spacing, .. } if line_spacing == 0.9)
+        );
+        assert!(
+            LabelDocument::from_toml_str(
+                &encoded.replace("line_spacing = 0.9", "line_spacing = nan")
+            )
+            .is_err()
+        );
     }
 
     #[test]

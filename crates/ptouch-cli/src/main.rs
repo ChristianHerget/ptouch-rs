@@ -1470,6 +1470,100 @@ mod tests {
     }
 
     #[test]
+    fn v5_spacing_survives_set_and_csv_and_matches_shared_rendering() {
+        let dir = std::env::temp_dir().join(format!("ptouch-v5-spacing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (dpi, height) in [(180, 76), (360, 150)] {
+            let mut object = LabelObject::text(
+                "{{port}}\nLAN\nSWITCH",
+                TextBox {
+                    x_mm: 5.0,
+                    width_mm: 20.0,
+                    height_mm: 10.0,
+                    ..Default::default()
+                },
+            );
+            object.content_box = Some(ContentBox {
+                width_mm: 20.0,
+                height_mm: 10.0,
+                offset_x_mm: 0.0,
+                offset_y_mm: 0.0,
+            });
+            if let ObjectContent::Text {
+                font_size,
+                line_spacing,
+                ..
+            } = &mut object.content
+            {
+                *font_size = Some(6.0);
+                *line_spacing = 0.9;
+            }
+            let doc = LabelDocument {
+                version: 4,
+                tape_width_mm: 12,
+                dpi,
+                font_name: "DejaVu Sans".into(),
+                font_margin: 0,
+                flip_h: false,
+                flip_v: false,
+                elements: vec![LabelElement::Object(object)],
+            };
+            let serialized = doc.to_toml_string().unwrap();
+            let doc = LabelDocument::from_toml_str(&serialized).unwrap();
+            assert_eq!(doc.version, 5);
+            let layout = dir.join(format!("spacing-{dpi}.ptl"));
+            let csv = dir.join("ports.csv");
+            std::fs::write(&layout, &serialized).unwrap();
+            std::fs::write(&csv, "port\nPORT1\n\"\"\n").unwrap();
+            let batch_output = dir.join(format!("csv-{dpi}-{{n}}.png"));
+            execute_print(
+                &batch_args(&[
+                    "--layout",
+                    layout.to_str().unwrap(),
+                    "--csv",
+                    csv.to_str().unwrap(),
+                    "--output",
+                    batch_output.to_str().unwrap(),
+                ]),
+                &[],
+            )
+            .unwrap();
+            for (row, value) in [(1, "PORT1"), (2, "")] {
+                let single_output = dir.join(format!("set-{dpi}-{row}.png"));
+                execute_print(
+                    &batch_args(&[
+                        "--layout",
+                        layout.to_str().unwrap(),
+                        "--set",
+                        &format!("port={value}"),
+                        "--output",
+                        single_output.to_str().unwrap(),
+                    ]),
+                    &[],
+                )
+                .unwrap();
+                let mut filled = doc.clone();
+                filled.apply_values(&std::collections::BTreeMap::from([(
+                    "port".into(),
+                    value.into(),
+                )]));
+                let expected =
+                    document::render_document(&filled, height, dpi, &mut TextRenderer::new())
+                        .unwrap()
+                        .bitmap
+                        .unwrap();
+                assert_eq!(load_export(&single_output).data(), expected.data());
+                assert_eq!(
+                    load_export(&dir.join(format!("csv-{dpi}-{row}.png"))).data(),
+                    expected.data()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(layout).unwrap(), serialized);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn v4_saved_layout_set_export_keeps_independent_geometry_at_design_dpi() {
         let dir = std::env::temp_dir().join(format!("ptouch-v4-set-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

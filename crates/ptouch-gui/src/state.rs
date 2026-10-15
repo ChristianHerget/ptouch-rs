@@ -8,8 +8,8 @@ use std::sync::mpsc;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_render::bitmap::LabelBitmap;
 use ptouch_render::document::{
-    ContentBox, ContentGeometry, DOCUMENT_VERSION, ElementBounds, LabelDocument, LabelObject,
-    ObjectContent, PositionMode, TextBox,
+    ContentBox, ContentGeometry, DEFAULT_DOCUMENT_VERSION, ElementBounds, LabelDocument,
+    LabelObject, ObjectContent, PositionMode, TextBox,
 };
 use ptouch_render::text::{TextAlign, TextRenderer};
 
@@ -217,7 +217,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            document_version: DOCUMENT_VERSION,
+            document_version: DEFAULT_DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
             selection_revision: 0,
@@ -375,14 +375,7 @@ impl AppState {
             .elements
             .iter()
             .fold(self.document_version, |version, element| {
-                version.max(match element {
-                    LabelElement::Object(object) if object.content_box.is_some() => 4,
-                    LabelElement::Object(_) => 3,
-                    LabelElement::Text {
-                        text_box: Some(_), ..
-                    } => 2,
-                    _ => 1,
-                })
+                version.max(element.minimum_version())
             });
         LabelDocument {
             version,
@@ -928,6 +921,7 @@ mod tests {
             ObjectContent::Text {
                 content: "{{port}}".into(),
                 font_size: Some(9.0),
+                line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
                 align: TextAlign::Right,
             },
             image.content,
@@ -1042,9 +1036,46 @@ mod tests {
     }
 
     #[test]
+    fn line_spacing_upgrades_render_and_save_together_and_survives_duplication() {
+        let mut state = AppState::default();
+        state.add_text();
+        assert_eq!(state.document().version, 4);
+        if let ObjectContent::Text { line_spacing, .. } =
+            &mut state.elements[0].as_object_mut().unwrap().content
+        {
+            *line_spacing = 0.9;
+        }
+        assert_eq!(state.document().version, 5);
+        assert!(state.duplicate_selected());
+        let saved = state.document().to_toml_string().unwrap();
+        let restored = LabelDocument::from_toml_str(&saved).unwrap();
+        assert_eq!(restored.version, 5);
+        for element in &restored.elements {
+            assert!(
+                matches!(element.as_object().unwrap().content, ObjectContent::Text { line_spacing, .. } if line_spacing == 0.9)
+            );
+        }
+        for element in &mut state.elements {
+            if let ObjectContent::Text { line_spacing, .. } =
+                &mut element.as_object_mut().unwrap().content
+            {
+                *line_spacing = ptouch_render::text::DEFAULT_LINE_SPACING;
+            }
+        }
+        assert_eq!(state.document().version, 4);
+        assert!(
+            !state
+                .document()
+                .to_toml_string()
+                .unwrap()
+                .contains("line_spacing")
+        );
+    }
+
+    #[test]
     fn new_objects_have_independent_frames_after_the_furthest_right_edge() {
         let mut state = AppState::default();
-        assert_eq!(state.document_version, DOCUMENT_VERSION);
+        assert_eq!(state.document_version, DEFAULT_DOCUMENT_VERSION);
         state.add_text();
         state.add_text();
         let first = state.elements[0].as_object_mut().unwrap();
