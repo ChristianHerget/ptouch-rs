@@ -266,6 +266,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             selection = Some(object_target);
         }
         response.context_menu(|ui| {
+            if ui.button("Duplicate").clicked() {
+                action = Some(ElementAction::Duplicate(idx));
+                ui.close();
+            }
             if ui.button("Select object").clicked() {
                 selection = Some(object_target);
                 ui.close();
@@ -297,8 +301,16 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let has_selection = state.selected_element.is_some();
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Duplicate"))
+            .on_hover_text("Copy after this element, keeping its settings (Ctrl+D / Cmd+D)")
+            .clicked()
+            && let Some(idx) = state.selected_element
+        {
+            action = Some(ElementAction::Duplicate(idx));
+        }
 
         if ui
             .add_enabled(
@@ -338,6 +350,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     // Apply deferred action
     if let Some(act) = action {
         match act {
+            ElementAction::Duplicate(idx) => {
+                state.duplicate_element(idx);
+            }
             ElementAction::MoveUp(idx) => {
                 if idx > 0 {
                     move_element(state, idx, idx - 1);
@@ -381,6 +396,7 @@ fn move_element(state: &mut AppState, from: usize, to: usize) {
 
 /// Deferred actions for element list manipulation.
 enum ElementAction {
+    Duplicate(usize),
     MoveUp(usize),
     MoveDown(usize),
     MoveTo(usize, usize),
