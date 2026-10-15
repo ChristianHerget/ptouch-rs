@@ -131,6 +131,8 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
         "design"
     };
     ui.label(format!("Preview: {} DPI ({source})", state.target_dpi()));
+    ui.small(format!("Printable height: {:.2} mm", state.printable_height_mm()))
+        .on_hover_text("The printable area is narrower than the nominal tape. Layout Y coordinates start at its top edge.");
     if !state.printer_connected
         && state.preview_uses_printer
         && ui.button("Use design DPI").clicked()
@@ -367,6 +369,7 @@ fn move_element(state: &mut AppState, from: usize, to: usize) {
     }
     let element = state.elements.remove(from);
     state.elements.insert(to, element);
+    state.selection_revision = state.selection_revision.wrapping_add(1);
     state.select_canvas_target(Some(CanvasTarget {
         element: to,
         edit: state.canvas_edit_target,
