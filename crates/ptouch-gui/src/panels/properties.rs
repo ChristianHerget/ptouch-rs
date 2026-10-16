@@ -622,6 +622,7 @@ fn show_object_properties(
             content,
             font_size,
             align,
+            line_spacing,
         } => {
             ui.label("Text Content:");
             changed |= ui
@@ -633,6 +634,14 @@ fn show_object_properties(
                 .changed();
             ui.small("Template variables such as {{port}} keep the slot in place.");
             changed |= show_font_properties(ui, font_size, align, true, state);
+            ui.horizontal(|ui| {
+                ui.label("Line spacing:");
+                changed |= ui.add(crate::widgets::decimal_drag(line_spacing)
+                    .range(ptouch_render::text::LINE_SPACING_RANGE)
+                    .speed(0.05).min_decimals(2).max_decimals(2).suffix(" ×"))
+                    .on_hover_text("Baseline distance as a multiple of font size. 1.20 keeps the original spacing.")
+                    .changed();
+            });
         }
         ObjectContent::Image {
             path,
