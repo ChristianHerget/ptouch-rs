@@ -643,6 +643,7 @@ pub fn show(
             != selected_style.font_name.as_deref().unwrap_or(default_font)
     });
     ComboBox::from_id_salt(id.with("font"))
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .selected_text(if mixed_font {
             "Mixed fonts"
         } else {
@@ -658,6 +659,7 @@ pub fn show(
                 .selectable_label(selected_style.font_name.is_none(), "Inherit label font")
                 .clicked()
             {
+                ui.close();
                 action = Some(Action::Format(StylePatch {
                     font_name: Some(None),
                     ..Default::default()
@@ -671,6 +673,7 @@ pub fn show(
                     .selectable_label(selected_style.font_name.as_ref() == Some(font), font)
                     .clicked()
                 {
+                    ui.close();
                     action = Some(Action::Format(StylePatch {
                         font_name: Some(Some(font.clone())),
                         ..Default::default()
@@ -753,7 +756,7 @@ mod tests {
                         *id,
                         "DejaVu Sans",
                         12.0,
-                        &[],
+                        &["DejaVu Serif".into()],
                     );
                 },
             );
@@ -852,6 +855,61 @@ mod tests {
         assert_eq!(h.document.style_at(0).font_size, Some(18.0));
         assert_eq!(h.document.style_at(1).font_size, Some(18.0));
         assert_eq!(h.document.style_at(2).font_size, None);
+        h.command(Key::Z, false);
+        assert!(h.document.spans.is_empty());
+    }
+
+    #[test]
+    fn font_search_stays_open_and_formats_the_original_selection() {
+        let mut h = EditorHarness::new("ABCD");
+        h.select(0..2);
+        let center = |shapes: Vec<egui::epaint::ClippedShape>, label: &str| {
+            shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.job.text == label => {
+                        Some(t.pos + t.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {label}"))
+        };
+        let click = |pos| {
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        let pos = center(h.frame(vec![]), "DejaVu Sans");
+        h.frame(click(pos));
+        let pos = center(h.frame(vec![]), "Search selection font...");
+        h.frame(click(pos));
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("Serif".into())]);
+        let pos = center(h.frame(vec![]), "DejaVu Serif");
+        h.frame(click(pos));
+        h.frame(vec![]);
+        assert_eq!(h.document.text, "ABCD");
+        assert_eq!(
+            h.document.style_at(0).font_name.as_deref(),
+            Some("DejaVu Serif")
+        );
+        assert_eq!(
+            h.document.style_at(1).font_name.as_deref(),
+            Some("DejaVu Serif")
+        );
+        assert_eq!(h.document.style_at(2).font_name, None);
         h.command(Key::Z, false);
         assert!(h.document.spans.is_empty());
     }
