@@ -89,7 +89,30 @@ impl TextRenderer {
         align: TextAlign,
         line_spacing: f32,
     ) -> Result<LabelBitmap> {
+        self.render_unbounded_styled(
+            text,
+            font_name,
+            font_size_px,
+            align,
+            line_spacing,
+            &[],
+            12.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_unbounded_styled(
+        &mut self,
+        text: &str,
+        font_name: &str,
+        font_size_px: f32,
+        align: TextAlign,
+        line_spacing: f32,
+        styles: &[crate::styled_text::StyleSpan],
+        base_size_pt: f32,
+    ) -> Result<LabelBitmap> {
         validate_line_spacing(line_spacing)?;
+        crate::styled_text::validate_spans(text, styles)?;
         if !font_size_px.is_finite() || font_size_px <= 0.0 || font_size_px > 4096.0 {
             return Err(RenderError::Text(
                 "font size must be in (0, 4096] pixels".into(),
@@ -110,13 +133,56 @@ impl TextRenderer {
         );
         buffer.set_wrap(Wrap::None);
         buffer.set_size(None, None);
-        buffer.set_text(text, &attrs, Shaping::Advanced, Some(align.to_cosmic()));
+        if styles.is_empty() {
+            buffer.set_text(text, &attrs, Shaping::Advanced, Some(align.to_cosmic()));
+        } else {
+            let mut boundaries: Vec<usize> = text.char_indices().map(|(byte, _)| byte).collect();
+            boundaries.push(text.len());
+            let regions = crate::styled_text::style_regions(text, styles);
+            let mut spans = Vec::with_capacity(regions.len());
+            for (range, style) in &regions {
+                let mut attr = attrs.clone();
+                if let Some(name) = &style.font_name {
+                    attr = attr.family(Family::Name(name));
+                }
+                attr = attr
+                    .weight(if style.bold {
+                        cosmic_text::Weight::BOLD
+                    } else {
+                        cosmic_text::Weight::NORMAL
+                    })
+                    .style(if style.italic {
+                        cosmic_text::Style::Italic
+                    } else {
+                        cosmic_text::Style::Normal
+                    });
+                if style.underline {
+                    attr = attr.underline(cosmic_text::UnderlineStyle::Single);
+                }
+                let size = font_size_px * style.font_size.unwrap_or(base_size_pt) / base_size_pt;
+                if !size.is_finite() || size > 4096.0 {
+                    return Err(RenderError::DimensionMismatch(
+                        "inline font raster is too large".into(),
+                    ));
+                }
+                attr = attr.metrics(Metrics::new(size, (size * line_spacing).ceil()));
+                spans.push((&text[boundaries[range.start]..boundaries[range.end]], attr));
+            }
+            buffer.set_rich_text(spans, &attrs, Shaping::Advanced, Some(align.to_cosmic()));
+        }
         buffer.shape_until_scroll(&mut self.font_system, true);
         let width = buffer
             .layout_runs()
             .map(|run| run.line_w)
             .fold(0.0_f32, f32::max);
-        let height = text.split('\n').count() as f32 * (font_size_px * line_spacing).ceil();
+        let height = if styles.is_empty() {
+            text.split('\n').count() as f32 * (font_size_px * line_spacing).ceil()
+        } else {
+            buffer
+                .layout_runs()
+                .map(|r| r.line_top + r.line_height)
+                .fold(0.0_f32, f32::max)
+        };
         if !width.is_finite() || width > 1_000_000.0 || width * height > 16_777_216.0 {
             return Err(RenderError::DimensionMismatch(
                 "text raster is too large".into(),
@@ -357,5 +423,33 @@ mod tests {
             assert!(bmp.width() > 0);
             assert_eq!(bmp.height(), 64);
         }
+    }
+
+    #[test]
+    fn inline_sizes_and_underline_change_ink_without_altering_plain_output() {
+        use crate::styled_text::{StyleSpan, TextStyle};
+        let mut renderer = TextRenderer::with_test_font();
+        let plain = renderer
+            .render_unbounded("Ag口", "", 20.0, TextAlign::Left, 1.2)
+            .unwrap();
+        let empty = renderer
+            .render_unbounded_styled("Ag口", "", 20.0, TextAlign::Left, 1.2, &[], 12.0)
+            .unwrap();
+        assert_eq!(plain.data(), empty.data());
+        let styles = vec![StyleSpan {
+            start: 2,
+            end: 3,
+            style: TextStyle {
+                font_size: Some(24.0),
+                underline: true,
+                ..Default::default()
+            },
+        }];
+        let rich = renderer
+            .render_unbounded_styled("Ag口", "", 20.0, TextAlign::Left, 1.2, &styles, 12.0)
+            .unwrap();
+        assert!(rich.width() > plain.width());
+        assert!(rich.height() > plain.height());
+        assert!(rich.data().iter().any(|byte| *byte != 0));
     }
 }

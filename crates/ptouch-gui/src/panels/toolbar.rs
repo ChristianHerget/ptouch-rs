@@ -279,6 +279,7 @@ fn apply_layout(state: &mut AppState, document: LabelDocument) -> Result<(), Str
     state.font_margin = document.font_margin;
     state.overall_flip_h = document.flip_h;
     state.overall_flip_v = document.flip_v;
+    state.editor_generation = state.editor_generation.wrapping_add(1);
     state.elements = document.elements;
     state.select_canvas_target(None);
     state.selection_revision = state.selection_revision.wrapping_add(1);

@@ -1390,6 +1390,95 @@ mod tests {
     }
 
     #[test]
+    fn rich_text_set_and_csv_exports_match_the_shared_renderer() {
+        use ptouch_render::styled_text::{StyleSpan, TextStyle};
+        let dir = std::env::temp_dir().join(format!("ptouch-rich-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for dpi in [180, 360] {
+            let mut object = LabelObject::text(
+                "{{port}}\nLAN",
+                TextBox {
+                    x_mm: 5.0,
+                    width_mm: 25.0,
+                    height_mm: 9.0,
+                    ..Default::default()
+                },
+            );
+            if let ObjectContent::Text {
+                font_size, styles, ..
+            } = &mut object.content
+            {
+                *font_size = Some(6.0);
+                styles.push(StyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: TextStyle {
+                        font_size: Some(12.0),
+                        bold: true,
+                        underline: true,
+                        ..Default::default()
+                    },
+                });
+            }
+            let doc = LabelDocument {
+                version: 4,
+                tape_width_mm: 12,
+                dpi,
+                font_name: "DejaVu Sans".into(),
+                font_margin: 0,
+                flip_h: false,
+                flip_v: false,
+                elements: vec![LabelElement::Object(object)],
+            };
+            let layout = dir.join("rich.ptl");
+            let output = dir.join("set.png");
+            let csv = dir.join("rows.csv");
+            std::fs::write(&layout, doc.to_toml_string().unwrap()).unwrap();
+            std::fs::write(&csv, "port\nPORT 01\n网口02\n").unwrap();
+            let args = batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--set",
+                "port=PORT 01",
+                "--output",
+                output.to_str().unwrap(),
+            ]);
+            execute_print(&args, &[]).unwrap();
+            let mut resolved =
+                LabelDocument::from_toml_str(&doc.to_toml_string().unwrap()).unwrap();
+            resolved.apply_values(&BTreeMap::from([("port".into(), "PORT 01".into())]));
+            let expected =
+                render_layout(&resolved, if dpi == 180 { 76 } else { 150 }, dpi).unwrap();
+            let actual = load_export(&output);
+            assert_eq!(
+                (actual.width(), actual.height(), actual.data()),
+                (expected.width(), expected.height(), expected.data())
+            );
+            let batch = dir.join("row-{n}.png");
+            let args = batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--csv",
+                csv.to_str().unwrap(),
+                "--output",
+                batch.to_str().unwrap(),
+            ]);
+            execute_print(&args, &[]).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join("row-1.png")).unwrap(),
+                std::fs::read(output).unwrap()
+            );
+            assert!(dir.join("row-2.png").exists());
+            assert!(
+                std::fs::read_to_string(&layout)
+                    .unwrap()
+                    .contains("version = 6")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn calibration_profiles_and_direct_offsets_export_the_same_at_each_dpi() {
         let dir = std::env::temp_dir().join(format!("ptouch-calibration-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

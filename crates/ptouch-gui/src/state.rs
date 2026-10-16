@@ -140,6 +140,8 @@ pub struct AppState {
     pub selected_element: Option<usize>,
     /// Isolate unfinished widget drafts across selections and structural edits.
     pub selection_revision: u64,
+    /// Invalidate per-index rich editor histories on structural changes.
+    pub editor_generation: u64,
     /// Current tape width in millimeters.
     pub tape_width_mm: u8,
     /// Current tape width in pixels (derived from tape_width_mm).
@@ -226,6 +228,7 @@ impl Default for AppState {
             elements: Vec::new(),
             selected_element: None,
             selection_revision: 0,
+            editor_generation: 0,
             tape_width_mm: 12,
             tape_width_px: 76,
             design_dpi: 180,
@@ -506,6 +509,7 @@ impl AppState {
     }
 
     fn add_element(&mut self, element: LabelElement) {
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         if element
             .as_object()
             .is_some_and(|object| object.content_box.is_some())
@@ -545,6 +549,7 @@ impl AppState {
         } else {
             CanvasEditTarget::Content
         };
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         self.elements.insert(index + 1, copy);
         self.select_canvas_target(Some(CanvasTarget {
             element: index + 1,
@@ -671,6 +676,7 @@ impl AppState {
 
     /// Ensure the selected element index is valid.
     pub fn validate_selection(&mut self) {
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         self.selection_revision = self.selection_revision.wrapping_add(1);
         if let Some(idx) = self.selected_element
             && idx >= self.elements.len()
@@ -933,6 +939,15 @@ mod tests {
                 content: "{{port}}".into(),
                 font_size: Some(9.0),
                 line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
+                styles: vec![ptouch_render::styled_text::StyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: ptouch_render::styled_text::TextStyle {
+                        font_size: Some(18.0),
+                        bold: true,
+                        ..Default::default()
+                    },
+                }],
                 align: TextAlign::Right,
             },
             image.content,

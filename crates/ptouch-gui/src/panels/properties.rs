@@ -298,7 +298,7 @@ fn show_font_properties(
     state: &mut AppState,
 ) -> bool {
     let mut changed = false;
-    ui.label("Font (whole label):");
+    ui.label("Default font (label):");
     ui.add(
         egui::TextEdit::singleline(&mut state.font_search)
             .desired_width(f32::INFINITY)
@@ -623,17 +623,45 @@ fn show_object_properties(
             font_size,
             align,
             line_spacing,
+            styles,
         } => {
             ui.label("Text Content:");
-            changed |= ui
-                .add(
-                    egui::TextEdit::multiline(content)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3),
-                )
-                .changed();
+            let editor_id = egui::Id::new((
+                "inline_editor",
+                state.editor_generation,
+                state.selected_element,
+            ));
+            changed |= crate::rich_text_editor::show(
+                ui,
+                content,
+                styles,
+                editor_id,
+                &state.font_name,
+                font_size.unwrap_or(12.0),
+                &state.available_fonts,
+            );
             ui.small("Template variables such as {{port}} keep the slot in place.");
+            let old_base_size = *font_size;
             changed |= show_font_properties(ui, font_size, align, true, state);
+            if let Some(old) = old_base_size
+                && font_size.is_none()
+                && !styles.is_empty()
+            {
+                // Freeze inherited point sizes before auto-fitting the whole block.
+                *styles = ptouch_render::styled_text::style_regions(content, styles)
+                    .into_iter()
+                    .map(|(range, mut style)| {
+                        style.font_size = Some(style.font_size.unwrap_or(old));
+                        ptouch_render::styled_text::StyleSpan {
+                            start: range.start,
+                            end: range.end,
+                            style,
+                        }
+                    })
+                    .collect();
+                changed = true;
+            }
+            ui.small("Auto font size scales all inline sizes together.");
             ui.horizontal(|ui| {
                 ui.label("Line spacing:");
                 changed |= ui.add(crate::widgets::decimal_drag(line_spacing)
