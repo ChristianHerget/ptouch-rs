@@ -68,7 +68,7 @@ enum Commands {
     Gui,
 }
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Clone)]
 struct PrintArgs {
     /// Select a USB bus/address from `ptouch doctor` (changes on reconnect)
     #[arg(long, value_name = "BUS:ADDRESS", conflicts_with = "bluetooth")]
@@ -163,6 +163,14 @@ struct PrintArgs {
     /// Skip final feed and cut (for chained labels)
     #[arg(long)]
     chain: bool,
+
+    /// Shift the whole label along the tape; negative removes blank space only
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "calibration")]
+    offset_mm: Option<f64>,
+
+    /// Apply a saved printer calibration profile (.toml), including to exports
+    #[arg(long, value_name = "FILE")]
+    calibration: Option<String>,
 
     /// Cut before label
     #[arg(long)]
@@ -774,6 +782,12 @@ fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build a label from a layout file or ad-hoc text/images, then print or save.
 fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve a file once so all copies/CSV rows use the same correction.
+    let mut resolved_args = args.clone();
+    resolved_args.offset_mm = resolve_calibration(args)?;
+    resolved_args.calibration = None;
+    let args = &resolved_args;
+
     if args.tape_width == Some(0) {
         eprintln!("Error: --tape-width must be greater than 0");
         process::exit(1);
@@ -850,6 +864,23 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
     }
 
     Ok(())
+}
+
+fn resolve_calibration(args: &PrintArgs) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    use ptouch_render::calibration::PrintCalibration;
+    if let Some(path) = &args.calibration {
+        return Ok(Some(
+            PrintCalibration::from_toml(&std::fs::read_to_string(path)?)?.offset_mm,
+        ));
+    }
+    if let Some(offset_mm) = args.offset_mm {
+        PrintCalibration {
+            name: "Command line".into(),
+            offset_mm,
+        }
+        .validate()?;
+    }
+    Ok(args.offset_mm)
 }
 
 /// Reject combinations that the physically verified PT-P300BT path does not
@@ -947,7 +978,12 @@ fn print_layout_batch(
         let values = build_row_values(&base, &headers, &row);
         let mut row_doc = doc.clone();
         row_doc.apply_values(&values);
-        render_layout(&row_doc, print_width, target_dpi)
+        let bitmap = render_layout(&row_doc, print_width, target_dpi)?;
+        Ok(ptouch_render::calibration::apply_calibration(
+            &bitmap,
+            target_dpi,
+            args.offset_mm,
+        )?)
     });
     let count = emit_batch(labels, args, max_px, device.as_mut())?;
 
@@ -1091,6 +1127,9 @@ fn emit_label(
     dpi: u16,
     device: Option<&mut CliDevice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let corrected = ptouch_render::calibration::apply_calibration(bitmap, dpi, args.offset_mm)?;
+    let bitmap = &corrected;
+
     if let Some(ref output_path) = args.output {
         bitmap.save(Path::new(output_path))?;
         let tape_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
@@ -1348,6 +1387,59 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn calibration_profiles_and_direct_offsets_export_the_same_at_each_dpi() {
+        let dir = std::env::temp_dir().join(format!("ptouch-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for dpi in [180, 360] {
+            let doc = free_layout_fixture(&dir, dpi);
+            let layout = dir.join("source.ptl");
+            let profile = dir.join("printer.toml");
+            let first = dir.join("profile.png");
+            let second = dir.join("offset.png");
+            let encoded = doc.to_toml_string().unwrap();
+            std::fs::write(&layout, &encoded).unwrap();
+            std::fs::write(
+                &profile,
+                ptouch_render::calibration::PrintCalibration {
+                    name: "Desk printer / auto cut".into(),
+                    offset_mm: 1.5,
+                }
+                .to_toml()
+                .unwrap(),
+            )
+            .unwrap();
+            for (flag, value, output) in [
+                ("--calibration", profile.to_str().unwrap(), &first),
+                ("--offset-mm", "1.5", &second),
+            ] {
+                let args = batch_args(&[
+                    "--layout",
+                    layout.to_str().unwrap(),
+                    "--set",
+                    "port=LAN",
+                    "--set",
+                    "suffix=A",
+                    "--output",
+                    output.to_str().unwrap(),
+                    flag,
+                    value,
+                ]);
+                execute_print(&args, &[]).unwrap();
+            }
+            let first = load_export(&first);
+            let second = load_export(&second);
+            assert_eq!(
+                (first.width(), first.height(), first.data()),
+                (second.width(), second.height(), second.data())
+            );
+            assert_eq!(std::fs::read_to_string(&layout).unwrap(), encoded);
+        }
+        let invalid = batch_args(&["--offset-mm", "NaN", "PORT"]);
+        assert!(resolve_calibration(&invalid).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

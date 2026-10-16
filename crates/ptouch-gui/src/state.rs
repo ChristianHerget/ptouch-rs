@@ -186,6 +186,11 @@ pub struct AppState {
     pub rotation_input: String,
     /// Buffer for font search/filter in properties panel.
     pub font_search: String,
+    /// Calibration is opt-in for each session and never part of a layout.
+    pub calibration_enabled: bool,
+    pub calibration: ptouch_render::calibration::PrintCalibration,
+    pub calibration_profiles:
+        std::collections::BTreeMap<String, ptouch_render::calibration::PrintCalibration>,
     /// Auto-cut after printing. When false, chain print mode (no cut).
     pub auto_cut: bool,
     /// Whether a printer is currently connected (detected by background poll).
@@ -246,6 +251,12 @@ impl Default for AppState {
             status_message: "Ready".to_string(),
             rotation_input: String::new(),
             font_search: String::new(),
+            calibration_enabled: false,
+            calibration: ptouch_render::calibration::PrintCalibration {
+                name: "Custom printer".into(),
+                offset_mm: 0.0,
+            },
+            calibration_profiles: Default::default(),
             auto_cut: true,
             printer_connected: false,
             printer_target: PrinterTarget::Usb,
