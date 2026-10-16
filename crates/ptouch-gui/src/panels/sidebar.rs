@@ -46,6 +46,7 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
             });
     });
     if state.printer_target != old_target {
+        state.calibration_enabled = false;
         state.printer_connected = false;
         state.preview_uses_printer = false;
         state.update_tape_pixels();
@@ -151,7 +152,12 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             let label = if state.auto_cut { "Auto cut" } else { "No cut" };
             ui.label(label);
-            ui.add(crate::widgets::toggle(&mut state.auto_cut));
+            if ui
+                .add(crate::widgets::toggle(&mut state.auto_cut))
+                .changed()
+            {
+                state.calibration_enabled = false;
+            }
         })
     });
     if state.printer_target.is_bluetooth() {
@@ -172,10 +178,139 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
                     PrintQuality::HighRes,
                     PrintQuality::Draft,
                 ] {
-                    ui.selectable_value(&mut state.print_quality, q, quality_label(q));
+                    if ui
+                        .selectable_value(&mut state.print_quality, q, quality_label(q))
+                        .changed()
+                    {
+                        state.calibration_enabled = false;
+                    }
                 }
             });
     }
+    show_calibration(ui, state);
+}
+
+fn show_calibration(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.collapsing("Position calibration", |ui| {
+        ui.add_enabled_ui(!state.is_printer_busy(), |ui| {
+            ui.checkbox(&mut state.calibration_enabled, "Use custom correction");
+            ui.small("Default keeps the printer's current behavior.");
+            ui.horizontal(|ui| {
+                ui.label("Offset:");
+                ui.add(
+                    crate::widgets::decimal_drag(&mut state.calibration.offset_mm)
+                        .range(-100.0..=100.0)
+                        .min_decimals(2)
+                        .max_decimals(3)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                );
+            });
+            ui.small("Positive adds leading space. Negative removes blank space only.");
+            ui.label("Saved profile:");
+            egui::ComboBox::from_id_salt("calibration_profile")
+                .selected_text(&state.calibration.name)
+                .show_ui(ui, |ui| {
+                    for profile in state.calibration_profiles.values() {
+                        if ui
+                            .selectable_label(state.calibration.name == profile.name, &profile.name)
+                            .clicked()
+                        {
+                            state.calibration = profile.clone();
+                            state.calibration_enabled = true;
+                        }
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut state.calibration.name)
+                    .desired_width(ui.available_width())
+                    .hint_text("Printer and cut mode"),
+            );
+            ui.small("Save a separate profile for each printer and cut mode.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Save profile").clicked() {
+                    match state.calibration.validate() {
+                        Ok(()) => {
+                            state
+                                .calibration_profiles
+                                .insert(state.calibration.name.clone(), state.calibration.clone());
+                            state.status_message = "Calibration profile saved".into();
+                        }
+                        Err(e) => state.status_message = e.to_string(),
+                    }
+                }
+                if ui.button("Default").clicked() {
+                    state.calibration_enabled = false;
+                }
+                if ui.button("Load file").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Calibration", &["toml"])
+                        .pick_file()
+                {
+                    match std::fs::read_to_string(path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|text| {
+                            ptouch_render::calibration::PrintCalibration::from_toml(&text)
+                                .map_err(|e| e.to_string())
+                        }) {
+                        Ok(profile) => {
+                            state.calibration = profile;
+                            state.calibration_enabled = true;
+                        }
+                        Err(e) => state.status_message = e,
+                    }
+                }
+                if ui.button("Export profile").clicked() {
+                    match state.calibration.to_toml() {
+                        Ok(text) => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Calibration", &["toml"])
+                                .set_file_name("printer-calibration.toml")
+                                .save_file()
+                            {
+                                match std::fs::write(path, text) {
+                                    Ok(()) => {
+                                        state.status_message = "Calibration profile exported".into()
+                                    }
+                                    Err(e) => state.status_message = e.to_string(),
+                                }
+                            }
+                        }
+                        Err(e) => state.status_message = e.to_string(),
+                    }
+                }
+            });
+            if ui
+                .add_enabled(
+                    state.preview_bitmap.is_some(),
+                    egui::Button::new("Export corrected image"),
+                )
+                .clicked()
+                && let Some(bitmap) = &state.preview_bitmap
+            {
+                match ptouch_render::calibration::apply_calibration(
+                    bitmap,
+                    state.target_dpi(),
+                    state
+                        .calibration_enabled
+                        .then_some(state.calibration.offset_mm),
+                ) {
+                    Ok(corrected) => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG", &["png"])
+                            .save_file()
+                        {
+                            match corrected.save(&path) {
+                                Ok(()) => state.status_message = "Corrected image exported".into(),
+                                Err(e) => state.status_message = e.to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => state.status_message = e.to_string(),
+                }
+            }
+        });
+    });
 }
 
 /// Whole-label mirror section: flip the entire composed label.

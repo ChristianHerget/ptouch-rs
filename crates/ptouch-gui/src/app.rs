@@ -45,6 +45,10 @@ impl PtouchApp {
 
         Self {
             state: AppState {
+                calibration_profiles: cc
+                    .storage
+                    .and_then(|storage| eframe::get_value(storage, "calibration_profiles"))
+                    .unwrap_or_default(),
                 available_fonts: ptouch_render::font::list_fonts(),
                 printer_cmd_tx: enable_printer.then_some(cmd_tx),
                 printer_status: (!enable_printer).then(|| "Offline mode".to_string()),
@@ -287,6 +291,14 @@ impl PtouchApp {
 }
 
 impl eframe::App for PtouchApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(
+            storage,
+            "calibration_profiles",
+            &self.state.calibration_profiles,
+        );
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show_editor(ui);
     }

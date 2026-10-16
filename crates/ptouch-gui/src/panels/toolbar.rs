@@ -132,10 +132,23 @@ pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
             if let Some(bitmap) = &state.preview_bitmap
                 && let Some(tx) = &state.printer_cmd_tx
             {
+                let corrected = match ptouch_render::calibration::apply_calibration(
+                    bitmap,
+                    state.target_dpi(),
+                    state
+                        .calibration_enabled
+                        .then_some(state.calibration.offset_mm),
+                ) {
+                    Ok(bitmap) => bitmap,
+                    Err(error) => {
+                        state.status_message = error.to_string();
+                        return;
+                    }
+                };
                 let cancellation = ptouch_core::CancellationToken::default();
                 state.cancellation = Some(cancellation.clone());
                 let _ = tx.send(PrinterCommand::Print {
-                    raster_lines: raster::bitmap_to_raster_lines(bitmap, state.printer_max_px),
+                    raster_lines: raster::bitmap_to_raster_lines(&corrected, state.printer_max_px),
                     chain_print: !state.auto_cut,
                     auto_cut: state.auto_cut,
                     quality: state.print_quality,
@@ -316,6 +329,42 @@ mod tests {
     use super::*;
     use crate::state::PrinterTarget;
     use ptouch_render::text::TextRenderer;
+
+    #[test]
+    fn print_calibration_matches_shared_output_without_editing_the_layout() {
+        for offset in [None, Some(1.0), Some(-0.4), Some(-10.0)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut bitmap = ptouch_render::bitmap::LabelBitmap::new(80, 32);
+            bitmap.set_pixel(10, 3, true);
+            let mut state = AppState {
+                printer_connected: true,
+                printer_max_px: 128,
+                preview_bitmap: Some(bitmap.clone()),
+                needs_rerender: false,
+                calibration_enabled: offset.is_some(),
+                printer_cmd_tx: Some(tx),
+                ..Default::default()
+            };
+            state.add_text();
+            state.needs_rerender = false;
+            state.calibration.offset_mm = offset.unwrap_or(20.0);
+            let before = state.document().to_toml_string().unwrap();
+            execute_action(&mut state, ToolbarAction::Print);
+            let expected = ptouch_render::calibration::apply_calibration(&bitmap, 180, offset);
+            if let Ok(expected) = expected {
+                let PrinterCommand::Print { raster_lines, .. } = rx.try_recv().unwrap() else {
+                    panic!("expected print");
+                };
+                assert_eq!(raster_lines, raster::bitmap_to_raster_lines(&expected, 128));
+                assert!(state.operation_in_progress);
+            } else {
+                assert!(rx.try_recv().is_err());
+                assert!(!state.operation_in_progress);
+                assert!(state.status_message.contains("calibration"));
+            }
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+        }
+    }
 
     fn layout(tape_width_mm: u8) -> LabelDocument {
         let document = LabelDocument {

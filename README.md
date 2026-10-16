@@ -319,6 +319,29 @@ preview DPI. A printer disconnect keeps the last printer preview until **Use
 design DPI** is selected. `--tape-width` changes the exported printable height in
 pixels, not the layout DPI or its millimeter coordinates.
 
+### Optional print-position calibration
+
+Open **Print Options → Position calibration** to apply a correction in millimeters.
+Positive values add leading blank space; negative values remove existing leading
+blank space and are rejected if they would cut off printed content. Correction
+is rounded to the output DPI and moves all label content together. It cannot
+remove a printer's mechanical feed margin.
+
+Calibration starts disabled and resets when choosing another connection. Save
+named profiles for individual printers and cut modes; **Default** disables the
+correction. **Export profile** writes a TOML file for CLI use, and **Export
+corrected image** previews the applied correction without printing. Layout files
+and the ordinary design export retain their original coordinates.
+
+```sh
+ptouch print --layout ports.ptl --calibration desk-printer.toml
+ptouch print --layout ports.ptl --offset-mm 1.5 --output corrected.png
+```
+
+Omitting both options preserves the existing print behavior, including device
+margin commands. A direct offset and a profile are mutually exclusive. CLI
+exports, copies and CSV rows use the same correction at their output DPI.
+
 ### Layout templates and batch printing
 
 Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
