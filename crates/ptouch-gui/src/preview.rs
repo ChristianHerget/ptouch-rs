@@ -143,23 +143,24 @@ impl RenderedPreview {
     /// Square pixels preserve proportions in image viewers. Replication keeps
     /// every printer dot; interpolation would introduce unprinted shades.
     pub fn square_pixel_bitmap(&self) -> LabelBitmap {
-        let dpi = self.resolution.head_dpi.max(self.resolution.feed_dpi);
-        let x_scale = u32::from(dpi / self.resolution.feed_dpi);
-        let y_scale = u32::from(dpi / self.resolution.head_dpi);
-        if x_scale == 1 && y_scale == 1 {
-            return self.bitmap.clone();
-        }
-        let mut out = LabelBitmap::new(
-            self.bitmap.width() * x_scale,
-            self.bitmap.height() * y_scale,
-        );
-        for y in 0..out.height() {
-            for x in 0..out.width() {
-                out.set_pixel(x, y, self.bitmap.get_pixel(x / x_scale, y / y_scale));
-            }
-        }
-        out
+        square_pixel_bitmap(&self.bitmap, self.resolution)
     }
+}
+
+pub fn square_pixel_bitmap(bitmap: &LabelBitmap, resolution: PrintResolution) -> LabelBitmap {
+    let dpi = resolution.head_dpi.max(resolution.feed_dpi);
+    let x_scale = u32::from(dpi / resolution.feed_dpi);
+    let y_scale = u32::from(dpi / resolution.head_dpi);
+    if x_scale == 1 && y_scale == 1 {
+        return bitmap.clone();
+    }
+    let mut out = LabelBitmap::new(bitmap.width() * x_scale, bitmap.height() * y_scale);
+    for y in 0..out.height() {
+        for x in 0..out.width() {
+            out.set_pixel(x, y, bitmap.get_pixel(x / x_scale, y / y_scale));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

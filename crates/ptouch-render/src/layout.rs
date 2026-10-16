@@ -353,8 +353,19 @@ fn render_document_impl(
 
     for (index, element) in doc.elements.iter().enumerate() {
         if let LabelElement::Object(object) = element
-            && let ObjectContent::Text { line_spacing, .. } = &object.content
+            && let ObjectContent::Text {
+                content,
+                styles,
+                line_spacing,
+                ..
+            } = &object.content
         {
+            crate::styled_text::validate_spans(content, styles)?;
+            if !styles.is_empty() && doc.version < 6 {
+                return Err(RenderError::Layout(
+                    "inline text styles require layout version 6".into(),
+                ));
+            }
             crate::text::validate_line_spacing(*line_spacing)?;
             if *line_spacing != crate::text::DEFAULT_LINE_SPACING && doc.version < 5 {
                 return Err(RenderError::Layout(
@@ -451,6 +462,7 @@ fn render_document_impl(
                             *font_size,
                             *align,
                             crate::text::DEFAULT_LINE_SPACING,
+                            &[],
                             rotation,
                             frame.vertical_align,
                             width,
@@ -767,6 +779,7 @@ pub fn convert_to_objects(
                             }
                         }),
                         line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                        styles: Vec::new(),
                         align: *align,
                     },
                 }
@@ -975,12 +988,14 @@ fn render_object(
             font_size,
             align,
             line_spacing,
+            styles,
         } => render_box(
             renderer,
             content,
             *font_size,
             *align,
             *line_spacing,
+            styles,
             rotation,
             object.frame.vertical_align,
             width,
@@ -1152,6 +1167,7 @@ fn render_box(
     font_size_pt: Option<f32>,
     align: TextAlign,
     line_spacing: f32,
+    styles: &[crate::styled_text::StyleSpan],
     rotation: f32,
     vertical_align: VerticalAlign,
     width: u32,
@@ -1172,8 +1188,51 @@ fn render_box(
         .checked_sub(margin.saturating_mul(2))
         .filter(|h| *h > 0)
         .ok_or_else(|| RenderError::Layout("font margin leaves no space in the text box".into()))?;
+    // Search in units of the largest used face for rich auto-fit. Uniform
+    // inline point sizes then fit identically, even for very small nominal sizes.
+    let normalized: Vec<crate::styled_text::StyleSpan> =
+        if font_size_pt.is_none() && !styles.is_empty() {
+            crate::styled_text::style_regions(content, styles)
+                .into_iter()
+                .map(|(range, mut style)| {
+                    style.font_size = Some(style.font_size.unwrap_or(12.0));
+                    crate::styled_text::StyleSpan {
+                        start: range.start,
+                        end: range.end,
+                        style,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let base_size_pt = if normalized.is_empty() {
+        font_size_pt.unwrap_or(12.0)
+    } else {
+        normalized
+            .iter()
+            .filter_map(|s| s.style.font_size)
+            .fold(0.1_f32, f32::max)
+    };
+    let render_styles = if normalized.is_empty() {
+        styles
+    } else {
+        &normalized
+    };
     let mut render = |size: f32| -> Result<(LabelBitmap, u32, u32)> {
-        let source = renderer.render_unbounded(content, font_name, size, align, line_spacing)?;
+        let source = if styles.is_empty() {
+            renderer.render_unbounded(content, font_name, size, align, line_spacing)?
+        } else {
+            renderer.render_unbounded_styled(
+                content,
+                font_name,
+                size,
+                align,
+                line_spacing,
+                render_styles,
+                base_size_pt,
+            )?
+        };
         Ok((
             checked_rotate(&source, rotation)?,
             source.width(),
@@ -1796,6 +1855,7 @@ mod tests {
                 content: "{{port}}".into(),
                 font_size: None,
                 line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                styles: Vec::new(),
                 align: TextAlign::Center,
             },
             image_content(solid_bitmap(40, 20)),
@@ -2504,6 +2564,7 @@ mod tests {
                 content: String::new(),
                 font_size: None,
                 line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                styles: Vec::new(),
                 align: TextAlign::Left,
             },
         ] {
@@ -2557,6 +2618,7 @@ mod tests {
                         content: "汉字".into(),
                         font_size,
                         line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                        styles: Vec::new(),
                         align: TextAlign::Center,
                     },
                     TextBox {
@@ -2638,6 +2700,7 @@ mod tests {
                         font_size: None,
                         align: TextAlign::Left,
                         line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                        styles: Vec::new(),
                     },
                     frame,
                     8.19,
@@ -2843,5 +2906,40 @@ mod tests {
         .bitmap
         .unwrap();
         assert_eq!(high.data(), reloaded.data());
+    }
+
+    #[test]
+    fn rich_auto_fit_is_invariant_to_uniform_nominal_point_sizes() {
+        use crate::styled_text::{StyleSpan, TextStyle};
+        let mut baseline = None;
+        for size in [0.1, 6.0, 18.0, 512.0] {
+            let mut object = LabelObject::text(
+                "PORT 01",
+                TextBox {
+                    width_mm: 20.0,
+                    height_mm: 8.0,
+                    ..Default::default()
+                },
+            );
+            if let ObjectContent::Text { styles, .. } = &mut object.content {
+                styles.push(StyleSpan {
+                    start: 0,
+                    end: 7,
+                    style: TextStyle {
+                        font_size: Some(size),
+                        ..Default::default()
+                    },
+                });
+            }
+            let mut doc = document(vec![LabelElement::Object(object)]);
+            doc.version = 6;
+            let bitmap = render(&doc, 180).bitmap.unwrap();
+            let pixels = (bitmap.width(), bitmap.height(), bitmap.data().to_vec());
+            if let Some(before) = &baseline {
+                assert_eq!(before, &pixels, "size {size}");
+            } else {
+                baseline = Some(pixels);
+            }
+        }
     }
 }

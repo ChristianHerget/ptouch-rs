@@ -37,7 +37,7 @@ fn enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrinterProfile {
     pub alias: String,
     pub model: String,
@@ -49,10 +49,60 @@ pub struct PrinterProfile {
     pub final_cut: bool,
     #[serde(default)]
     pub allow_experimental: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibrations: Vec<CalibrationRule>,
+}
+
+/// A measured correction for the exact commands used for one printed label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationRule {
+    pub quality: Quality,
+    pub precut: bool,
+    pub final_cut: bool,
+    pub offset_mm: f64,
+}
+
+impl CalibrationRule {
+    pub fn validate(&self) -> Result<()> {
+        if !self.offset_mm.is_finite() || self.offset_mm.abs() > 100.0 {
+            return Err("Calibration offset must be between -100 and 100 mm".into());
+        }
+        Ok(())
+    }
+
+    fn same_mode(&self, other: &Self) -> bool {
+        self.quality == other.quality
+            && self.precut == other.precut
+            && self.final_cut == other.final_cut
+    }
 }
 
 impl PrinterProfile {
+    pub fn calibration_offset(
+        &self,
+        quality: Quality,
+        precut: bool,
+        final_cut: bool,
+    ) -> Option<f64> {
+        self.calibrations
+            .iter()
+            .find(|rule| {
+                rule.quality == quality && rule.precut == precut && rule.final_cut == final_cut
+            })
+            .map(|rule| rule.offset_mm)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        for (index, rule) in self.calibrations.iter().enumerate() {
+            rule.validate()?;
+            if self.calibrations[..index]
+                .iter()
+                .any(|other| rule.same_mode(other))
+            {
+                return Err("Duplicate calibration for the same quality and cut settings".into());
+            }
+        }
         if self.alias.is_empty()
             || !self
                 .alias
@@ -136,7 +186,7 @@ impl ProfileStore {
             }
             let text = fs::read_to_string(&path)?;
             let parsed = parse_file(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            if parsed.version != 1 {
+            if !matches!(parsed.version, 1 | 2) {
                 return Err(format!(
                     "{}: unsupported profile version {}",
                     path.display(),
@@ -246,9 +296,13 @@ impl ProfileStore {
             "quality",
             "final_cut",
             "allow_experimental",
+            "calibrations",
         ] {
             if let Some(new) = replacement.get(key) {
                 let mut new = new.clone();
+                if key == "calibrations" {
+                    preserve_calibration_comments(table.get(key), &mut new);
+                }
                 if let (Some(old), Some(v)) =
                     (table.get(key).and_then(Item::as_value), new.as_value_mut())
                 {
@@ -331,7 +385,18 @@ impl ProfileStore {
         }
     }
 
-    fn write(&mut self, path: &Path, doc: DocumentMut) -> Result<()> {
+    fn write(&mut self, path: &Path, mut doc: DocumentMut) -> Result<()> {
+        if doc
+            .get("printers")
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|printers| {
+                printers
+                    .iter()
+                    .any(|printer| printer.contains_key("calibrations"))
+            })
+        {
+            doc["version"] = value(2);
+        }
         fs::create_dir_all(&self.directory)?;
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -376,6 +441,7 @@ fn parse_file(text: &str) -> Result<ProfileFile> {
                     "quality",
                     "final_cut",
                     "allow_experimental",
+                    "calibrations",
                 ]
                 .contains(&key.as_str())
                     && key != if network { "host" } else { "serial" }
@@ -385,7 +451,43 @@ fn parse_file(text: &str) -> Result<ProfileFile> {
             }
         }
     }
-    Ok(toml::from_str(text)?)
+    let parsed: ProfileFile = toml::from_str(text)?;
+    if !matches!(parsed.version, 1 | 2) {
+        return Err(format!("Unsupported profile version {}", parsed.version).into());
+    }
+    if parsed.version < 2 && parsed.printers.iter().any(|p| !p.calibrations.is_empty()) {
+        return Err("Calibration rules require profile version 2".into());
+    }
+    Ok(parsed)
+}
+
+fn preserve_calibration_comments(old: Option<&Item>, new: &mut Item) {
+    let Some(old) = old.and_then(Item::as_array_of_tables) else {
+        return;
+    };
+    let Some(new) = new.as_array_of_tables_mut() else {
+        return;
+    };
+    for rule in new.iter_mut() {
+        let previous = old.iter().find(|previous| {
+            previous.get("quality").and_then(Item::as_str)
+                == rule.get("quality").and_then(Item::as_str)
+                && previous.get("precut").and_then(Item::as_bool)
+                    == rule.get("precut").and_then(Item::as_bool)
+                && previous.get("final_cut").and_then(Item::as_bool)
+                    == rule.get("final_cut").and_then(Item::as_bool)
+        });
+        if let Some(previous) = previous {
+            let mut offset = rule["offset_mm"].clone();
+            if let (Some(old), Some(new)) =
+                (previous["offset_mm"].as_value(), offset.as_value_mut())
+            {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *rule = previous.clone();
+            rule["offset_mm"] = offset;
+        }
+    }
 }
 
 fn profile_table(profile: &PrinterProfile) -> Result<Table> {
@@ -399,6 +501,95 @@ fn profile_table(profile: &PrinterProfile) -> Result<Table> {
 mod tests {
     use super::*;
     #[test]
+    fn calibration_upgrades_only_the_edited_file_and_preserves_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProfileStore::load(dir.path()).unwrap();
+        store.add(printer("desk"), Some("group.toml")).unwrap();
+        store.add(printer("neighbour"), Some("group.toml")).unwrap();
+        store.add(printer("untouched"), None).unwrap();
+        let path = dir.path().join("group.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("# Keep this collection comment\n{original}")).unwrap();
+        let untouched = fs::read(dir.path().join("untouched.toml")).unwrap();
+        store = ProfileStore::load(dir.path()).unwrap();
+        let neighbour = store.entries["neighbour"].profile.clone();
+        let mut profile = store.entries["desk"].profile.clone();
+        profile.calibrations = vec![CalibrationRule {
+            quality: Quality::High,
+            precut: true,
+            final_cut: false,
+            offset_mm: -0.4,
+        }];
+        store.update("desk", profile.clone()).unwrap();
+        assert_eq!(store.entries["desk"].profile, profile);
+        assert_eq!(store.entries["neighbour"].profile, neighbour);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("version = 2") && saved.starts_with("# Keep this collection comment")
+        );
+        assert_eq!(
+            fs::read(dir.path().join("untouched.toml")).unwrap(),
+            untouched
+        );
+        assert_eq!(
+            profile.calibration_offset(Quality::High, true, false),
+            Some(-0.4)
+        );
+        assert_eq!(
+            profile.calibration_offset(Quality::High, false, false),
+            None
+        );
+        assert_eq!(
+            profile.calibration_offset(Quality::Standard, true, false),
+            None
+        );
+        let commented = saved.replace(
+            "offset_mm = -0.4",
+            "offset_mm = -0.4 # measured on the bench",
+        );
+        fs::write(&path, commented).unwrap();
+        store = ProfileStore::load(dir.path()).unwrap();
+        profile.calibrations[0].offset_mm = -0.5;
+        store.update("desk", profile.clone()).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("offset_mm = -0.5 # measured on the bench")
+        );
+        profile.calibrations.clear();
+        store.update("desk", profile).unwrap();
+        assert!(fs::read_to_string(path).unwrap().contains("version = 2"));
+    }
+
+    #[test]
+    fn calibration_rejects_duplicate_modes_invalid_values_and_old_file_versions() {
+        let rule = CalibrationRule {
+            quality: Quality::Standard,
+            precut: false,
+            final_cut: true,
+            offset_mm: 1.0,
+        };
+        let mut profile = printer("desk");
+        profile.calibrations = vec![rule.clone(), rule.clone()];
+        assert!(profile.validate().is_err());
+        for offset in [f64::NAN, f64::INFINITY, -100.01, 100.01] {
+            profile.calibrations = vec![CalibrationRule {
+                offset_mm: offset,
+                ..rule.clone()
+            }];
+            assert!(profile.validate().is_err());
+        }
+        profile.calibrations = vec![rule];
+        let printer = toml::to_string(&profile)
+            .unwrap()
+            .replace("[[calibrations]]", "[[printers.calibrations]]");
+        let text = format!("version = 2\n[[printers]]\n{printer}");
+        assert!(parse_file(&text).is_ok());
+        assert!(parse_file(&text.replace("version = 2", "version = 1")).is_err());
+        assert!(parse_file(&text.replace("offset_mm", "offset_mmm")).is_err());
+    }
+
+    #[test]
     fn schema_typos_versions_and_conflicting_defaults_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = ProfileStore::load(dir.path()).unwrap();
@@ -406,7 +597,7 @@ mod tests {
         let original = fs::read_to_string(dir.path().join("desk.toml")).unwrap();
         for content in [
             original.replace("final_cut", "final_cutt"),
-            original.replace("version = 1", "version = 2"),
+            original.replace("version = 1", "version = 3"),
             format!("{original}\nserial = 'wrong-connection'\n"),
         ] {
             fs::write(dir.path().join("desk.toml"), content).unwrap();
@@ -437,6 +628,7 @@ mod tests {
             quality: Quality::Standard,
             final_cut: true,
             allow_experimental: false,
+            calibrations: Vec::new(),
         }
     }
     #[test]

@@ -26,6 +26,7 @@ enum ElementContent {
         font_size: Option<f32>,
         align: TextAlign,
         line_spacing: f32,
+        styles: Vec<ptouch_render::styled_text::StyleSpan>,
         rotation: f32,
         flip_h: bool,
         flip_v: bool,
@@ -65,6 +66,10 @@ impl ElementContent {
                         align,
                         line_spacing: match content.as_ref() {
                             Self::Text { line_spacing, .. } => *line_spacing,
+                            _ => unreachable!("restored text has text content"),
+                        },
+                        styles: match content.as_ref() {
+                            Self::Text { styles, .. } => styles.clone(),
                             _ => unreachable!("restored text has text content"),
                         },
                     },
@@ -144,6 +149,8 @@ pub(crate) struct ContentSelection {
     pub element: Option<usize>,
     pub cursor: Option<(egui::Id, egui::text::CCursorRange)>,
     pub target: crate::state::CanvasEditTarget,
+    pub rich_text: Option<(egui::Id, crate::rich_text_editor::InlineState)>,
+    pub rich_generation: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -165,6 +172,16 @@ impl ContentSnapshot {
             && self.font_margin == other.font_margin
             && self.flip_h == other.flip_h
             && self.flip_v == other.flip_v
+            && self
+                .selection
+                .rich_text
+                .as_ref()
+                .map(|(id, state)| (*id, &state.pending, state.pending_at))
+                == other
+                    .selection
+                    .rich_text
+                    .as_ref()
+                    .map(|(id, state)| (*id, &state.pending, state.pending_at))
     }
 
     pub fn restore(&self, state: &mut AppState) {
@@ -183,6 +200,9 @@ impl ContentSnapshot {
         state.canvas_drag_target = None;
         state.canvas_hover_target = None;
         state.editor.text_cursor = self.selection.cursor;
+        state.editor.rich_text = self.selection.rich_text.clone();
+        state.editor_generation = self.selection.rich_generation;
+        state.editor.rich_restore = true;
         state.mark_dirty();
     }
 }
@@ -253,11 +273,13 @@ impl ContentHistory {
                         font_size,
                         align,
                         line_spacing,
+                        styles,
                     } => ElementContent::Text {
                         content: content.clone(),
                         font_size: *font_size,
                         align: *align,
                         line_spacing: *line_spacing,
+                        styles: styles.clone(),
                         text_box: None,
                         rotation: 0.0,
                         flip_h: false,
@@ -301,6 +323,7 @@ impl ContentHistory {
                 font_size: *font_size,
                 align: *align,
                 line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
+                styles: Vec::new(),
                 rotation: *rotation,
                 flip_h: *flip_h,
                 flip_v: *flip_v,

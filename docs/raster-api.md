@@ -1,7 +1,8 @@
 # Rust raster API migration
 
 `print_raster` now requires the actual input raster resolution. This is a
-breaking Rust API change. CLI quality flags and saved printer-profile formats are unchanged. New free
+breaking Rust API change. CLI quality flags retain their existing meaning. Printer profiles with calibration
+rules use format v2; profiles without them retain v1. New free
 layouts use upstream format v4; unchanged legacy documents keep their version.
 
 Use a model's shared quality metadata to select the mode and render its input:
@@ -82,3 +83,17 @@ columns in the protocol. Render or resample before calling the driver. Use
 defines resolution and media requirements. `QualityCommands` separately
 selects the USB command sequence; frontends do not select commands by model
 name. Standard-mode command streams retain their existing behavior.
+
+
+Inline text styles use the optional `ObjectContent::Text.styles` vector of
+`styled_text::StyleSpan`. Ranges count Unicode scalar values and use an exclusive
+end. Unstyled constructors should supply `styles: Vec::new()`. Styles require
+layout v6; custom line spacing requires v5. Serialization raises the layout
+version only when needed, and unstyled text retains its previous rendering path.
+
+Apply `calibration::apply_calibration(&bitmap, resolution.feed_dpi, offset_mm)`
+after document rendering/mirroring and before raster encoding. It returns a new
+bitmap without changing layout bounds. Negative offsets can remove only blank
+leading columns. Select any saved correction using the actual quality and cut
+commands for that label; chained copies may need different rules. Convert the
+corrected raster to square pixels only afterward when exporting a GUI image.

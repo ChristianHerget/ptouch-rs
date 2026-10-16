@@ -201,7 +201,8 @@ impl PtouchApp {
                     // A stale non-standard quality from a previous printer
                     // would make every print fail with the selector hidden.
                     if quality.mode(self.state.print_quality).is_err() {
-                        self.state.print_quality = ptouch_core::protocol::PrintQuality::Standard;
+                        self.state
+                            .set_print_quality(ptouch_core::protocol::PrintQuality::Standard);
                     }
                     self.state.printer_model =
                         Some(format!("{}: {} mm {}", model_name, media_width, media_type));
@@ -357,6 +358,20 @@ impl PtouchApp {
                 self.state.add_text();
                 let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><path d="M1 3L7 1" stroke="black"/></svg>"#;
                 self.state.add_image_bytes(None, svg.to_vec());
+                if let ptouch_render::document::ObjectContent::Text { styles, .. } =
+                    &mut self.state.elements[0].as_object_mut().unwrap().content
+                {
+                    styles.push(ptouch_render::styled_text::StyleSpan {
+                        start: 0,
+                        end: 5,
+                        style: ptouch_render::styled_text::TextStyle {
+                            bold: true,
+                            underline: true,
+                            ..Default::default()
+                        },
+                    });
+                }
+                self.state.select_element(Some(0));
                 self.state.view.select(crate::preview::ZoomMode::Fit);
             } else if *frames == 4 {
                 self.state
@@ -968,6 +983,15 @@ mod tests {
     }
     #[test]
     fn v5_spacing_and_symbols_reopen_and_preview_at_every_quality() {
+        styled_layout_preview_at_every_quality(false);
+    }
+
+    #[test]
+    fn v6_styles_spacing_and_symbols_reopen_and_preview_at_every_quality() {
+        styled_layout_preview_at_every_quality(true);
+    }
+
+    fn styled_layout_preview_at_every_quality(styled: bool) {
         use ptouch_render::document::{
             LabelDocument, ObjectContent, render_document_at_resolution,
         };
@@ -976,11 +1000,24 @@ mod tests {
         if let ObjectContent::Text {
             content,
             line_spacing,
+            styles,
             ..
         } = &mut state.elements[0].as_object_mut().unwrap().content
         {
             *content = "{{port}}\nLAN".into();
             *line_spacing = 0.8;
+            if styled {
+                styles.push(ptouch_render::styled_text::StyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: ptouch_render::styled_text::TextStyle {
+                        font_size: Some(9.0),
+                        bold: true,
+                        underline: true,
+                        ..Default::default()
+                    },
+                });
+            }
         }
         let icon = crate::symbols::catalogue()
             .icons
@@ -996,7 +1033,7 @@ mod tests {
         }
         let saved = state.document().to_toml_string().unwrap();
         let mut document = LabelDocument::from_toml_str(&saved).unwrap();
-        assert_eq!(document.version, 5);
+        assert_eq!(document.version, if styled { 6 } else { 5 });
         assert_eq!(
             document.elements[1].display_name(),
             state.elements[1].display_name()

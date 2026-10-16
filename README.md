@@ -3,7 +3,7 @@
 Rust tool for Brother P-Touch USB and network label printers. CLI and GUI.
 Optional native macOS Bluetooth support is available in `ptouch-core` for the PT-P300BT.
 
-![P-Touch free layout editor](https://github.com/user-attachments/assets/ce630fd8-c612-4a78-bcd1-e9fef5fbf991)
+![P-Touch rich text and free layout editor](https://github.com/user-attachments/assets/433b1dfb-a5a2-4655-86b3-5628d7758898)
 
 ## Features
 
@@ -385,9 +385,9 @@ errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
 New free layouts use format version 4. Non-default line spacing requires version
-5, which older builds reject. Versions 1–4 retain their original rendering and
-version when opened and saved without using this new setting. Objects without
-a `content_box` keep fitting inside their frames;
+5, and inline text styles require version 6. Older builds reject newer features.
+Versions 1–5 retain their rendering and version when saved without new inline
+styles. Objects without a `content_box` keep fitting inside their frames;
 their first Object move, resize, or rotation fixes the current content size and
 saves it as v4. Content previously clipped by the frame may reappear on that
 first edit. **Convert to free layout** preserves the exact dimensions of
@@ -411,6 +411,80 @@ preserving physical proportions. The GUI saves a separate design DPI and shows t
 preview DPI. A printer disconnect keeps the last printer preview until **Use
 design DPI** is selected. `--tape-width` changes the exported printable height in
 pixels, not the layout DPI or its millimeter coordinates.
+
+### Rich text within one object
+
+Select text in **Text Content**, then use **B**, **I**, **U**, the selection font,
+or the size field to format that range. With a caret, these controls format the
+next text you type. Ctrl+B/I/U (Cmd on macOS), **Undo** and **Redo** work with
+both text and formatting. Ctrl+Z undoes; Ctrl+Shift+Z or Ctrl+Y redoes. Internal
+selected-text copy/paste and object duplication retain styles. External plain
+text inherits the insertion style.
+
+**Default font (label)** supplies the font for text without an inline override.
+**Auto font size** scales the whole block while preserving the size ratios;
+turn it off to use exact point sizes. Mouse resizing of a fixed-size Object
+scales all its inline point sizes together. Frame editing retains its spacing
+behavior. Legacy text can use **Convert to free layout** to enable inline styles.
+
+Styled content is shared by GUI, templates and CLI rendering. Template matching
+uses the complete text even when a placeholder crosses style boundaries; its
+replacement inherits the placeholder's starting style. Use the millimeter
+canvas to review final output. The property editor uses the desktop's text
+layout for selection, while the canvas, image exports and printing share the
+same renderer. Font availability can affect output on another computer.
+
+Set the top-level document version to 6 when adding inline styles manually.
+Format v6 adds optional `styles` to a text object's content. Each range uses
+zero-based Unicode character offsets (end excluded), with its style in a nested
+table. For example, this makes the first four characters 12-point bold:
+
+```toml
+[[elements.content.styles]]
+start = 0
+end = 4
+[elements.content.styles.style]
+font_size = 12.0
+bold = true
+```
+
+Only styled content needs v6; plain text keeps the original rendering path.
+
+### Print-position calibration
+
+Open **Manage printers → Position corrections** to save measured offsets for a
+printer's quality, leading-cut, and final-cut settings. Matching corrections
+apply automatically. No match uses no correction. These rules travel with the
+printer profile; see [profile format and examples](docs/printer-profiles.md#position-corrections).
+
+**Print Options → Position calibration** shows the active correction. Choose
+**No correction** to disable it or **Custom correction** for a temporary offset.
+Temporary overrides reset when the printer, quality, or cut settings change.
+Individual corrections can be imported or exported as upstream-compatible TOML
+files. **Export corrected image** in the toolbar shows the applied correction;
+the canvas, layout files, and ordinary **Export Image** keep design coordinates.
+
+Positive offsets add leading blank space. Negative offsets remove leading blank
+space and fail if they would discard ink. The correction is rounded at the
+output's feed DPI and cannot remove the printer's mechanical feed margin.
+
+```sh
+# Automatically use a matching rule from the saved printer
+ptouch print --printer desk --layout ports.ptl
+# Override the printer's rules for this job
+ptouch print --printer desk --layout ports.ptl --no-calibration
+ptouch print --layout ports.ptl --calibration desk-correction.toml
+ptouch print --layout ports.ptl --offset-mm 1.5 --output corrected.png
+```
+
+`--no-calibration`, `--offset-mm`, and `--calibration` are mutually exclusive;
+each overrides the saved printer's rules. Without a matching rule or explicit
+correction, printing retains its existing pixels and device margin commands.
+Each copy and CSV label matches its actual cut commands, so chained labels can
+use a different correction from the last label. Streaming jobs stop before
+submitting a label whose correction fails; earlier labels may already have
+printed. CLI exports use their output DPI and retain one image per CSV row,
+representing that row's last copy.
 
 ### Layout templates and batch printing
 

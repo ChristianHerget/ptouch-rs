@@ -181,6 +181,21 @@ struct PrintArgs {
     #[arg(long)]
     chain: bool,
 
+    /// Shift the whole label along the tape; negative removes blank space only
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "calibration")]
+    offset_mm: Option<f64>,
+
+    /// Ignore saved printer calibration for this job
+    #[arg(long, conflicts_with_all = ["offset_mm", "calibration"])]
+    no_calibration: bool,
+
+    #[arg(skip)]
+    printer_profile: Option<PrinterProfile>,
+
+    /// Apply a saved printer calibration profile (.toml), including to exports
+    #[arg(long, value_name = "FILE")]
+    calibration: Option<String>,
+
     /// Cut before label (network jobs use short margins by default)
     #[arg(long, conflicts_with = "no_precut")]
     precut: bool,
@@ -333,6 +348,7 @@ fn profile_command(command: ProfileCommand, directory: &Path) -> ptouch_profiles
                 },
                 final_cut: !no_final_cut,
                 allow_experimental,
+                calibrations: Vec::new(),
             };
             validate_profile(&profile)?;
             store.add(profile, file.as_deref())?;
@@ -347,7 +363,11 @@ fn validate_profile(profile: &PrinterProfile) -> ptouch_profiles::Result<()> {
     if let Connection::Network { host } = &profile.connection {
         ptouch_core::network_host::normalize(host)?;
     }
+    profile.validate()?;
     let model = PrinterModel::find(&profile.model).ok_or("Unknown model")?;
+    for rule in &profile.calibrations {
+        model.quality.mode(profile_quality(rule.quality))?;
+    }
     if matches!(profile.connection, Connection::Usb { .. }) && !model.usb {
         return Err("USB is not implemented for this model".into());
     }
@@ -402,6 +422,7 @@ fn apply_profile_preferences(
     if !args.final_cut && !args.cut_each {
         args.chain |= !profile.final_cut;
     }
+    args.printer_profile = Some(profile.clone());
 }
 
 /// The printer selected by the CLI. USB remains the default target.
@@ -1138,6 +1159,12 @@ fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build a label from a layout file or ad-hoc text/images, then print or save.
 fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve a file once so all copies/CSV rows use the same correction.
+    let mut resolved_args = args.clone();
+    resolved_args.offset_mm = resolve_calibration(args)?;
+    resolved_args.calibration = None;
+    let args = &resolved_args;
+
     if args.tape_width == Some(0) {
         eprintln!("Error: --tape-width must be greater than 0");
         process::exit(1);
@@ -1233,6 +1260,23 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
     }
 
     Ok(())
+}
+
+fn resolve_calibration(args: &PrintArgs) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    use ptouch_render::calibration::PrintCalibration;
+    if let Some(path) = &args.calibration {
+        return Ok(Some(
+            PrintCalibration::from_toml(&std::fs::read_to_string(path)?)?.offset_mm,
+        ));
+    }
+    if let Some(offset_mm) = args.offset_mm {
+        PrintCalibration {
+            name: "Command line".into(),
+            offset_mm,
+        }
+        .validate()?;
+    }
+    Ok(args.offset_mm)
 }
 
 /// Reject combinations that the physically verified PT-P300BT path does not
@@ -1340,7 +1384,7 @@ fn print_layout_batch(
         row_doc.apply_values(&values);
         render_layout_quality(&row_doc, print_width, resolution)
     });
-    let count = emit_batch(labels, args, max_px, device.as_mut())?;
+    let count = emit_batch_at_dpi(labels, args, max_px, resolution.feed_dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -1355,18 +1399,25 @@ fn print_layout_batch(
 }
 
 /// Keep at most one rendered label ahead of the current one. Only USB
-/// printing needs lookahead; exports and Bluetooth can emit each row immediately.
-fn emit_batch(
+/// printing and exports with automatic USB correction rules need lookahead.
+fn emit_batch_at_dpi(
     labels: impl Iterator<Item = Result<LabelBitmap, Box<dyn std::error::Error>>>,
     args: &PrintArgs,
     max_px: u16,
+    output_dpi: u16,
     mut device: Option<&mut impl PrintDevice>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut labels = labels.peekable();
-    let chain_rows = args.output.is_none()
-        && device
-            .as_ref()
-            .is_some_and(|dev| !dev.is_bluetooth() && !dev.is_network() && !args.cut_each);
+    let chain_rows = !args.cut_each
+        && if args.output.is_some() {
+            args.printer_profile.as_ref().is_some_and(|p| {
+                !p.calibrations.is_empty() && matches!(p.connection, Connection::Usb { .. })
+            })
+        } else {
+            device
+                .as_ref()
+                .is_some_and(|dev| !dev.is_bluetooth() && !dev.is_network())
+        };
     let mut count = 0;
 
     while let Some(label) = labels.next() {
@@ -1377,7 +1428,8 @@ fn emit_batch(
         count += 1;
         if let Some(output) = &args.output {
             let path = output.replace("{n}", &count.to_string());
-            bitmap.save(Path::new(&path))?;
+            let corrected = corrected_export(&bitmap, args, output_dpi, is_last_row)?;
+            corrected.save(Path::new(&path))?;
             println!("Saved row {} to '{}'", count, path);
         } else if let Some(dev) = device.as_mut() {
             // A transport failure returns directly; never retry a printed page.
@@ -1387,6 +1439,16 @@ fn emit_batch(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+fn emit_batch(
+    labels: impl Iterator<Item = Result<LabelBitmap, Box<dyn std::error::Error>>>,
+    args: &PrintArgs,
+    max_px: u16,
+    device: Option<&mut impl PrintDevice>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    emit_batch_at_dpi(labels, args, max_px, 180, device)
 }
 
 /// Merge `--set` constants with one CSV row's columns (row values win).
@@ -1503,6 +1565,8 @@ fn emit_label(
     device: Option<&mut CliDevice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref output_path) = args.output {
+        let corrected = corrected_export(bitmap, args, dpi, true)?;
+        let bitmap = &corrected;
         bitmap.save(Path::new(output_path))?;
         let tape_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
         println!(
@@ -1617,6 +1681,65 @@ fn make_padding(print_width: u32, pad_px: u32) -> LabelBitmap {
     LabelBitmap::new(pad_px, print_width)
 }
 
+/// Resolve the same physical cut commands for calibration, exports and transport.
+fn label_cut_settings(
+    args: &PrintArgs,
+    network: bool,
+    bluetooth: bool,
+    is_last: bool,
+) -> (bool, bool) {
+    if bluetooth {
+        return (false, false);
+    }
+    let chain = args.chain || (!is_last && !args.cut_each && !network);
+    (
+        if network {
+            !args.no_precut
+        } else {
+            args.precut
+        },
+        !chain,
+    )
+}
+
+fn calibration_offset(args: &PrintArgs, precut: bool, final_cut: bool) -> Option<f64> {
+    if args.no_calibration {
+        return None;
+    }
+    args.offset_mm.or_else(|| {
+        args.printer_profile.as_ref().and_then(|profile| {
+            profile.calibration_offset(
+                match args.quality {
+                    QualityArg::Standard => Quality::Standard,
+                    QualityArg::High => Quality::High,
+                    QualityArg::Draft => Quality::Draft,
+                },
+                precut,
+                final_cut,
+            )
+        })
+    })
+}
+
+fn corrected_export(
+    bitmap: &LabelBitmap,
+    args: &PrintArgs,
+    dpi: u16,
+    is_last: bool,
+) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
+    let (precut, final_cut) = label_cut_settings(
+        args,
+        args.target.host.is_some(),
+        args.bluetooth.is_some(),
+        is_last,
+    );
+    Ok(ptouch_render::calibration::apply_calibration(
+        bitmap,
+        dpi,
+        calibration_offset(args, precut, final_cut),
+    )?)
+}
+
 /// Send the label bitmap to the printer.
 fn print_to_device(
     dev: &mut impl PrintDevice,
@@ -1628,20 +1751,29 @@ fn print_to_device(
     if args.no_precut && !dev.is_network() {
         return Err("--no-precut is only available for network jobs".into());
     }
-    let raster_lines = if let Some(left) = dev.band_left() {
-        raster::bitmap_to_raster_lines_at(bitmap, max_px, left)
-    } else {
-        raster::bitmap_to_raster_lines(bitmap, max_px)
-    };
-
+    let resolution = dev.resolution(args.quality.to_print_quality())?;
     let total_copies = args.copies.max(1);
+    let mut lengths = (f64::INFINITY, 0.0_f64);
     for copy_idx in 0..total_copies {
-        let is_last = is_last_row && copy_idx == total_copies - 1;
-        // Chain intermediate copies (no cut between copies), and intermediate
-        // CSV rows (no cut between labels in a batch).
-        // Very last copy of the very last row: chain only if user requested --chain.
-        let chain_print = !dev.is_bluetooth()
-            && (args.chain || (!is_last && !args.cut_each && !dev.is_network()));
+        let (precut, final_cut) = label_cut_settings(
+            args,
+            dev.is_network(),
+            dev.is_bluetooth(),
+            is_last_row && copy_idx == total_copies - 1,
+        );
+        let chain_print = !dev.is_bluetooth() && !final_cut;
+        let corrected = ptouch_render::calibration::apply_calibration(
+            bitmap,
+            resolution.feed_dpi,
+            calibration_offset(args, precut, final_cut),
+        )?;
+        let length = resolution.length_mm(corrected.width() as usize);
+        lengths = (lengths.0.min(length), lengths.1.max(length));
+        let raster_lines = if let Some(left) = dev.band_left() {
+            raster::bitmap_to_raster_lines_at(&corrected, max_px, left)
+        } else {
+            raster::bitmap_to_raster_lines(&corrected, max_px)
+        };
 
         debug!(
             "Printing copy {}/{} ({} raster lines, chain={})",
@@ -1655,23 +1787,21 @@ fn print_to_device(
             &raster_lines,
             dev.resolution(args.quality.to_print_quality())?,
             chain_print,
-            if dev.is_network() {
-                !args.no_precut
-            } else {
-                args.precut
-            },
+            precut,
             args.quality.to_print_quality(),
         )?;
     }
 
-    let tape_mm = dev
-        .resolution(args.quality.to_print_quality())?
-        .length_mm(bitmap.width() as usize);
+    let length = if lengths.0 == lengths.1 {
+        format!("{:.1}", lengths.0)
+    } else {
+        format!("{:.1}–{:.1}", lengths.0, lengths.1)
+    };
     println!(
-        "Printed {} cop{} ({:.1} mm of tape each)",
+        "Printed {} cop{} ({} mm of tape each)",
         total_copies,
         if total_copies == 1 { "y" } else { "ies" },
-        tape_mm
+        length
     );
 
     Ok(())
@@ -1775,6 +1905,148 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rich_text_set_and_csv_exports_match_the_shared_renderer() {
+        use ptouch_render::styled_text::{StyleSpan, TextStyle};
+        let dir = std::env::temp_dir().join(format!("ptouch-rich-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for dpi in [180, 360] {
+            let mut object = LabelObject::text(
+                "{{port}}\nLAN",
+                TextBox {
+                    x_mm: 5.0,
+                    width_mm: 25.0,
+                    height_mm: 9.0,
+                    ..Default::default()
+                },
+            );
+            if let ObjectContent::Text {
+                font_size, styles, ..
+            } = &mut object.content
+            {
+                *font_size = Some(6.0);
+                styles.push(StyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: TextStyle {
+                        font_size: Some(12.0),
+                        bold: true,
+                        underline: true,
+                        ..Default::default()
+                    },
+                });
+            }
+            let doc = LabelDocument {
+                version: 4,
+                tape_width_mm: 12,
+                dpi,
+                font_name: "DejaVu Sans".into(),
+                font_margin: 0,
+                flip_h: false,
+                flip_v: false,
+                elements: vec![LabelElement::Object(object)],
+            };
+            let layout = dir.join("rich.ptl");
+            let output = dir.join("set.png");
+            let csv = dir.join("rows.csv");
+            std::fs::write(&layout, doc.to_toml_string().unwrap()).unwrap();
+            std::fs::write(&csv, "port\nPORT 01\n网口02\n").unwrap();
+            let args = batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--set",
+                "port=PORT 01",
+                "--output",
+                output.to_str().unwrap(),
+            ]);
+            execute_print(&args, &[]).unwrap();
+            let mut resolved =
+                LabelDocument::from_toml_str(&doc.to_toml_string().unwrap()).unwrap();
+            resolved.apply_values(&BTreeMap::from([("port".into(), "PORT 01".into())]));
+            let expected =
+                render_layout(&resolved, if dpi == 180 { 76 } else { 150 }, dpi).unwrap();
+            let actual = load_export(&output);
+            assert_eq!(
+                (actual.width(), actual.height(), actual.data()),
+                (expected.width(), expected.height(), expected.data())
+            );
+            let batch = dir.join("row-{n}.png");
+            let args = batch_args(&[
+                "--layout",
+                layout.to_str().unwrap(),
+                "--csv",
+                csv.to_str().unwrap(),
+                "--output",
+                batch.to_str().unwrap(),
+            ]);
+            execute_print(&args, &[]).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join("row-1.png")).unwrap(),
+                std::fs::read(output).unwrap()
+            );
+            assert!(dir.join("row-2.png").exists());
+            assert!(
+                std::fs::read_to_string(&layout)
+                    .unwrap()
+                    .contains("version = 6")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_profiles_and_direct_offsets_export_the_same_at_each_dpi() {
+        let dir = std::env::temp_dir().join(format!("ptouch-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for dpi in [180, 360] {
+            let doc = free_layout_fixture(&dir, dpi);
+            let layout = dir.join("source.ptl");
+            let profile = dir.join("printer.toml");
+            let first = dir.join("profile.png");
+            let second = dir.join("offset.png");
+            let encoded = doc.to_toml_string().unwrap();
+            std::fs::write(&layout, &encoded).unwrap();
+            std::fs::write(
+                &profile,
+                ptouch_render::calibration::PrintCalibration {
+                    name: "Desk printer / auto cut".into(),
+                    offset_mm: 1.5,
+                }
+                .to_toml()
+                .unwrap(),
+            )
+            .unwrap();
+            for (flag, value, output) in [
+                ("--calibration", profile.to_str().unwrap(), &first),
+                ("--offset-mm", "1.5", &second),
+            ] {
+                let args = batch_args(&[
+                    "--layout",
+                    layout.to_str().unwrap(),
+                    "--set",
+                    "port=LAN",
+                    "--set",
+                    "suffix=A",
+                    "--output",
+                    output.to_str().unwrap(),
+                    flag,
+                    value,
+                ]);
+                execute_print(&args, &[]).unwrap();
+            }
+            let first = load_export(&first);
+            let second = load_export(&second);
+            assert_eq!(
+                (first.width(), first.height(), first.data()),
+                (second.width(), second.height(), second.data())
+            );
+            assert_eq!(std::fs::read_to_string(&layout).unwrap(), encoded);
+        }
+        let invalid = batch_args(&["--offset-mm", "NaN", "PORT"]);
+        assert!(resolve_calibration(&invalid).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2178,6 +2450,7 @@ mod tests {
                         quality: Quality::High,
                         final_cut: false,
                         allow_experimental: false,
+                        calibrations: Vec::new(),
                     },
                     None,
                 )
@@ -2287,6 +2560,7 @@ mod tests {
             quality: Quality::High,
             final_cut: false,
             allow_experimental: false,
+            calibrations: Vec::new(),
         };
         let mut args = batch_args(&[]);
         apply_profile_preferences(&mut args, &profile, false);
@@ -2296,6 +2570,187 @@ mod tests {
         apply_profile_preferences(&mut args, &profile, true);
         assert_eq!(args.quality, QualityArg::Standard);
         assert!(!args.chain);
+    }
+
+    fn calibrated_profile(quality: Quality, network: bool) -> PrinterProfile {
+        PrinterProfile {
+            alias: "desk".into(),
+            model: "PT-P750W".into(),
+            connection: if network {
+                Connection::Network {
+                    host: "printer.local".into(),
+                }
+            } else {
+                Connection::Usb { serial: None }
+            },
+            quality,
+            final_cut: true,
+            allow_experimental: false,
+            calibrations: [false, true]
+                .into_iter()
+                .flat_map(|precut| {
+                    [false, true].into_iter().map(move |final_cut| {
+                        ptouch_profiles::CalibrationRule {
+                            quality,
+                            precut,
+                            final_cut,
+                            offset_mm: if final_cut { 1.0 } else { 0.5 }
+                                + if precut { 1.0 } else { 0.0 },
+                        }
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn calibration_matches_each_copy_and_csv_cut_command_at_every_resolution() {
+        for (model, head) in [("PT-P750W", 180), ("PT-9700PC", 360)] {
+            let quality_profile = ptouch_core::quality::QualityProfile::for_model(model, head);
+            for mode in quality_profile.modes {
+                let quality = match mode.quality {
+                    PrintQuality::Standard => Quality::Standard,
+                    PrintQuality::HighRes => Quality::High,
+                    PrintQuality::Draft => Quality::Draft,
+                };
+                for (network, flags) in [
+                    (false, vec![]),
+                    (false, vec!["--cut-each"]),
+                    (false, vec!["--chain"]),
+                    (false, vec!["--precut"]),
+                    (true, vec![]),
+                ] {
+                    let mut args = batch_args(&flags);
+                    args.copies = 3;
+                    apply_profile_preferences(
+                        &mut args,
+                        &calibrated_profile(quality, network),
+                        false,
+                    );
+                    let mut printer = RecordingPrinter {
+                        network,
+                        model: Some(model),
+                        head_dpi: Some(head),
+                        ..Default::default()
+                    };
+                    let mut bitmap = LabelBitmap::new(80, 16);
+                    bitmap.set_pixel(30, 5, true);
+                    emit_batch(
+                        [Ok(bitmap.clone()), Ok(bitmap.clone())].into_iter(),
+                        &args,
+                        128,
+                        Some(&mut printer),
+                    )
+                    .unwrap();
+                    assert_eq!(printer.rasters.len(), 6);
+                    for (index, raster) in printer.rasters.iter().enumerate() {
+                        let expected_cut = !args.chain && (network || args.cut_each || index == 5);
+                        assert_eq!(raster.final_cut, expected_cut);
+                        assert_eq!(raster.precut, network || args.precut);
+                        assert_eq!(raster.resolution, mode.resolution);
+                        let offset = if expected_cut { 1.0 } else { 0.5 }
+                            + if raster.precut { 1.0 } else { 0.0 };
+                        let expected = ptouch_render::calibration::apply_calibration(
+                            &bitmap,
+                            mode.resolution.feed_dpi,
+                            Some(offset),
+                        )
+                        .unwrap();
+                        assert_eq!(raster.lines, raster::bitmap_to_raster_lines(&expected, 128));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_overrides_and_invalid_trims_are_resolved_before_submission() {
+        for flags in [vec![], vec!["--no-calibration"], vec!["--offset-mm", "0"]] {
+            let mut args = batch_args(&flags);
+            let mut profile = calibrated_profile(Quality::Standard, false);
+            for rule in &mut profile.calibrations {
+                rule.offset_mm = -100.0;
+            }
+            apply_profile_preferences(&mut args, &profile, false);
+            let mut printer = RecordingPrinter::default();
+            let mut bitmap = LabelBitmap::new(80, 16);
+            bitmap.set_pixel(1, 2, true);
+            let result = print_to_device(&mut printer, &bitmap, 128, &args, true);
+            if flags.is_empty() {
+                assert!(result.is_err());
+                assert_eq!(printer.print_calls, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    printer.rasters[0].lines,
+                    raster::bitmap_to_raster_lines(&bitmap, 128)
+                );
+            }
+        }
+        for flags in [
+            vec!["--no-calibration", "--offset-mm", "1"],
+            vec!["--no-calibration", "--calibration", "file"],
+            vec!["--offset-mm", "1", "--calibration", "file"],
+        ] {
+            let mut argv = vec!["ptouch", "print"];
+            argv.extend(flags);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn saved_calibration_csv_exports_use_each_rows_last_copy_without_changing_layout() {
+        let dir =
+            std::env::temp_dir().join(format!("ptouch-profile-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profiles = dir.join("profiles");
+        let profile = calibrated_profile(Quality::Standard, false);
+        let mut store = ProfileStore::load(&profiles).unwrap();
+        store.add(profile, None).unwrap();
+        for dpi in [180, 360] {
+            let doc = free_layout_fixture(&dir, dpi);
+            let encoded = doc.to_toml_string().unwrap();
+            let layout = dir.join("source.ptl");
+            let csv = dir.join("data.csv");
+            let output = dir.join("row-{n}.png");
+            std::fs::write(&layout, &encoded).unwrap();
+            std::fs::write(&csv, "port,suffix\nLAN,A\nLAN,A\n").unwrap();
+            let mut args = batch_args(&[
+                "--printer",
+                "desk",
+                "--layout",
+                layout.to_str().unwrap(),
+                "--csv",
+                csv.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--copies",
+                "3",
+            ]);
+            let resolved = resolve_profile(&mut args.target, false, &profiles)
+                .unwrap()
+                .unwrap();
+            apply_profile_preferences(&mut args, &resolved, false);
+            execute_print(&args, &[]).unwrap();
+            let mut filled = doc.clone();
+            filled.apply_values(&BTreeMap::from([
+                ("port".into(), "LAN".into()),
+                ("suffix".into(), "A".into()),
+            ]));
+            let bitmap = render_layout(&filled, if dpi == 180 { 76 } else { 150 }, dpi).unwrap();
+            for (row, offset) in [(1, 0.5), (2, 1.0)] {
+                let expected =
+                    ptouch_render::calibration::apply_calibration(&bitmap, dpi, Some(offset))
+                        .unwrap();
+                let actual = load_export(&dir.join(format!("row-{row}.png")));
+                assert_eq!(
+                    (actual.width(), actual.height(), actual.data()),
+                    (expected.width(), expected.height(), expected.data())
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&layout).unwrap(), encoded);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2509,6 +2964,16 @@ mod tests {
         network: bool,
         print_calls: usize,
         fail_print_at: Option<usize>,
+        model: Option<&'static str>,
+        head_dpi: Option<u16>,
+        rasters: Vec<RecordedRaster>,
+    }
+
+    struct RecordedRaster {
+        lines: Vec<Vec<u8>>,
+        resolution: ptouch_core::PrintResolution,
+        precut: bool,
+        final_cut: bool,
     }
 
     impl PrintDevice for RecordingPrinter {
@@ -2519,14 +2984,15 @@ mod tests {
             &self,
             quality: PrintQuality,
         ) -> Result<ptouch_core::PrintResolution, PtouchError> {
-            Ok(
-                ptouch_core::quality::QualityProfile::for_model("PT-P700", 180)
-                    .mode(quality)?
-                    .resolution,
+            Ok(ptouch_core::quality::QualityProfile::for_model(
+                self.model.unwrap_or("PT-P700"),
+                self.dpi(),
             )
+            .mode(quality)?
+            .resolution)
         }
         fn dpi(&self) -> u16 {
-            180
+            self.head_dpi.unwrap_or(180)
         }
 
         fn is_bluetooth(&self) -> bool {
@@ -2555,9 +3021,18 @@ mod tests {
                 lines,
                 resolution,
                 DeviceFlags::NONE,
-                ptouch_core::quality::QualityProfile::for_model("PT-P700", 180),
+                ptouch_core::quality::QualityProfile::for_model(
+                    self.model.unwrap_or("PT-P700"),
+                    self.dpi(),
+                ),
                 &opts,
             )?;
+            self.rasters.push(RecordedRaster {
+                lines: lines.to_vec(),
+                resolution,
+                precut,
+                final_cut: !chain_print,
+            });
             self.commands.borrow_mut().push(job.last().unwrap()[0]);
             Ok(())
         }

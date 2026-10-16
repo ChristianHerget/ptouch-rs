@@ -22,6 +22,8 @@ pub enum EditorAction {
 #[derive(Default)]
 pub struct Editor {
     pub history: ContentHistory,
+    pub(crate) rich_text: Option<(Id, crate::rich_text_editor::InlineState)>,
+    pub(crate) rich_restore: bool,
     surfaces: HashSet<Id>,
     content_inputs: HashSet<Id>,
     input_buffers: HashSet<Id>,
@@ -41,7 +43,7 @@ impl Editor {
         self.preferred_focus = Some(response.id);
     }
 
-    fn input(&mut self, response: &Response) {
+    pub(crate) fn input(&mut self, response: &Response) {
         self.content_inputs.insert(response.id);
         self.input_buffers.insert(response.id);
         if response.has_focus()
@@ -83,6 +85,8 @@ impl AppState {
                 element: self.selected_element,
                 cursor: self.editor.text_cursor,
                 target: self.canvas_edit_target,
+                rich_text: self.editor.rich_text.clone(),
+                rich_generation: self.editor_generation,
             },
             (self.document_version, self.design_dpi),
         )
@@ -194,6 +198,8 @@ impl AppState {
             }
         };
         self.selection_revision = self.selection_revision.wrapping_add(1);
+        self.editor_generation = self.editor_generation.wrapping_add(1);
+        self.editor.rich_text = None;
         self.canvas_hover_target = None;
         self.canvas_drag_target = None;
         let after = self.content_snapshot();
@@ -211,6 +217,7 @@ pub fn apply_action(ctx: &egui::Context, state: &mut AppState, action: EditorAct
         .is_some_and(|id| state.editor.content_inputs.contains(&id));
     if state.apply_editor_action(action) {
         if history_action {
+            state.editor.rich_restore = true;
             for &id in &state.editor.input_buffers {
                 ctx.data_mut(|data| data.remove::<String>(id));
                 egui::text_edit::TextEditState::default().store(ctx, id);

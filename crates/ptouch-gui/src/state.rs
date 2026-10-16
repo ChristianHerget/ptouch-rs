@@ -30,8 +30,16 @@ pub struct CanvasTarget {
     pub edit: CanvasEditTarget,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CalibrationMode {
+    #[default]
+    Profile,
+    Disabled,
+    Custom,
+}
+
 /// Printer connection selected in the GUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PrinterTarget {
     Unavailable(String),
     Profile(ptouch_profiles::PrinterProfile),
@@ -99,7 +107,7 @@ impl PrinterTarget {
 }
 
 /// A selection revision makes delayed responses stale even after A → B → A.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PrinterSelection {
     pub target: PrinterTarget,
     pub generation: u64,
@@ -192,6 +200,8 @@ pub struct AppState {
     pub selected_element: Option<usize>,
     /// Isolate unfinished widget drafts across selections and structural edits.
     pub selection_revision: u64,
+    /// Isolate per-index rich editor sessions across structural changes.
+    pub editor_generation: u64,
     /// Current tape width in millimeters.
     pub tape_width_mm: u8,
     /// Current tape width in pixels (derived from tape_width_mm).
@@ -237,6 +247,9 @@ pub struct AppState {
     pub rotation_input: String,
     /// Buffer for font search/filter in properties panel.
     pub font_search: String,
+    /// Temporary job override; measured defaults live in printer profiles.
+    pub calibration_mode: CalibrationMode,
+    pub calibration: ptouch_render::calibration::PrintCalibration,
     /// Auto-cut after printing. When false, chain print mode (no cut).
     pub auto_cut: bool,
     pub precut: bool,
@@ -282,6 +295,7 @@ impl Default for AppState {
             elements: Vec::new(),
             selected_element: None,
             selection_revision: 0,
+            editor_generation: 0,
             tape_width_mm: 12,
             tape_width_px: 76,
             design_dpi: 180,
@@ -307,6 +321,11 @@ impl Default for AppState {
             status_message: "Ready".to_string(),
             rotation_input: String::new(),
             font_search: String::new(),
+            calibration_mode: CalibrationMode::Profile,
+            calibration: ptouch_render::calibration::PrintCalibration {
+                name: "Custom printer".into(),
+                offset_mm: 0.0,
+            },
             auto_cut: true,
             precut: true,
             printer_connected: false,
@@ -335,6 +354,7 @@ impl AppState {
     }
 
     pub fn select_target(&mut self, target: PrinterTarget) {
+        self.calibration_mode = CalibrationMode::Profile;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.printer_target = target;
         self.apply_target_preferences();
@@ -726,6 +746,7 @@ impl AppState {
             self.selection_revision = self.selection_revision.wrapping_add(1);
             self.editor.history.finish_group();
             self.editor.clear_text_cursor();
+            self.editor.rich_text = None;
         }
         self.selected_element = selection.filter(|&index| index < self.elements.len());
         self.rotation_input = match self.selected_element.map(|index| &self.elements[index]) {
@@ -749,8 +770,27 @@ impl AppState {
 
     pub fn set_print_quality(&mut self, quality: PrintQuality) {
         if self.print_quality != quality {
+            self.calibration_mode = CalibrationMode::Profile;
             self.print_quality = quality;
             self.mark_dirty();
+        }
+    }
+
+    pub fn calibration_offset(&self) -> Option<f64> {
+        match self.calibration_mode {
+            CalibrationMode::Disabled => None,
+            CalibrationMode::Custom => Some(self.calibration.offset_mm),
+            CalibrationMode::Profile => self.printer_target.profile().and_then(|profile| {
+                profile.calibration_offset(
+                    match self.print_quality {
+                        PrintQuality::Standard => ptouch_profiles::Quality::Standard,
+                        PrintQuality::HighRes => ptouch_profiles::Quality::High,
+                        PrintQuality::Draft => ptouch_profiles::Quality::Draft,
+                    },
+                    self.precut && !self.printer_target.is_bluetooth(),
+                    self.auto_cut && !self.printer_target.is_bluetooth(),
+                )
+            }),
         }
     }
 
@@ -1141,6 +1181,15 @@ mod tests {
                 content: "{{port}}".into(),
                 font_size: Some(9.0),
                 line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
+                styles: vec![ptouch_render::styled_text::StyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: ptouch_render::styled_text::TextStyle {
+                        font_size: Some(18.0),
+                        bold: true,
+                        ..Default::default()
+                    },
+                }],
                 align: TextAlign::Right,
             },
             image.content,

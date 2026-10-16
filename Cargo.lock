@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "ptouch-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "csv",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "ptouch-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "bitflags 2.13.1",
  "log",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "ptouch-gui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "egui",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "ptouch-profiles"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "directories",
  "fs2",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "ptouch-render"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64",
  "cosmic-text",

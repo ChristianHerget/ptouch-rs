@@ -11,11 +11,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod calibration_ui;
 mod editor;
 mod panels;
 mod preview;
 mod printer_worker;
 mod profile_ui;
+mod rich_text_editor;
 mod state;
 mod symbols;
 mod widgets;

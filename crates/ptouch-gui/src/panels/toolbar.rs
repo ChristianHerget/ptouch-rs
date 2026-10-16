@@ -20,6 +20,7 @@ pub enum ToolbarAction {
     Feed,
     Cancel,
     Export,
+    ExportCorrected,
     Save,
     Open,
 }
@@ -82,6 +83,13 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) -> Option<ToolbarAc
             action = Some(ToolbarAction::Export);
         }
 
+        if ui
+            .add_enabled(has_bitmap, egui::Button::new("Export corrected image"))
+            .clicked()
+        {
+            action = Some(ToolbarAction::ExportCorrected);
+        }
+
         ui.separator();
 
         if ui.button("Save Layout").clicked() {
@@ -131,7 +139,8 @@ pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
                 state.status_message = "Cancelling; sent data may still print".into();
             }
         }
-        ToolbarAction::Export => do_export_image(state),
+        ToolbarAction::Export => do_export_image(state, false),
+        ToolbarAction::ExportCorrected => do_export_image(state, true),
         ToolbarAction::Save => do_save_layout(state),
         ToolbarAction::Open => do_open_layout(state),
     }
@@ -184,7 +193,7 @@ pub fn show_add_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
-/// Submit exactly the pixels shown by the current preview.
+/// Submit the current preview with the active job correction applied.
 fn do_print(state: &mut AppState) {
     if !state.printer_connected || state.is_printer_busy() || state.printer_quality.is_none() {
         return;
@@ -193,10 +202,21 @@ fn do_print(state: &mut AppState) {
         return;
     };
     let resolution = preview.resolution;
+    let corrected = match ptouch_render::calibration::apply_calibration(
+        &preview.bitmap,
+        resolution.feed_dpi,
+        state.calibration_offset(),
+    ) {
+        Ok(bitmap) => bitmap,
+        Err(error) => {
+            state.status_message = error.to_string();
+            return;
+        }
+    };
     let raster_lines = if let Some(left) = state.band_left {
-        raster::bitmap_to_raster_lines_at(&preview.bitmap, state.printer_max_px, left)
+        raster::bitmap_to_raster_lines_at(&corrected, state.printer_max_px, left)
     } else {
-        raster::bitmap_to_raster_lines(&preview.bitmap, state.printer_max_px)
+        raster::bitmap_to_raster_lines(&corrected, state.printer_max_px)
     };
     if let Some(ref tx) = state.printer_cmd_tx {
         let cancellation = ptouch_core::CancellationToken::default();
@@ -314,6 +334,7 @@ pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) -> Res
     state.font_margin = document.font_margin;
     state.overall_flip_h = document.flip_h;
     state.overall_flip_v = document.flip_v;
+    state.editor_generation = state.editor_generation.wrapping_add(1);
     state.elements = document.elements;
     state.select_element(None);
     state.selection_revision = state.selection_revision.wrapping_add(1);
@@ -321,12 +342,41 @@ pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) -> Res
     Ok(())
 }
 
+fn export_bitmap(
+    preview: &crate::preview::RenderedPreview,
+    offset: Option<f64>,
+) -> ptouch_render::Result<ptouch_render::bitmap::LabelBitmap> {
+    if offset.is_none() {
+        return Ok(preview.square_pixel_bitmap());
+    }
+    let bitmap = ptouch_render::calibration::apply_calibration(
+        &preview.bitmap,
+        preview.resolution.feed_dpi,
+        offset,
+    )?;
+    Ok(crate::preview::square_pixel_bitmap(
+        &bitmap,
+        preview.resolution,
+    ))
+}
+
 /// Export the current label preview as an image file.
-fn do_export_image(state: &mut AppState) {
+fn do_export_image(state: &mut AppState, corrected: bool) {
     let preview = match state.output_preview() {
         Some(preview) => preview,
         None => {
             state.status_message = "Nothing to export".to_string();
+            return;
+        }
+    };
+
+    let bitmap = match export_bitmap(
+        preview,
+        corrected.then(|| state.calibration_offset()).flatten(),
+    ) {
+        Ok(bitmap) => bitmap,
+        Err(error) => {
+            state.status_message = error.to_string();
             return;
         }
     };
@@ -346,7 +396,7 @@ fn do_export_image(state: &mut AppState) {
         } else {
             path
         };
-        match preview.square_pixel_bitmap().save(&save_path) {
+        match bitmap.save(&save_path) {
             Ok(()) => {
                 state.status_message = format!("Saved to {}", save_path.display());
                 info!("Exported image: {}", save_path.display());
@@ -364,6 +414,72 @@ mod tests {
     use super::*;
     use crate::state::PrinterTarget;
     use ptouch_render::text::TextRenderer;
+
+    #[test]
+    fn print_calibration_matches_shared_output_without_editing_the_layout() {
+        for (model, head) in [("PT-P750W", 180), ("PT-9700PC", 360)] {
+            let quality = ptouch_core::quality::QualityProfile::for_model(model, head);
+            for mode in quality.modes {
+                for offset in [None, Some(1.0), Some(-0.4), Some(-10.0)] {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let mut bitmap = ptouch_render::bitmap::LabelBitmap::new(80, 32);
+                    bitmap.set_pixel(10, 3, true);
+                    let mut state = AppState {
+                        printer_connected: true,
+                        printer_max_px: 128,
+                        preview: Some(crate::preview::RenderedPreview::new(
+                            &egui::Context::default(),
+                            bitmap.clone(),
+                            mode.resolution,
+                        )),
+                        printer_quality: Some(quality),
+                        printer_dpi: head,
+                        print_quality: mode.quality,
+                        needs_rerender: false,
+                        calibration_mode: if offset.is_some() {
+                            crate::state::CalibrationMode::Custom
+                        } else {
+                            crate::state::CalibrationMode::Disabled
+                        },
+                        printer_cmd_tx: Some(tx),
+                        ..Default::default()
+                    };
+                    state.add_text();
+                    state.needs_rerender = false;
+                    state.calibration.offset_mm = offset.unwrap_or(20.0);
+                    let before = state.document().to_toml_string().unwrap();
+                    execute_action(&mut state, ToolbarAction::Print);
+                    let expected = ptouch_render::calibration::apply_calibration(
+                        &bitmap,
+                        mode.resolution.feed_dpi,
+                        offset,
+                    );
+                    let exported = export_bitmap(state.output_preview().unwrap(), offset);
+                    assert_eq!(exported.is_ok(), expected.is_ok());
+                    if let (Ok(exported), Ok(expected)) = (&exported, &expected) {
+                        let square = crate::preview::square_pixel_bitmap(expected, mode.resolution);
+                        assert_eq!(
+                            (exported.width(), exported.height(), exported.data()),
+                            (square.width(), square.height(), square.data())
+                        );
+                    }
+                    if let Ok(expected) = expected {
+                        let PrinterCommand::Print { raster_lines, .. } = rx.try_recv().unwrap()
+                        else {
+                            panic!("expected print");
+                        };
+                        assert_eq!(raster_lines, raster::bitmap_to_raster_lines(&expected, 128));
+                        assert!(state.operation_in_progress);
+                    } else {
+                        assert!(rx.try_recv().is_err());
+                        assert!(!state.operation_in_progress);
+                        assert!(state.status_message.contains("calibration"));
+                    }
+                    assert_eq!(state.document().to_toml_string().unwrap(), before);
+                }
+            }
+        }
+    }
 
     fn layout(tape_width_mm: u8) -> LabelDocument {
         let document = LabelDocument {

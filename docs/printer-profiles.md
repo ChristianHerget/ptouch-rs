@@ -8,7 +8,7 @@ features are experimental. They live in `ptouch-core/src/printer_model.rs`.
 Only built-in code can select protocol commands.
 
 User profiles describe particular printers: alias, built-in model, connection,
-preferred quality, final cut, and experimental opt-in. The standalone
+preferred quality, final cut, experimental opt-in, and optional position corrections. The standalone
 `ptouch-profiles` crate stores these files and has no dependency on the driver.
 
 ## One directory, any number of files
@@ -211,3 +211,65 @@ References:
 
 Adapted protocol code remains GPL-3.0-or-later. Independent profile storage and
 UI additions are MIT. See the repository's LICENSE, LICENSE-MIT, and NOTICE.
+
+## Position corrections
+
+Profile files without corrections retain `version = 1`. Files containing
+corrections use `version = 2`; existing v1 files still load without migration.
+The GUI upgrades only a file saved with new correction rules. Older builds
+reject v2 files rather than silently ignoring their corrections.
+
+```toml
+version = 2
+
+[[printers]]
+alias = "desk"
+model = "PT-P750W"
+connection = "network"
+host = "labelprinter.local"
+quality = "high"
+final_cut = true
+
+[[printers.calibrations]]
+quality = "high"
+precut = true
+final_cut = true
+offset_mm = -0.4
+```
+
+Each rule matches all three settings exactly: quality (`standard`, `high`, or
+`draft`), leading cut (`precut`), and final feed/cut (`final_cut`). Rules must
+have unique setting combinations. Offsets must be finite and within −100 to
++100 mm. The selected printer model must support each rule's quality.
+
+Matching rules apply automatically in both GUI and CLI. No match applies no
+correction. CLI `--offset-mm`, `--calibration FILE`, or `--no-calibration` overrides
+the saved rules; these options are mutually exclusive. An explicit zero offset
+also overrides saved rules. Direct connections without a saved profile have no
+automatic correction.
+
+The GUI's **Position corrections** editor adds, edits, removes, imports, and
+exports individual rules. Changing the printer model or endpoint clears the
+measured rules from the edit draft; saving commits that change. Renaming the
+alias preserves its rules. Writes preserve collection comments, neighbouring
+printers, and comments on offsets whose setting combinations are unchanged.
+
+USB strips can use no-cut rules for intermediate labels and a final-cut rule for
+the last copy of the last row. `--cut-each`, `--chain`, network defaults, and
+leading-cut overrides participate in matching. Each label uses its actual
+commands; corrections do not change those commands or the layout coordinates.
+CLI exports retain one image per row, representing its last copy. They use the
+export resolution, which may differ from the printer resolution.
+
+Standalone correction files remain compatible with upstream:
+
+```toml
+name = "Desk printer, high quality with cuts"
+offset_mm = -0.4
+```
+
+Importing such a file into a saved rule changes its offset and keeps the rule's
+quality and cut settings. Loading it under **Print Options** instead creates a
+temporary custom correction. Temporary overrides reset when changing printer,
+quality, or cut settings. The ordinary GUI design export remains uncorrected;
+**Export corrected image** applies the active correction without printing.

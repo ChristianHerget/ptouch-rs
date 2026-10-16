@@ -187,15 +187,24 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             let label = if state.auto_cut { "Auto cut" } else { "No cut" };
             ui.label(label);
-            ui.add(crate::widgets::toggle(&mut state.auto_cut));
+            if ui
+                .add(crate::widgets::toggle(&mut state.auto_cut))
+                .changed()
+            {
+                state.calibration_mode = crate::state::CalibrationMode::Profile;
+            }
         })
     });
     if state.printer_target.is_bluetooth() {
         ui.label("Manual cutter");
     }
 
-    if state.printer_target.is_network() {
-        ui.checkbox(&mut state.precut, "Short margins (leading cut)");
+    if state.printer_target.is_network()
+        && ui
+            .checkbox(&mut state.precut, "Short margins (leading cut)")
+            .changed()
+    {
+        state.calibration_mode = crate::state::CalibrationMode::Profile;
     }
 
     if let Some(profile) = state.printer_quality {
@@ -218,6 +227,7 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
             });
         state.set_print_quality(quality);
     }
+    crate::calibration_ui::show(ui, state);
 }
 
 /// Whole-label mirror section: flip the entire composed label.

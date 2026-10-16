@@ -46,10 +46,28 @@ fn new_profile() -> PrinterProfile {
         quality: Quality::Standard,
         final_cut: true,
         allow_experimental: false,
+        calibrations: Vec::new(),
     }
 }
 
 impl ProfilesUi {
+    pub fn edit_profile(&mut self, alias: &str) {
+        self.open = true;
+        if let Some(entry) = self
+            .store
+            .as_ref()
+            .and_then(|store| store.entries.get(alias))
+        {
+            self.draft = entry.profile.clone();
+            self.editing = Some(alias.into());
+            self.filename = entry
+                .source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into();
+        }
+    }
     pub fn load(directory: PathBuf) -> Self {
         let mut ui = Self {
             directory,
@@ -201,6 +219,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 }
             }
             ui.separator();
+            let old_identity = (p.draft.model.clone(), p.draft.connection.clone());
             egui::Grid::new("printer_profile_fields")
                 .num_columns(2)
                 .show(ui, |ui| {
@@ -301,6 +320,10 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     );
                     ui.end_row();
                 });
+            if clear_changed_calibrations(&mut p.draft, &old_identity) {
+                ui.label("Printer changed; measured corrections cleared from this draft.");
+            }
+            crate::calibration_ui::profile_rules(ui, &mut p.draft, &mut p.error);
             if p.usb_loading {
                 ui.label("Reading USB serials…");
             }
@@ -378,6 +401,15 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
+fn clear_changed_calibrations(profile: &mut PrinterProfile, old: &(String, Connection)) -> bool {
+    if (profile.model != old.0 || profile.connection != old.1) && !profile.calibrations.is_empty() {
+        profile.calibrations.clear();
+        true
+    } else {
+        false
+    }
+}
+
 fn validate(p: &PrinterProfile) -> Result<(), String> {
     p.validate().map_err(|e| e.to_string())?;
     if let Connection::Network { host } = &p.connection {
@@ -389,6 +421,11 @@ fn validate(p: &PrinterProfile) -> Result<(), String> {
     }
     if matches!(p.connection, Connection::Network { .. }) && m.network.is_none() {
         return Err("This model has no network backend".into());
+    }
+    for rule in &p.calibrations {
+        m.quality
+            .mode(to_core_quality(rule.quality))
+            .map_err(|e| e.to_string())?;
     }
     if m.quality.mode(to_core_quality(p.quality)).is_err() {
         return Err("Quality unsupported by this model".into());
@@ -544,6 +581,45 @@ mod tests {
         let mut ui = ProfilesUi::load(directory.0.clone());
         ui.store.as_mut().unwrap().add(profile(), None).unwrap();
         ui
+    }
+
+    #[test]
+    fn corrections_follow_profiles_and_overrides_reset_on_context_changes() {
+        use crate::state::CalibrationMode;
+        let mut profile = profile();
+        profile.calibrations = vec![ptouch_profiles::CalibrationRule {
+            quality: Quality::Standard,
+            precut: true,
+            final_cut: true,
+            offset_mm: 0.75,
+        }];
+        let mut state = AppState::default();
+        state.select_target(PrinterTarget::Profile(profile.clone()));
+        assert_eq!(state.calibration_offset(), Some(0.75));
+        state.calibration_mode = CalibrationMode::Disabled;
+        assert_eq!(state.calibration_offset(), None);
+        state.calibration_mode = CalibrationMode::Custom;
+        state.calibration.offset_mm = 1.25;
+        assert_eq!(state.calibration_offset(), Some(1.25));
+        state.set_print_quality(ptouch_core::PrintQuality::HighRes);
+        assert_eq!(state.calibration_mode, CalibrationMode::Profile);
+        assert_eq!(state.calibration_offset(), None);
+        state.set_print_quality(ptouch_core::PrintQuality::Standard);
+        assert_eq!(state.calibration_offset(), Some(0.75));
+        state.auto_cut = false;
+        assert_eq!(state.calibration_offset(), None);
+        state.calibration_mode = CalibrationMode::Custom;
+        state.select_target(PrinterTarget::Usb);
+        assert_eq!(state.calibration_mode, CalibrationMode::Profile);
+        assert_eq!(state.calibration_offset(), None);
+        let identity = (profile.model.clone(), profile.connection.clone());
+        profile.alias = "renamed".into();
+        assert!(!clear_changed_calibrations(&mut profile, &identity));
+        profile.connection = Connection::Network {
+            host: "new-printer".into(),
+        };
+        assert!(clear_changed_calibrations(&mut profile, &identity));
+        assert!(profile.calibrations.is_empty());
     }
 
     #[test]

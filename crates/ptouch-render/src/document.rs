@@ -28,8 +28,8 @@ pub use crate::layout::{
 };
 
 /// Newest supported on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 5;
-/// New layouts need v5 only when custom line spacing is used.
+pub const DOCUMENT_VERSION: u32 = 6;
+/// New layouts use v4; custom line spacing needs v5 and inline styles need v6.
 pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
@@ -72,6 +72,16 @@ impl LabelDocument {
         // ignore them. Ordinary v1 documents can still round-trip as v1.
         let mut doc = self.clone();
         for element in &doc.elements {
+            if let Some(LabelObject {
+                content:
+                    ObjectContent::Text {
+                        content, styles, ..
+                    },
+                ..
+            }) = element.as_object()
+            {
+                crate::styled_text::validate_spans(content, styles)?;
+            }
             doc.version = doc.version.max(element.minimum_version());
         }
         Ok(toml::to_string(&doc)?)
@@ -115,7 +125,19 @@ impl LabelDocument {
             ));
         }
         for object in doc.elements.iter().filter_map(LabelElement::as_object) {
-            if let ObjectContent::Text { line_spacing, .. } = &object.content {
+            if let ObjectContent::Text {
+                content,
+                styles,
+                line_spacing,
+                ..
+            } = &object.content
+            {
+                crate::styled_text::validate_spans(content, styles)?;
+                if !styles.is_empty() && doc.version < 6 {
+                    return Err(RenderError::Layout(
+                        "inline text styles require layout version 6".into(),
+                    ));
+                }
                 crate::text::validate_line_spacing(*line_spacing)?;
                 if *line_spacing != crate::text::DEFAULT_LINE_SPACING && doc.version < 5 {
                     return Err(RenderError::Layout(
@@ -190,6 +212,45 @@ impl LabelDocument {
     /// [`LabelDocument::placeholders`] against the provided keys first.
     pub fn apply_values(&mut self, values: &BTreeMap<String, String>) {
         for element in &mut self.elements {
+            if let Some(LabelObject {
+                content:
+                    ObjectContent::Text {
+                        content, styles, ..
+                    },
+                ..
+            }) = element.as_object_mut()
+                && !styles.is_empty()
+            {
+                let mut rich = crate::styled_text::StyledText {
+                    text: content.clone(),
+                    spans: styles.clone(),
+                };
+                let mut replacements = Vec::new();
+                let mut rest = content.as_str();
+                let mut base = 0;
+                while let Some(start) = rest.find("{{") {
+                    let after = &rest[start + 2..];
+                    let Some(end) = after.find("}}") else {
+                        break;
+                    };
+                    let name = after[..end].trim();
+                    if is_valid_placeholder(name) {
+                        let from = content[..base + start].chars().count();
+                        let to = content[..base + start + 2 + end + 2].chars().count();
+                        replacements
+                            .push((from..to, values.get(name).cloned().unwrap_or_default()));
+                    }
+                    base += start + 2 + end + 2;
+                    rest = &content[base..];
+                }
+                for (range, value) in replacements.into_iter().rev() {
+                    let style = rich.style_at(range.start);
+                    rich.replace(range, &value, &style);
+                }
+                *content = rich.text;
+                *styles = rich.spans;
+                continue;
+            }
             if let Some(content) = element.text_content_mut() {
                 *content = substitute_placeholders(content, |name| values.get(name).cloned());
             }
@@ -369,6 +430,8 @@ pub enum ObjectContent {
             skip_serializing_if = "crate::text::is_default_line_spacing"
         )]
         line_spacing: f32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        styles: Vec<crate::styled_text::StyleSpan>,
     },
     Image {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,6 +458,7 @@ impl LabelObject {
                 content: content.into(),
                 font_size: None,
                 line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                styles: Vec::new(),
                 align: TextAlign::Left,
             },
         }
@@ -426,6 +490,11 @@ impl LabelElement {
     pub fn minimum_version(&self) -> u32 {
         match self {
             Self::Object(object) => {
+                if let ObjectContent::Text { styles, .. } = &object.content
+                    && !styles.is_empty()
+                {
+                    return 6;
+                }
                 if let ObjectContent::Text { line_spacing, .. } = &object.content
                     && *line_spacing != crate::text::DEFAULT_LINE_SPACING
                 {
@@ -1764,6 +1833,62 @@ mod tests {
             }
             _ => panic!("expected image element"),
         }
+    }
+
+    #[test]
+    fn rich_text_requires_v6_and_substitution_crosses_style_boundaries() {
+        use crate::styled_text::{StyleSpan, TextStyle};
+        let mut object = LabelObject::text("端{{port}}-A", TextBox::default());
+        if let ObjectContent::Text { styles, .. } = &mut object.content {
+            styles.push(StyleSpan {
+                start: 1,
+                end: 4,
+                style: TextStyle {
+                    bold: true,
+                    font_size: Some(18.0),
+                    ..Default::default()
+                },
+            });
+            styles.push(StyleSpan {
+                start: 5,
+                end: 8,
+                style: TextStyle {
+                    italic: true,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut doc = LabelDocument {
+            version: 4,
+            tape_width_mm: 12,
+            dpi: 180,
+            font_name: String::new(),
+            font_margin: 0,
+            flip_h: false,
+            flip_v: false,
+            elements: vec![LabelElement::Object(object)],
+        };
+        let encoded = doc.to_toml_string().unwrap();
+        assert!(encoded.contains("version = 6"));
+        assert!(
+            LabelDocument::from_toml_str(&encoded.replace("version = 6", "version = 5")).is_err()
+        );
+        doc = LabelDocument::from_toml_str(&encoded).unwrap();
+        assert_eq!(doc.to_toml_string().unwrap(), encoded);
+        assert_eq!(doc.placeholders(), vec!["port".to_string()]);
+        doc.apply_values(&BTreeMap::from([("port".into(), "网口02".into())]));
+        let ObjectContent::Text {
+            content, styles, ..
+        } = &doc.elements[0].as_object().unwrap().content
+        else {
+            unreachable!()
+        };
+        assert_eq!(content, "端网口02-A");
+        assert_eq!(styles.len(), 1);
+        assert_eq!((styles[0].start, styles[0].end), (1, 5));
+        assert!(styles[0].style.bold);
+        assert!(!styles[0].style.italic);
+        crate::styled_text::validate_spans(content, styles).unwrap();
     }
 }
 
