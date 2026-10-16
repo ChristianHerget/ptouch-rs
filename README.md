@@ -295,8 +295,9 @@ errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
 New free layouts use format version 4. Non-default line spacing requires version
-5, which older builds reject. Versions 1–4 retain their original rendering and
-version when opened and saved without using this new setting. Objects without a `content_box` keep fitting inside their slots;
+5, and inline text styles require version 6. Older builds reject newer features.
+Versions 1–5 retain their rendering and version when saved without new inline
+styles. Objects without a `content_box` keep fitting inside their slots;
 their first Object move, resize, or rotation fixes the current content size and
 saves it as v4. Content previously clipped by the slot may reappear on that
 first edit. **Convert to free layout** preserves the exact dimensions of
@@ -318,6 +319,44 @@ millimeter positions. The GUI saves a separate design DPI and shows the current
 preview DPI. A printer disconnect keeps the last printer preview until **Use
 design DPI** is selected. `--tape-width` changes the exported printable height in
 pixels, not the layout DPI or its millimeter coordinates.
+
+### Rich text within one object
+
+Select text in **Text Content**, then use **B**, **I**, **U**, the selection font,
+or the size field to format that range. With a caret, these controls format the
+next text you type. Ctrl+B/I/U (Cmd on macOS), **Undo** and **Redo** work with
+both text and formatting. Ctrl+Z undoes; Ctrl+Shift+Z or Ctrl+Y redoes. Internal
+selected-text copy/paste and object duplication retain styles. External plain
+text inherits the insertion style.
+
+**Default font (label)** supplies the font for text without an inline override.
+**Auto font size** scales the whole block while preserving the size ratios;
+turn it off to use exact point sizes. Mouse resizing of a fixed-size Object
+scales all its inline point sizes together. Slot editing retains its spacing
+behavior. Legacy text can use **Convert to free layout** to enable inline styles.
+
+Styled content is shared by GUI, templates and CLI rendering. Template matching
+uses the complete text even when a placeholder crosses style boundaries; its
+replacement inherits the placeholder's starting style. Use the millimeter
+canvas to review final output. The property editor uses the desktop's text
+layout for selection, while the canvas, image exports and printing share the
+same renderer. Font availability can affect output on another computer.
+
+Set the top-level document version to 6 when adding inline styles manually.
+Format v6 adds optional `styles` to a text object's content. Each range uses
+zero-based Unicode character offsets (end excluded), with its style in a nested
+table. For example, this makes the first four characters 12-point bold:
+
+```toml
+[[elements.content.styles]]
+start = 0
+end = 4
+[elements.content.styles.style]
+font_size = 12.0
+bold = true
+```
+
+Only styled content needs v6; plain text keeps the original rendering path.
 
 ### Optional print-position calibration
 

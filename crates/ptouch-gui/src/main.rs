@@ -13,6 +13,7 @@
 mod app;
 mod panels;
 mod printer_worker;
+mod rich_text_editor;
 mod state;
 mod widgets;
 
