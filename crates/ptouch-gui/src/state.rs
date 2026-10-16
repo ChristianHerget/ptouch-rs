@@ -138,6 +138,8 @@ pub struct AppState {
     pub elements: Vec<LabelElement>,
     /// Index of the currently selected element, if any.
     pub selected_element: Option<usize>,
+    /// Isolate unfinished widget drafts across selections and structural edits.
+    pub selection_revision: u64,
     /// Current tape width in millimeters.
     pub tape_width_mm: u8,
     /// Current tape width in pixels (derived from tape_width_mm).
@@ -218,6 +220,7 @@ impl Default for AppState {
             document_version: DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
+            selection_revision: 0,
             tape_width_mm: 12,
             tape_width_px: 76,
             design_dpi: 180,
@@ -274,6 +277,9 @@ impl AppState {
     /// upgrade the file format, or request a different rendered bitmap.
     pub fn select_canvas_target(&mut self, target: Option<CanvasTarget>) {
         let target = target.filter(|target| target.element < self.elements.len());
+        if self.selected_canvas_target() != target {
+            self.selection_revision = self.selection_revision.wrapping_add(1);
+        }
         self.selected_element = target.map(|target| target.element);
         if let Some(target) = target {
             self.canvas_edit_target = target.edit;
@@ -620,6 +626,7 @@ impl AppState {
 
     /// Ensure the selected element index is valid.
     pub fn validate_selection(&mut self) {
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         if let Some(idx) = self.selected_element
             && idx >= self.elements.len()
         {
