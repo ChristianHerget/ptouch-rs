@@ -256,30 +256,22 @@ impl PtouchApp {
     }
 }
 
-impl eframe::App for PtouchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl PtouchApp {
+    fn show_editor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.drain_printer_responses();
         crate::editor::begin_frame(&ctx, &mut self.state);
 
         ui.add_enabled_ui(!self.state.symbol_picker.is_open(), |ui| {
             // Top toolbar
-            egui::Panel::top("toolbar").show(ui, |ui| {
-                panels::toolbar::show_toolbar(ui, &mut self.state);
-            });
+            let toolbar_action = egui::Panel::top("toolbar")
+                .show(ui, |ui| panels::toolbar::show_toolbar(ui, &mut self.state))
+                .inner;
 
             // Bottom status bar
             egui::Panel::bottom("status_bar").show(ui, |ui| {
                 panels::status_bar::show_status_bar(ui, &self.state);
             });
-
-            // Left sidebar
-            egui::Panel::left("sidebar")
-                .default_size(200.0)
-                .resizable(true)
-                .show(ui, |ui| {
-                    panels::sidebar::show_sidebar(ui, &mut self.state);
-                });
 
             // Reordering or opening a file invalidates geometry by element index.
             // Properties must freeze the current object's geometry on first edit.
@@ -297,6 +289,25 @@ impl eframe::App for PtouchApp {
                     });
                 });
 
+            if self.state.needs_rerender {
+                self.update_preview(&ctx);
+            }
+
+            // Commit the old selection before list and creation actions.
+            // Left sidebar
+            egui::Panel::left("sidebar")
+                .default_size(200.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    panels::sidebar::show_sidebar(ui, &mut self.state);
+                });
+
+            if self.state.needs_rerender {
+                self.update_preview(&ctx);
+            }
+            if let Some(action) = toolbar_action {
+                panels::toolbar::execute_action(&mut self.state, action);
+            }
             if self.state.needs_rerender {
                 self.update_preview(&ctx);
             }
@@ -342,7 +353,7 @@ impl eframe::App for PtouchApp {
             if *frames == 3 {
                 // Exercise the free-layout canvas and native SVG rendering too.
                 self.state.elements.clear();
-                self.state.document_version = ptouch_render::document::DOCUMENT_VERSION;
+                self.state.document_version = ptouch_render::document::DEFAULT_DOCUMENT_VERSION;
                 self.state.add_text();
                 let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><path d="M1 3L7 1" stroke="black"/></svg>"#;
                 self.state.add_image_bytes(None, svg.to_vec());
@@ -371,6 +382,12 @@ impl eframe::App for PtouchApp {
 
         // Periodic repaint so we pick up worker responses even when idle
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+}
+
+impl eframe::App for PtouchApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_editor(ui);
     }
 }
 
@@ -948,5 +965,302 @@ mod tests {
                 .is_none()
         );
         assert_eq!(app.state.document_version, 4);
+    }
+    #[test]
+    fn v5_spacing_and_symbols_reopen_and_preview_at_every_quality() {
+        use ptouch_render::document::{
+            LabelDocument, ObjectContent, render_document_at_resolution,
+        };
+        let mut state = AppState::default();
+        state.add_text();
+        if let ObjectContent::Text {
+            content,
+            line_spacing,
+            ..
+        } = &mut state.elements[0].as_object_mut().unwrap().content
+        {
+            *content = "{{port}}\nLAN".into();
+            *line_spacing = 0.8;
+        }
+        let icon = crate::symbols::catalogue()
+            .icons
+            .iter()
+            .find(|icon| icon.id == "ethernet")
+            .unwrap();
+        assert!(state.add_image_bytes(None, icon.svg()));
+        // Both physical printer profiles must have room for the saved frames.
+        for element in &mut state.elements {
+            let object = element.as_object_mut().unwrap();
+            object.frame.height_mm = 10.0;
+            object.content_box.as_mut().unwrap().height_mm = 10.0;
+        }
+        let saved = state.document().to_toml_string().unwrap();
+        let mut document = LabelDocument::from_toml_str(&saved).unwrap();
+        assert_eq!(document.version, 5);
+        assert_eq!(
+            document.elements[1].display_name(),
+            state.elements[1].display_name()
+        );
+        document.apply_values(&std::collections::BTreeMap::from([(
+            "port".into(),
+            "PORT 1".into(),
+        )]));
+        let ctx = egui::Context::default();
+        let mut renderer = TextRenderer::new();
+        for (model, head, height) in [("PT-P750W", 180, 76), ("PT-9700PC", 360, 150)] {
+            let profile = ptouch_core::quality::QualityProfile::for_model(model, head);
+            let (mut app, _) = app(AppState {
+                printer_connected: true,
+                printer_dpi: head,
+                tape_width_px: height,
+                printer_quality: Some(profile),
+                ..Default::default()
+            });
+            crate::panels::toolbar::apply_layout(&mut app.state, document.clone()).unwrap();
+            for mode in profile.modes {
+                app.state.set_print_quality(mode.quality);
+                app.update_preview(&ctx);
+                let preview = app
+                    .state
+                    .output_preview()
+                    .unwrap_or_else(|| panic!("{}", app.state.status_message));
+                let expected = render_document_at_resolution(
+                    &document,
+                    height,
+                    mode.resolution,
+                    &mut renderer,
+                )
+                .unwrap()
+                .bitmap
+                .unwrap();
+                assert_eq!(preview.bitmap.data(), expected.data());
+                assert_eq!(preview.bitmap.width(), expected.width());
+                assert_eq!(preview.bitmap.height(), expected.height());
+            }
+        }
+    }
+
+    #[test]
+    fn property_text_undo_and_redo_preserve_keyboard_focus() {
+        let text = |app: &PtouchApp| match &app.state.elements[0].as_object().unwrap().content {
+            ptouch_render::document::ObjectContent::Text { content, .. } => content.clone(),
+            _ => panic!("expected text"),
+        };
+        let mut state = AppState::default();
+        state.add_text();
+        let (mut app, _) = app(state);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut PtouchApp, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 680.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_editor(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Label" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(&mut app, vec![egui::Event::Text("X".into())]);
+        let input = ctx.memory(|memory| memory.focused()).unwrap();
+        assert_ne!(text(&app), "Label");
+        for (redo, expected) in [(false, false), (true, true)] {
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: if redo {
+                        egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT)
+                    } else {
+                        egui::Modifiers::COMMAND
+                    },
+                }],
+            );
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(input));
+            assert_eq!(text(&app).contains('X'), expected);
+        }
+    }
+
+    #[test]
+    fn pending_numeric_edits_do_not_leak_through_toolbar_or_list_selection() {
+        use ptouch_render::document::{LabelElement, LabelObject, TextBox};
+        for action in ["select", "add", "print"] {
+            let (command_tx, command_rx) = mpsc::channel();
+            let mut state = AppState {
+                printer_connected: action == "print",
+                printer_quality: Some(ptouch_core::quality::QualityProfile::for_model(
+                    "PT-P750W", 180,
+                )),
+                printer_cmd_tx: Some(command_tx),
+                selected_element: Some(0),
+                canvas_edit_target: crate::state::CanvasEditTarget::Slot,
+                ..Default::default()
+            };
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "PORT",
+                TextBox {
+                    width_mm: 14.5,
+                    ..Default::default()
+                },
+            )));
+            state.elements.push(LabelElement::Object(LabelObject::text(
+                "NEXT",
+                TextBox {
+                    x_mm: 30.0,
+                    width_mm: 20.0,
+                    ..Default::default()
+                },
+            )));
+            let (mut app, _tx) = app(state);
+            let ctx = egui::Context::default();
+            let mut frame = |events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 680.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.show_editor(ui),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let center = |output: &egui::FullOutput, text: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|s| {
+                        if let egui::Shape::Text(t) = &s.shape
+                            && t.galley.job.text == text
+                        {
+                            Some(t.pos + t.galley.size() / 2.0)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing text: {text}; visible: {:?}",
+                            output
+                                .shapes
+                                .iter()
+                                .filter_map(|s| if let egui::Shape::Text(t) = &s.shape {
+                                    Some(&t.galley.job.text)
+                                } else {
+                                    None
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    })
+            };
+            let click = |pos| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            frame(vec![]);
+            let output = frame(vec![]);
+            let input = center(&output, "14.5");
+            let action_pos = center(
+                &output,
+                match action {
+                    "add" => "Add Text",
+                    "print" => "Print",
+                    _ => "2. Text: NEXT",
+                },
+            );
+            frame(click(input));
+            frame(vec![]);
+            frame(vec![egui::Event::Text("14,6".into())]);
+            frame(click(action_pos));
+            frame(vec![]);
+            assert_eq!(
+                app.state.elements[0].as_object().unwrap().frame.width_mm,
+                14.6
+            );
+            assert_eq!(
+                app.state.elements.len(),
+                if action == "add" { 3 } else { 2 }
+            );
+            assert_eq!(
+                app.state.selected_element,
+                Some(match action {
+                    "add" => 2,
+                    "print" => 0,
+                    _ => 1,
+                })
+            );
+            assert_eq!(
+                app.state.elements[1].as_object().unwrap().frame.width_mm,
+                20.0
+            );
+            if action == "print" {
+                let crate::state::PrinterCommand::Print { raster_lines, .. } =
+                    command_rx.try_recv().unwrap()
+                else {
+                    panic!("expected a print command");
+                };
+                let preview = app.state.output_preview().unwrap();
+                assert_eq!(
+                    raster_lines,
+                    ptouch_render::raster::bitmap_to_raster_lines(
+                        &preview.bitmap,
+                        app.state.printer_max_px,
+                    )
+                );
+            }
+        }
     }
 }

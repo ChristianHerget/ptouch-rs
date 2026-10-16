@@ -352,6 +352,16 @@ fn render_document_impl(
     let ppm = f64::from(target_dpi) / 25.4;
 
     for (index, element) in doc.elements.iter().enumerate() {
+        if let LabelElement::Object(object) = element
+            && let ObjectContent::Text { line_spacing, .. } = &object.content
+        {
+            crate::text::validate_line_spacing(*line_spacing)?;
+            if *line_spacing != crate::text::DEFAULT_LINE_SPACING && doc.version < 5 {
+                return Err(RenderError::Layout(
+                    "custom line spacing requires layout version 5".into(),
+                ));
+            }
+        }
         let framed = match element {
             LabelElement::Text {
                 text_box: Some(frame),
@@ -440,6 +450,7 @@ fn render_document_impl(
                             content,
                             *font_size,
                             *align,
+                            crate::text::DEFAULT_LINE_SPACING,
                             rotation,
                             frame.vertical_align,
                             width,
@@ -755,6 +766,7 @@ pub fn convert_to_objects(
                                 size * 72.0 / f32::from(target_dpi)
                             }
                         }),
+                        line_spacing: crate::text::DEFAULT_LINE_SPACING,
                         align: *align,
                     },
                 }
@@ -962,11 +974,13 @@ fn render_object(
             content,
             font_size,
             align,
+            line_spacing,
         } => render_box(
             renderer,
             content,
             *font_size,
             *align,
+            *line_spacing,
             rotation,
             object.frame.vertical_align,
             width,
@@ -1137,6 +1151,7 @@ fn render_box(
     content: &str,
     font_size_pt: Option<f32>,
     align: TextAlign,
+    line_spacing: f32,
     rotation: f32,
     vertical_align: VerticalAlign,
     width: u32,
@@ -1158,7 +1173,7 @@ fn render_box(
         .filter(|h| *h > 0)
         .ok_or_else(|| RenderError::Layout("font margin leaves no space in the text box".into()))?;
     let mut render = |size: f32| -> Result<(LabelBitmap, u32, u32)> {
-        let source = renderer.render_unbounded(content, font_name, size, align)?;
+        let source = renderer.render_unbounded(content, font_name, size, align, line_spacing)?;
         Ok((
             checked_rotate(&source, rotation)?,
             source.width(),
@@ -1429,6 +1444,79 @@ mod tests {
         for (a, b) in rendered.bounds.iter().zip(&flipped.bounds) {
             assert_eq!(b.x, boundary(40.0, 180).unwrap() - a.x - a.width);
             assert_eq!(b.y, 76 - a.y - a.height);
+        }
+    }
+
+    #[test]
+    fn custom_line_spacing_changes_leading_without_moving_template_slots() {
+        for dpi in [180, 360] {
+            for text in ["Ag", "Ag\ngp\n汉字", ""] {
+                let frame = TextBox {
+                    x_mm: 5.0,
+                    width_mm: 20.0,
+                    height_mm: 10.0,
+                    ..Default::default()
+                };
+                let mut item = LabelObject::text(text, frame);
+                item.content_box = Some(ContentBox {
+                    width_mm: 20.0,
+                    height_mm: 10.0,
+                    offset_x_mm: 0.0,
+                    offset_y_mm: 0.0,
+                });
+                if let ObjectContent::Text { font_size, .. } = &mut item.content {
+                    *font_size = Some(6.0);
+                }
+                let mut doc = document(vec![
+                    LabelElement::Object(item),
+                    element(
+                        "",
+                        TextBox {
+                            position: PositionMode::Relative,
+                            gap_mm: 2.8,
+                            ..Default::default()
+                        },
+                    ),
+                ]);
+                doc.version = 4;
+                let before = render(&doc, dpi);
+                doc.version = 5;
+                if let ObjectContent::Text { line_spacing, .. } =
+                    &mut doc.elements[0].as_object_mut().unwrap().content
+                {
+                    *line_spacing = 0.8;
+                }
+                let after = render(&doc, dpi);
+                assert_eq!(before.bounds, after.bounds);
+                assert_eq!(before.content_bounds, after.content_bounds);
+                let before = before.bitmap.unwrap();
+                let after = after.bitmap.unwrap();
+                if text.contains('\n') {
+                    let (_, top_before, _, bottom_before) = ink_bounds(&before);
+                    let (_, top_after, _, bottom_after) = ink_bounds(&after);
+                    assert!(bottom_after - top_after < bottom_before - top_before);
+                } else {
+                    assert_eq!(before.data(), after.data());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_spacing_requires_v5_and_validates_even_empty_text() {
+        for spacing in [0.8, 0.0, 0.49, 3.01, f32::NAN, f32::INFINITY] {
+            let mut object = LabelObject::text("", TextBox::default());
+            if let ObjectContent::Text { line_spacing, .. } = &mut object.content {
+                *line_spacing = spacing;
+            }
+            let mut doc = document(vec![LabelElement::Object(object)]);
+            doc.version = 4;
+            assert!(render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_err());
+            doc.version = 5;
+            assert_eq!(
+                render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_ok(),
+                spacing == 0.8
+            );
         }
     }
 
@@ -1707,6 +1795,7 @@ mod tests {
             ObjectContent::Text {
                 content: "{{port}}".into(),
                 font_size: None,
+                line_spacing: crate::text::DEFAULT_LINE_SPACING,
                 align: TextAlign::Center,
             },
             image_content(solid_bitmap(40, 20)),
@@ -2414,6 +2503,7 @@ mod tests {
             ObjectContent::Text {
                 content: String::new(),
                 font_size: None,
+                line_spacing: crate::text::DEFAULT_LINE_SPACING,
                 align: TextAlign::Left,
             },
         ] {
@@ -2466,6 +2556,7 @@ mod tests {
                     ObjectContent::Text {
                         content: "汉字".into(),
                         font_size,
+                        line_spacing: crate::text::DEFAULT_LINE_SPACING,
                         align: TextAlign::Center,
                     },
                     TextBox {
@@ -2546,6 +2637,7 @@ mod tests {
                         content: String::new(),
                         font_size: None,
                         align: TextAlign::Left,
+                        line_spacing: crate::text::DEFAULT_LINE_SPACING,
                     },
                     frame,
                     8.19,

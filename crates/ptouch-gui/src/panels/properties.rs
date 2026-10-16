@@ -17,6 +17,19 @@ use crate::state::{AppState, CanvasEditTarget, LabelElement};
 
 /// Render the right-side properties panel.
 pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.push_id(
+        (
+            state.selection_revision,
+            state.selected_element,
+            state.canvas_edit_target == CanvasEditTarget::Slot,
+        ),
+        |ui| {
+            show_selected_properties(ui, state);
+        },
+    );
+}
+
+fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading(
         match state.selected_canvas_target().map(|target| target.edit) {
             Some(CanvasEditTarget::Content) => "Object properties",
@@ -258,7 +271,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
         if crate::editor::content_input(
             ui,
             &mut state.editor,
-            egui::DragValue::new(rotation)
+            crate::widgets::decimal_drag(rotation)
                 .speed(1.0)
                 .clamp_existing_to_range(false)
                 .range(-360.0..=360.0)
@@ -356,7 +369,7 @@ fn show_font_properties(
             changed |= crate::editor::content_input(
                 ui,
                 &mut state.editor,
-                egui::DragValue::new(size)
+                crate::widgets::decimal_drag(size)
                     .speed(0.5)
                     .clamp_existing_to_range(false)
                     .range(1.0..=200.0),
@@ -379,7 +392,7 @@ fn show_font_properties(
         changed |= crate::editor::content_input(
             ui,
             &mut state.editor,
-            egui::DragValue::new(&mut state.font_margin)
+            crate::widgets::decimal_drag(&mut state.font_margin)
                 .clamp_existing_to_range(false)
                 .range(0..=50),
         )
@@ -465,16 +478,28 @@ fn show_text_box(
                 ("Height", &mut bounds.height_mm, printable_height),
             ] {
                 ui.label(label);
+                let requested = std::cell::Cell::new(None);
                 let edited = crate::editor::content_input(
                     ui,
                     &mut state.editor,
-                    egui::DragValue::new(value)
+                    crate::widgets::decimal_drag(value)
+                        .custom_parser(|text| {
+                            let parsed = crate::widgets::parse_decimal(text);
+                            requested.set(parsed);
+                            parsed
+                        })
                         .speed(0.1)
                         .clamp_existing_to_range(false)
                         .range(minimum..=maximum)
                         .suffix(" mm"),
                 )
                 .changed();
+                if label == "Height" && requested.get().is_some_and(|height| height > maximum) {
+                    state.status_message = format!(
+                        "Height limited to the printable area: {maximum:.3} mm on {} mm tape.",
+                        state.tape_width_mm
+                    );
+                }
                 changed |= edited;
                 height_changed |= label == "Height" && edited;
                 ui.end_row();
@@ -487,7 +512,7 @@ fn show_text_box(
             changed |= crate::editor::content_input(
                 ui,
                 &mut state.editor,
-                egui::DragValue::new(value)
+                crate::widgets::decimal_drag(value)
                     .speed(0.1)
                     .clamp_existing_to_range(false)
                     .range(0.0..=10_000.0)
@@ -499,7 +524,7 @@ fn show_text_box(
             changed |= crate::editor::content_input(
                 ui,
                 &mut state.editor,
-                egui::DragValue::new(&mut bounds.y_mm)
+                crate::widgets::decimal_drag(&mut bounds.y_mm)
                     .speed(0.1)
                     .clamp_existing_to_range(false)
                     .range(0.0..=(printable_height - bounds.height_mm).max(0.0))
@@ -591,7 +616,7 @@ fn show_content_box(
                     changed |= crate::editor::content_input(
                         ui,
                         &mut state.editor,
-                        egui::DragValue::new(value)
+                        crate::widgets::decimal_drag(value)
                             .speed(0.1)
                             .clamp_existing_to_range(false)
                             .range(min..=10_000.0)
@@ -653,6 +678,7 @@ fn show_object_properties(
             content,
             font_size,
             align,
+            line_spacing,
         } => {
             ui.label("Text Content:");
             changed |= crate::editor::content_input(
@@ -665,6 +691,14 @@ fn show_object_properties(
             .changed();
             ui.small("Template variables such as {{port}} keep the frame in place.");
             changed |= show_font_properties(ui, font_size, align, true, state);
+            ui.horizontal(|ui| {
+                ui.label("Line spacing:");
+                changed |= crate::editor::content_input(ui, &mut state.editor, crate::widgets::decimal_drag(line_spacing)
+                    .range(ptouch_render::text::LINE_SPACING_RANGE)
+                    .speed(0.05).min_decimals(2).max_decimals(2).suffix(" ×"))
+                    .on_hover_text("Baseline distance as a multiple of font size. 1.20 keeps the original spacing.")
+                    .changed();
+            });
         }
         ObjectContent::Image {
             path,
@@ -726,7 +760,7 @@ fn show_object_properties(
     let mut rotation_changed = crate::editor::content_input(
         ui,
         &mut state.editor,
-        egui::DragValue::new(&mut rotation)
+        crate::widgets::decimal_drag(&mut rotation)
             .speed(1.0)
             .clamp_existing_to_range(false)
             .range(-360.0..=360.0)
@@ -858,7 +892,7 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
             if crate::editor::content_input(
                 ui,
                 &mut state.editor,
-                egui::DragValue::new(h)
+                crate::widgets::decimal_drag(h)
                     .speed(1.0)
                     .clamp_existing_to_range(false)
                     .range(1..=1000),
@@ -879,7 +913,7 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
         if crate::editor::content_input(
             ui,
             &mut state.editor,
-            egui::DragValue::new(rotation)
+            crate::widgets::decimal_drag(rotation)
                 .speed(1.0)
                 .clamp_existing_to_range(false)
                 .range(-360.0..=360.0)
@@ -941,7 +975,7 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32, state: &mut AppS
         if crate::editor::content_input(
             ui,
             &mut state.editor,
-            egui::DragValue::new(pixels)
+            crate::widgets::decimal_drag(pixels)
                 .speed(1.0)
                 .clamp_existing_to_range(false)
                 .range(1..=500),

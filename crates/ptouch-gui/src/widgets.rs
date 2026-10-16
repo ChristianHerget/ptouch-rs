@@ -113,6 +113,30 @@ pub fn icon_positions(ctx: &egui::Context, icon: Icon) -> Vec<egui::Pos2> {
         .collect()
 }
 
+/// Parse an ungrouped decimal using either decimal separator. Never accept a
+/// numeric prefix, ambiguous grouping, non-finite values, or internal spaces.
+pub fn parse_decimal(text: &str) -> Option<f64> {
+    let text = text.trim().replace('−', "-");
+    if text.chars().any(char::is_whitespace)
+        || text.contains(',') && text.contains('.')
+        || text.matches(',').count() > 1
+    {
+        return None;
+    }
+    text.replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+/// Commit keyboard edits as a whole; dragging still updates immediately.
+pub fn decimal_drag<N: egui::emath::Numeric>(value: &mut N) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .custom_parser(parse_decimal)
+        .update_while_editing(false)
+        .clamp_existing_to_range(false)
+}
+
 /// Build an image file dialog with per-format filters.
 ///
 /// The first filter is "All Images" (default), followed by individual
@@ -181,4 +205,96 @@ fn toggle_ui(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_input_accepts_both_separators_but_rejects_ambiguous_values() {
+        for (input, expected) in [
+            ("14,5", 14.5),
+            ("14.5", 14.5),
+            (" −0,25 ", -0.25),
+            (",5", 0.5),
+            ("1.2e2", 120.0),
+        ] {
+            assert_eq!(parse_decimal(input), Some(expected), "{input}");
+        }
+        for input in [
+            "14,5.0",
+            "1,234,567",
+            "1 234",
+            "14foo",
+            "NaN",
+            "inf",
+            "1e999",
+            "",
+            "-",
+        ] {
+            assert_eq!(parse_decimal(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn keyboard_edits_commit_whole_values_on_enter_or_blur() {
+        for (text, expected) in [("14,5", 14.5), ("14.5", 14.5), ("14,5.0", 8.125)] {
+            for enter in [false, true] {
+                let context = egui::Context::default();
+                let mut value = 8.125;
+                let mut rect = egui::Rect::NOTHING;
+                let mut frame = |events| {
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(800.0, 600.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            rect = ui.add(decimal_drag(&mut value).suffix(" mm")).rect;
+                        },
+                    );
+                    output.textures_delta.clear();
+                    (rect, value)
+                };
+                let click = |pos| {
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                };
+                let (rect, _) = frame(vec![]);
+                frame(click(rect.center()));
+                frame(vec![]);
+                assert_eq!(frame(vec![egui::Event::Text(text.into())]).1, 8.125);
+                if enter {
+                    frame(vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                } else {
+                    frame(click(egui::pos2(300.0, 300.0)));
+                }
+                assert_eq!(frame(vec![]).1, expected, "{text}, enter={enter}");
+            }
+        }
+    }
 }

@@ -319,6 +319,9 @@ The preview shows the full tape with shaded unprintable margins. The Y ruler
 starts at the printable top and ends at the actual printable height; a separate
 dimension shows the nominal tape width. The Tape section reports printable
 height, dot count, DPI, and whether the preview uses a printer or design settings.
+Numeric fields accept either `14.5` or `14,5`; press Enter or leave the field to
+apply the complete value. Object and frame outlines use physical dimensions,
+so equal boxes share an edge independently of print pixel rounding.
 
 New text starts in a 10 mm wide frame with automatic font size and the full
 printable height. **Fill printable height** sets an existing frame to Y=0 and
@@ -328,7 +331,15 @@ frames keep their dimensions when the tape or printer changes.
 The first object starts at X=0, Y=0. Subsequent frames start 3 mm after the rightmost frame, using absolute
 coordinates. Images keep their aspect ratio inside their object boxes.
 
+Use **Duplicate** in a row action menu or context menu, or Ctrl+D (Cmd+D on
+macOS), to copy any element with its settings. The copy follows the source in
+the list: relative frames reuse their gap; absolute frames start 3 mm after the
+source. Following relative frames move along;
+existing absolute frames stay put. Text-field shortcuts retain their normal use.
+
 Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
+Click the image row to move, resize or rotate its object; select **Frame** to edit
+its absolute position or gap, just like text.
 The source bytes are embedded in the saved `.ptl`, so reopening does not require
 the original image file. SVG sources should embed any linked images as well.
 
@@ -344,8 +355,11 @@ objects. The list order also determines which overlapping object is selected.
 Object width and height describe the unrotated content box; offsets move its
 center relative to the frame center. Auto font size fits that box without
 stretching letters; an explicit size uses points and clipped text raises a
-warning. Rotation keeps the object size and frame spacing. Content can overlap
-neighboring frames or extend the label length; the printable tape edges clip it
+warning. **Line spacing** controls baseline distance as a multiple of font size
+(0.5–3.0); 1.20 preserves the original spacing. Reduce it for compact multiline
+labels. Custom values are saved as `line_spacing` in the text object's
+`[elements.content]` table. Rotation keeps the object size and frame spacing.
+Content can overlap neighboring frames or extend the label length; the printable tape edges clip it
 with a warning. **Auto fit frame** restores the older fit-inside-frame behavior.
 
 The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
@@ -370,9 +384,10 @@ zero or excessive dimensions, and frames beyond the printable tape height are
 errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
-New free layouts use format version 4, which older builds reject. Versions 1,
-2, and 3 retain their original rendering and version when opened and saved
-unchanged. Objects without a `content_box` keep fitting inside their frames;
+New free layouts use format version 4. Non-default line spacing requires version
+5, which older builds reject. Versions 1–4 retain their original rendering and
+version when opened and saved without using this new setting. Objects without
+a `content_box` keep fitting inside their frames;
 their first Object move, resize, or rotation fixes the current content size and
 saves it as v4. Content previously clipped by the frame may reappear on that
 first edit. **Convert to free layout** preserves the exact dimensions of

@@ -8,8 +8,8 @@ use std::sync::mpsc;
 use crate::preview::RenderedPreview;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_render::document::{
-    ContentBox, ContentGeometry, DOCUMENT_VERSION, ElementBounds, LabelDocument, LabelObject,
-    ObjectContent, PositionMode, TextBox,
+    ContentBox, ContentGeometry, DEFAULT_DOCUMENT_VERSION, ElementBounds, LabelDocument,
+    LabelObject, ObjectContent, PositionMode, TextBox,
 };
 use ptouch_render::text::{TextAlign, TextRenderer};
 
@@ -190,6 +190,8 @@ pub struct AppState {
     pub elements: Vec<LabelElement>,
     /// Index of the currently selected element, if any.
     pub selected_element: Option<usize>,
+    /// Isolate unfinished widget drafts across selections and structural edits.
+    pub selection_revision: u64,
     /// Current tape width in millimeters.
     pub tape_width_mm: u8,
     /// Current tape width in pixels (derived from tape_width_mm).
@@ -276,9 +278,10 @@ impl Default for AppState {
             media_code: 0,
             job_timeout_secs: 600,
             band_left: None,
-            document_version: DOCUMENT_VERSION,
+            document_version: DEFAULT_DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
+            selection_revision: 0,
             tape_width_mm: 12,
             tape_width_px: 76,
             design_dpi: 180,
@@ -378,6 +381,9 @@ impl AppState {
     /// upgrade the file format, or request a different rendered bitmap.
     pub fn select_canvas_target(&mut self, target: Option<CanvasTarget>) {
         let target = target.filter(|target| target.element < self.elements.len());
+        if self.selected_canvas_target() != target {
+            self.selection_revision = self.selection_revision.wrapping_add(1);
+        }
         self.select_element(target.map(|target| target.element));
         if let Some(target) = target {
             self.canvas_edit_target = target.edit;
@@ -473,14 +479,7 @@ impl AppState {
             .elements
             .iter()
             .fold(self.document_version, |version, element| {
-                version.max(match element {
-                    LabelElement::Object(object) if object.content_box.is_some() => 4,
-                    LabelElement::Object(_) => 3,
-                    LabelElement::Text {
-                        text_box: Some(_), ..
-                    } => 2,
-                    _ => 1,
-                })
+                version.max(element.minimum_version())
             });
         LabelDocument {
             version,
@@ -724,6 +723,7 @@ impl AppState {
     /// Keep the editable angle buffer in sync when selection changes surfaces.
     pub fn select_element(&mut self, selection: Option<usize>) {
         if self.selected_element != selection {
+            self.selection_revision = self.selection_revision.wrapping_add(1);
             self.editor.history.finish_group();
             self.editor.clear_text_cursor();
         }
@@ -1095,9 +1095,218 @@ mod tests {
     }
 
     #[test]
+    fn duplicates_insert_into_relative_chains_without_moving_absolute_anchors() {
+        let object = |x, position, gap| {
+            LabelElement::Object(LabelObject::text(
+                "PORT",
+                TextBox {
+                    x_mm: x,
+                    position,
+                    gap_mm: gap,
+                    ..Default::default()
+                },
+            ))
+        };
+        let mut state = AppState {
+            elements: vec![
+                object(5.0, PositionMode::Absolute, 3.0),
+                object(0.0, PositionMode::Relative, 2.8),
+                object(100.0, PositionMode::Absolute, 3.0),
+            ],
+            selected_element: Some(0),
+            canvas_edit_target: CanvasEditTarget::Slot,
+            ..Default::default()
+        };
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                state.selected_element.unwrap()
+            ))
+        );
+        assert_eq!(state.selected_element, Some(1));
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+        for (i, x) in [5.0, 18.0, 30.8, 100.0].into_iter().enumerate() {
+            assert!((state.element_rect_mm(i).unwrap().0 - x).abs() < 1e-10);
+        }
+        assert!(state.apply_editor_action(crate::editor::EditorAction::Duplicate(2)));
+        assert!((state.element_rect_mm(3).unwrap().0 - 43.6).abs() < 1e-10);
+        assert_eq!(state.element_rect_mm(4).unwrap().0, 100.0);
+        assert!(!state.apply_editor_action(crate::editor::EditorAction::Duplicate(999)));
+    }
+
+    #[test]
+    fn duplicate_all_object_types_keeps_content_transforms_and_embedded_images() {
+        let image = LabelObject::image_from_bytes(None, br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>"#.to_vec(), TextBox::default());
+        for content in [
+            ObjectContent::Text {
+                content: "{{port}}".into(),
+                font_size: Some(9.0),
+                line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
+                align: TextAlign::Right,
+            },
+            image.content,
+            ObjectContent::CutMark,
+            ObjectContent::Padding,
+        ] {
+            let object = LabelObject {
+                frame: TextBox {
+                    x_mm: 5.0,
+                    ..Default::default()
+                },
+                content_box: Some(ContentBox {
+                    width_mm: 7.0,
+                    height_mm: 3.0,
+                    offset_x_mm: 0.8,
+                    offset_y_mm: -0.2,
+                }),
+                rotation: 30.0,
+                flip_h: true,
+                flip_v: true,
+                content,
+            };
+            let mut state = AppState {
+                document_version: 4,
+                elements: vec![LabelElement::Object(object.clone())],
+                selected_element: Some(0),
+                ..Default::default()
+            };
+            assert!(
+                state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                    state.selected_element.unwrap()
+                ))
+            );
+            let saved = state.document().to_toml_string().unwrap();
+            let restored = LabelDocument::from_toml_str(&saved).unwrap();
+            let copy = restored.elements[1].as_object().unwrap();
+            assert_eq!(copy.content_box, object.content_box);
+            assert_eq!(
+                (copy.rotation, copy.flip_h, copy.flip_v),
+                (30.0, true, true)
+            );
+            assert_eq!(copy.frame.x_mm, 18.0);
+            let mut normalized = restored.clone();
+            normalized.elements[1].as_object_mut().unwrap().frame = object.frame.clone();
+            let mut first = normalized.clone();
+            first.elements.truncate(1);
+            normalized.elements.remove(0);
+            assert_eq!(
+                normalized.to_toml_string().unwrap(),
+                first.to_toml_string().unwrap()
+            );
+            if let ObjectContent::Image {
+                bitmap, image_data, ..
+            } = &copy.content
+            {
+                assert!(bitmap.is_some());
+                assert!(!image_data.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn duplication_keeps_legacy_versions_and_does_not_pin_auto_fit_objects() {
+        let legacy = LabelElement::Text {
+            content: "PORT".into(),
+            font_size: None,
+            align: TextAlign::Center,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            text_box: None,
+        };
+        let mut boxed = legacy.clone();
+        if let LabelElement::Text { text_box, .. } = &mut boxed {
+            *text_box = Some(TextBox {
+                x_mm: 5.0,
+                ..Default::default()
+            });
+        }
+        for (version, elements) in [
+            (
+                1,
+                vec![
+                    legacy,
+                    LabelElement::CutMark,
+                    LabelElement::Padding { pixels: 20 },
+                ],
+            ),
+            (2, vec![boxed]),
+            (
+                3,
+                vec![LabelElement::Object(LabelObject::text(
+                    "PORT",
+                    TextBox::default(),
+                ))],
+            ),
+        ] {
+            for index in 0..elements.len() {
+                let mut state = AppState {
+                    document_version: version,
+                    elements: elements.clone(),
+                    selected_element: Some(index),
+                    ..Default::default()
+                };
+                assert!(
+                    state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                        state.selected_element.unwrap()
+                    ))
+                );
+                let restored =
+                    LabelDocument::from_toml_str(&state.document().to_toml_string().unwrap())
+                        .unwrap();
+                assert_eq!(restored.version, version);
+                assert_eq!(restored.elements.len(), elements.len() + 1);
+                if let Some(object) = restored.elements[index + 1].as_object() {
+                    assert!(object.content_box.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_spacing_upgrades_render_and_save_together_and_survives_duplication() {
+        let mut state = AppState::default();
+        state.add_text();
+        assert_eq!(state.document().version, 4);
+        if let ObjectContent::Text { line_spacing, .. } =
+            &mut state.elements[0].as_object_mut().unwrap().content
+        {
+            *line_spacing = 0.9;
+        }
+        assert_eq!(state.document().version, 5);
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                state.selected_element.unwrap()
+            ))
+        );
+        let saved = state.document().to_toml_string().unwrap();
+        let restored = LabelDocument::from_toml_str(&saved).unwrap();
+        assert_eq!(restored.version, 5);
+        for element in &restored.elements {
+            assert!(
+                matches!(element.as_object().unwrap().content, ObjectContent::Text { line_spacing, .. } if line_spacing == 0.9)
+            );
+        }
+        for element in &mut state.elements {
+            if let ObjectContent::Text { line_spacing, .. } =
+                &mut element.as_object_mut().unwrap().content
+            {
+                *line_spacing = ptouch_render::text::DEFAULT_LINE_SPACING;
+            }
+        }
+        assert_eq!(state.document().version, 4);
+        assert!(
+            !state
+                .document()
+                .to_toml_string()
+                .unwrap()
+                .contains("line_spacing")
+        );
+    }
+
+    #[test]
     fn new_objects_have_independent_frames_after_the_furthest_right_edge() {
         let mut state = AppState::default();
-        assert_eq!(state.document_version, DOCUMENT_VERSION);
+        assert_eq!(state.document_version, DEFAULT_DOCUMENT_VERSION);
         state.add_text();
         state.add_text();
         let first = state.elements[0].as_object_mut().unwrap();

@@ -25,6 +25,7 @@ enum ElementContent {
         content: String,
         font_size: Option<f32>,
         align: TextAlign,
+        line_spacing: f32,
         rotation: f32,
         flip_h: bool,
         flip_v: bool,
@@ -54,14 +55,18 @@ impl ElementContent {
             } => {
                 let content = match content.restore() {
                     LabelElement::Text {
-                        content,
+                        content: text,
                         font_size,
                         align,
                         ..
                     } => ObjectContent::Text {
-                        content,
+                        content: text,
                         font_size,
                         align,
+                        line_spacing: match content.as_ref() {
+                            Self::Text { line_spacing, .. } => *line_spacing,
+                            _ => unreachable!("restored text has text content"),
+                        },
                     },
                     LabelElement::Image {
                         path,
@@ -94,6 +99,7 @@ impl ElementContent {
                 rotation,
                 flip_h,
                 flip_v,
+                ..
             } => LabelElement::Text {
                 text_box: text_box.clone(),
                 content: content.clone(),
@@ -246,10 +252,12 @@ impl ContentHistory {
                         content,
                         font_size,
                         align,
+                        line_spacing,
                     } => ElementContent::Text {
                         content: content.clone(),
                         font_size: *font_size,
                         align: *align,
+                        line_spacing: *line_spacing,
                         text_box: None,
                         rotation: 0.0,
                         flip_h: false,
@@ -292,6 +300,7 @@ impl ContentHistory {
                 content: content.clone(),
                 font_size: *font_size,
                 align: *align,
+                line_spacing: ptouch_render::text::DEFAULT_LINE_SPACING,
                 rotation: *rotation,
                 flip_h: *flip_h,
                 flip_v: *flip_v,
@@ -581,6 +590,51 @@ mod tests {
                 assert!(state.content_snapshot().elements[0] == original.elements[0]);
             }
         }
+    }
+
+    #[test]
+    fn spacing_and_duplicate_position_survive_history_without_upgrading_defaults() {
+        let mut state = AppState::default();
+        state.add_text();
+        assert_eq!(state.document().version, 4);
+        let before = state.content_snapshot();
+        if let ObjectContent::Text { line_spacing, .. } =
+            &mut state.elements[0].as_object_mut().unwrap().content
+        {
+            *line_spacing = 0.8;
+        }
+        state.record_content(before, "Line spacing", None, 1.0);
+        let spaced = state.document().to_toml_string().unwrap();
+        assert!(spaced.contains("version = 5"));
+
+        state.canvas_edit_target = crate::state::CanvasEditTarget::Slot;
+        assert!(state.apply_editor_action(EditorAction::Duplicate(0)));
+        assert_eq!(state.elements[1].as_object().unwrap().frame.x_mm, 13.0);
+        assert_eq!(
+            state.canvas_edit_target,
+            crate::state::CanvasEditTarget::Slot
+        );
+        let duplicated = state.document().to_toml_string().unwrap();
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().to_toml_string().unwrap(), spaced);
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().version, 4);
+        assert!(
+            !state
+                .document()
+                .to_toml_string()
+                .unwrap()
+                .contains("line_spacing")
+        );
+        assert!(state.apply_editor_action(EditorAction::Redo));
+        assert_eq!(state.document().to_toml_string().unwrap(), spaced);
+        assert!(state.apply_editor_action(EditorAction::Redo));
+        assert_eq!(state.document().to_toml_string().unwrap(), duplicated);
+
+        // An unrelated edit also restores text through the history snapshot.
+        assert!(state.apply_editor_action(EditorAction::Delete(0)));
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().to_toml_string().unwrap(), duplicated);
     }
 
     #[test]

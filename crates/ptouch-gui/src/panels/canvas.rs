@@ -251,42 +251,7 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             let geometry: Vec<_> = state
                 .preview_bounds
                 .iter()
-                .map(|bound| {
-                    let slot =
-                        screen_bounds(label_rect.min, state.canvas_scale, bound, feed_pixel_width);
-                    let object = state
-                        .preview_content_bounds
-                        .iter()
-                        .find(|g| g.element_index == bound.element_index)
-                        .map(|g| {
-                            g.corners.map(|p| {
-                                label_rect.min
-                                    + egui::vec2(p[0] * feed_pixel_width, p[1]) * state.canvas_scale
-                            })
-                        })
-                        .or_else(|| {
-                            state
-                                .elements
-                                .get(bound.element_index)
-                                .filter(|e| e.as_object().is_none())
-                                .map(|_| rect_quad(slot))
-                        });
-                    CanvasGeometry {
-                        element: bound.element_index,
-                        slot,
-                        object,
-                        has_slot: state.elements.get(bound.element_index).is_some_and(|e| {
-                            matches!(
-                                e,
-                                ptouch_render::document::LabelElement::Object(_)
-                                    | ptouch_render::document::LabelElement::Text {
-                                        text_box: Some(_),
-                                        ..
-                                    }
-                            )
-                        }),
-                    }
-                })
+                .filter_map(|bound| editing_geometry(state, label_rect.min, bound))
                 .collect();
             let selected = state.selected_canvas_target();
             let hit = |pos| {
@@ -497,17 +462,11 @@ fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 // It must not pin legacy content or quantize saved coordinates.
                 if drag.pointer_moved {
                     let rotation = if let Some(rotation) = drag.rotation.as_mut() {
-                        let center = state
-                            .preview_content_bounds
+                        let center = geometry
                             .iter()
-                            .find(|g| g.element_index == drag.element)
-                            .map(|g| {
-                                quad_center(g.corners.map(|p| {
-                                    label_rect.min
-                                        + egui::vec2(p[0] * feed_pixel_width, p[1])
-                                            * state.canvas_scale
-                                }))
-                            });
+                            .find(|g| g.element == drag.element)
+                            .and_then(|g| g.object)
+                            .map(quad_center);
                         center.and_then(|center| {
                             dragged_rotation(rotation, pos, center, ui.input(|i| i.modifiers.shift))
                         })
@@ -648,6 +607,90 @@ struct CanvasGeometry {
     has_slot: bool,
 }
 
+/// Independent objects have exact physical edit geometry. Raster bounds stay
+/// unchanged: rounding a width and rounding two edges can differ by one dot.
+fn editing_geometry(
+    state: &AppState,
+    origin: egui::Pos2,
+    bound: &ElementBounds,
+) -> Option<CanvasGeometry> {
+    let index = bound.element_index;
+    let element = state.elements.get(index)?;
+    let feed_pixel_width = state
+        .preview
+        .as_ref()
+        .map_or(1.0, |preview| preview.feed_pixel_width());
+    let mut slot = screen_bounds(origin, state.canvas_scale, bound, feed_pixel_width);
+    let mut object = state
+        .preview_content_bounds
+        .iter()
+        .find(|g| g.element_index == index)
+        .map(|g| {
+            g.corners
+                .map(|p| origin + egui::vec2(p[0] * feed_pixel_width, p[1]) * state.canvas_scale)
+        });
+    if let Some(item) = element.as_object()
+        && let Some(content) = &item.content_box
+        && let Some((x, y, w, h)) = state.element_rect_mm(index)
+    {
+        let ppm = f64::from(state.target_dpi()) / 25.4;
+        let tape_width = state.preview.as_ref().map_or(0.0, |preview| {
+            f64::from(preview.bitmap.width()) * f64::from(feed_pixel_width)
+        });
+        let screen = |mut x: f64, mut y: f64| {
+            x *= ppm;
+            y *= ppm;
+            if state.overall_flip_h {
+                x = tape_width - x;
+            }
+            if state.overall_flip_v {
+                y = f64::from(state.tape_width_px) - y;
+            }
+            origin + egui::vec2(x as f32, y as f32) * state.canvas_scale
+        };
+        slot = egui::Rect::from_two_pos(screen(x, y), screen(x + w, y + h));
+        let center = [x + w / 2.0, y + h / 2.0];
+        let (sin, cos) = f64::from(item.rotation).to_radians().sin_cos();
+        object = Some(
+            [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]].map(|[dx, dy]| {
+                let dx = dx * content.width_mm;
+                let dy = dy * content.height_mm;
+                let mut px = dx * cos - dy * sin + content.offset_x_mm;
+                let mut py = dx * sin + dy * cos + content.offset_y_mm;
+                if item.flip_h {
+                    px = -px;
+                }
+                if item.flip_v {
+                    py = -py;
+                }
+                screen(center[0] + px, center[1] + py)
+            }),
+        );
+    }
+    if object.is_none() && element.as_object().is_none() {
+        object = Some(rect_quad(slot));
+    }
+    Some(CanvasGeometry {
+        element: index,
+        slot,
+        object,
+        has_slot: matches!(
+            element,
+            crate::state::LabelElement::Object(_)
+                | crate::state::LabelElement::Text {
+                    text_box: Some(_),
+                    ..
+                }
+        ),
+    })
+}
+
+/// Omit only coincident edges, not merely nearby shapes at a low zoom.
+fn same_edge(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2) -> bool {
+    let close = |x: egui::Pos2, y: egui::Pos2| x.distance_sq(y) < 0.0001;
+    close(a, c) && close(b, d) || close(a, d) && close(b, c)
+}
+
 fn target_quad(geometry: &[CanvasGeometry], target: CanvasTarget) -> Option<[egui::Pos2; 4]> {
     let g = geometry.iter().find(|g| g.element == target.element)?;
     match target.edit {
@@ -758,7 +801,7 @@ fn draw_targets(
     let selected = state.selected_canvas_target();
     let hovered = state.canvas_hover_target;
     let blue = egui::Color32::from_rgb(0, 90, 190);
-    for target in [selected, hovered]
+    for target in [selected, hovered.filter(|target| Some(*target) != selected)]
         .into_iter()
         .flatten()
         .filter(|t| t.edit == CanvasEditTarget::Slot)
@@ -772,18 +815,28 @@ fn draw_targets(
                 );
             }
         }
-        if let Some(quad) = target_quad(
-            geometry,
-            CanvasTarget {
-                edit: CanvasEditTarget::Content,
-                ..target
-            },
+        if let (Some(quad), Some(slot)) = (
+            target_quad(
+                geometry,
+                CanvasTarget {
+                    edit: CanvasEditTarget::Content,
+                    ..target
+                },
+            ),
+            target_quad(geometry, target),
         ) {
-            dashed_quad(
-                painter,
-                quad,
-                egui::Stroke::new(1.0, blue.gamma_multiply(0.45)),
-            );
+            for edge in 0..4 {
+                let a = quad[edge];
+                let b = quad[(edge + 1) % 4];
+                if !(0..4).any(|i| same_edge(a, b, slot[i], slot[(i + 1) % 4])) {
+                    dashed_quad_edge(
+                        painter,
+                        a,
+                        b,
+                        egui::Stroke::new(1.0, blue.gamma_multiply(0.45)),
+                    );
+                }
+            }
         }
     }
     if let Some(target) = hovered.filter(|t| Some(*t) != selected)
@@ -839,6 +892,12 @@ fn clipped_segment(a: egui::Pos2, b: egui::Pos2, clip: egui::Rect) -> Option<[eg
         }
     }
     Some([a + delta * start, a + delta * end])
+}
+
+fn dashed_quad_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: egui::Stroke) {
+    if let Some(line) = clipped_segment(a, b, painter.clip_rect().expand(stroke.width)) {
+        painter.extend(egui::Shape::dashed_line(&line, stroke, 6.0, 4.0));
+    }
 }
 
 fn dashed_quad(painter: &egui::Painter, quad: [egui::Pos2; 4], stroke: egui::Stroke) {
@@ -1459,9 +1518,10 @@ mod tests {
             })
             .unwrap();
         let g = &state.preview_content_bounds[0];
+        let feed_pixel_width = state.preview.as_ref().unwrap().feed_pixel_width();
         let quad = g
             .corners
-            .map(|p| paper.min + egui::vec2(p[0], p[1]) * state.canvas_scale);
+            .map(|p| paper.min + egui::vec2(p[0] * feed_pixel_width, p[1]) * state.canvas_scale);
         let center = quad_center(quad);
         let hover = canvas_event(
             &context,
@@ -1725,6 +1785,91 @@ mod tests {
             }
             preview
         });
+    }
+
+    #[test]
+    fn equal_physical_boxes_share_edit_edges_despite_raster_rounding() {
+        use ptouch_render::document::{LabelElement, LabelObject};
+        for (dpi, feed) in [(180, 180), (180, 360), (360, 180), (360, 360), (360, 720)] {
+            for mirrors in 0..16 {
+                let context = egui::Context::default();
+                let mut object = LabelObject::text(
+                    "PORT",
+                    TextBox {
+                        x_mm: 17.3,
+                        y_mm: 0.0,
+                        width_mm: 14.5,
+                        height_mm: 10.0,
+                        ..Default::default()
+                    },
+                );
+                object.content_box = Some(ContentBox {
+                    width_mm: 14.5,
+                    height_mm: 10.0,
+                    offset_x_mm: 0.0,
+                    offset_y_mm: 0.0,
+                });
+                object.flip_h = mirrors & 1 != 0;
+                object.flip_v = mirrors & 2 != 0;
+                let mut state = AppState {
+                    document_version: 4,
+                    design_dpi: dpi,
+                    printer_dpi: dpi,
+                    preview_uses_printer: true,
+                    printer_quality: Some(ptouch_core::quality::QualityProfile::for_model(
+                        if dpi == 180 { "PT-P750W" } else { "PT-9700PC" },
+                        dpi,
+                    )),
+                    print_quality: if feed > dpi {
+                        ptouch_core::PrintQuality::HighRes
+                    } else if feed < dpi {
+                        ptouch_core::PrintQuality::Draft
+                    } else {
+                        ptouch_core::PrintQuality::Standard
+                    },
+                    tape_width_px: if dpi == 180 { 76 } else { 150 },
+                    elements: vec![LabelElement::Object(object)],
+                    overall_flip_h: mirrors & 4 != 0,
+                    overall_flip_v: mirrors & 8 != 0,
+                    canvas_scale: 6.4,
+                    ..Default::default()
+                };
+                render_fixture(&context, &mut state);
+                let geometry =
+                    editing_geometry(&state, egui::pos2(100.0, 60.0), &state.preview_bounds[0])
+                        .unwrap();
+                let content = geometry.object.unwrap();
+                let slot = rect_quad(geometry.slot);
+                for edge in 0..4 {
+                    assert!(
+                        (0..4).any(|i| same_edge(
+                            content[edge],
+                            content[(edge + 1) % 4],
+                            slot[i],
+                            slot[(i + 1) % 4]
+                        )),
+                        "dpi={dpi}, mirrors={mirrors}"
+                    );
+                }
+                // A genuinely narrower object must remain distinguishable.
+                state.elements[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .content_box
+                    .as_mut()
+                    .unwrap()
+                    .width_mm = 14.0;
+                let narrower =
+                    editing_geometry(&state, egui::Pos2::ZERO, &state.preview_bounds[0]).unwrap();
+                assert!(
+                    narrower
+                        .object
+                        .unwrap()
+                        .iter()
+                        .all(|p| p.x > narrower.slot.left() && p.x < narrower.slot.right())
+                );
+            }
+        }
     }
 
     fn canvas_fixture(context: &egui::Context, image: bool, mirrors: u8) -> AppState {

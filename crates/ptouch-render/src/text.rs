@@ -15,6 +15,25 @@ use crate::RenderError;
 use crate::Result;
 use crate::bitmap::LabelBitmap;
 
+/// Historical baseline distance, as a multiple of the font size.
+pub const DEFAULT_LINE_SPACING: f32 = 1.2;
+pub const LINE_SPACING_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
+
+pub(crate) fn default_line_spacing() -> f32 {
+    DEFAULT_LINE_SPACING
+}
+pub(crate) fn is_default_line_spacing(value: &f32) -> bool {
+    *value == DEFAULT_LINE_SPACING
+}
+pub(crate) fn validate_line_spacing(value: f32) -> Result<()> {
+    if !value.is_finite() || !LINE_SPACING_RANGE.contains(&value) {
+        return Err(RenderError::Layout(
+            "line spacing must be between 0.5 and 3.0 times the font size".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Text alignment within the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,7 +87,9 @@ impl TextRenderer {
         font_name: &str,
         font_size_px: f32,
         align: TextAlign,
+        line_spacing: f32,
     ) -> Result<LabelBitmap> {
+        validate_line_spacing(line_spacing)?;
         if !font_size_px.is_finite() || font_size_px <= 0.0 || font_size_px > 4096.0 {
             return Err(RenderError::Text(
                 "font size must be in (0, 4096] pixels".into(),
@@ -85,7 +106,7 @@ impl TextRenderer {
         let attrs = Attrs::new().family(family);
         let mut buffer = Buffer::new(
             &mut self.font_system,
-            Metrics::new(font_size_px, (font_size_px * 1.2).ceil()),
+            Metrics::new(font_size_px, (font_size_px * line_spacing).ceil()),
         );
         buffer.set_wrap(Wrap::None);
         buffer.set_size(None, None);
@@ -95,7 +116,7 @@ impl TextRenderer {
             .layout_runs()
             .map(|run| run.line_w)
             .fold(0.0_f32, f32::max);
-        let height = text.split('\n').count() as f32 * (font_size_px * 1.2).ceil();
+        let height = text.split('\n').count() as f32 * (font_size_px * line_spacing).ceil();
         if !width.is_finite() || width > 1_000_000.0 || width * height > 16_777_216.0 {
             return Err(RenderError::DimensionMismatch(
                 "text raster is too large".into(),

@@ -146,9 +146,30 @@ impl AppState {
                 "Add object"
             }
             EditorAction::Duplicate(index) => {
-                self.elements
-                    .insert(index + 1, self.elements[index].clone());
-                self.select_element(Some(index + 1));
+                let mut copy = self.elements[index].clone();
+                let frame = match &mut copy {
+                    LabelElement::Object(object) => Some(&mut object.frame),
+                    LabelElement::Text { text_box, .. } => text_box.as_mut(),
+                    _ => None,
+                };
+                if let Some(frame) = frame
+                    && frame.position == ptouch_render::document::PositionMode::Absolute
+                {
+                    let Some((x, _, width, _)) = self.element_rect_mm(index) else {
+                        return false;
+                    };
+                    frame.x_mm = x + width + 3.0;
+                }
+                let edit = if self.selected_element == Some(index) {
+                    self.canvas_edit_target
+                } else {
+                    crate::state::CanvasEditTarget::Content
+                };
+                self.elements.insert(index + 1, copy);
+                self.select_canvas_target(Some(crate::state::CanvasTarget {
+                    element: index + 1,
+                    edit,
+                }));
                 "Duplicate object"
             }
             EditorAction::Delete(index) => {
@@ -172,6 +193,9 @@ impl AppState {
                 unreachable!()
             }
         };
+        self.selection_revision = self.selection_revision.wrapping_add(1);
+        self.canvas_hover_target = None;
+        self.canvas_drag_target = None;
         let after = self.content_snapshot();
         self.editor.history.record_action(before, after, name);
         self.mark_dirty();

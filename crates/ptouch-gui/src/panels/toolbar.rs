@@ -12,8 +12,21 @@ use ptouch_render::raster;
 
 use crate::state::{AppState, LabelElement, PrinterCommand};
 
-/// Render the top toolbar.
-pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
+/// Actions run after properties commit pending keyboard edits.
+#[derive(Clone, Copy)]
+pub enum ToolbarAction {
+    Convert,
+    Print,
+    Feed,
+    Cancel,
+    Export,
+    Save,
+    Open,
+}
+
+/// Collect document actions while rendering the top toolbar.
+pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) -> Option<ToolbarAction> {
+    let mut action = None;
     if !state.is_free_layout() {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Legacy objects (format v{})", state.document_version));
@@ -21,10 +34,7 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                 .on_hover_text("Fix every object's current position in millimeters. Natural font sizing and rotated image fitting may change; review the preview before saving.")
                 .clicked()
             {
-                match state.convert_to_free_layout() {
-                    Ok(()) => state.status_message = "Converted to free layout. Review text sizing and rotated images before saving.".into(),
-                    Err(error) => state.status_message = format!("Conversion error: {error}"),
-                }
+                action = Some(ToolbarAction::Convert);
             }
             ui.small("Legacy spacing stays unchanged until converted.");
         });
@@ -42,7 +52,7 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             .add_enabled(connected && !busy && has_bitmap, egui::Button::new("Print"))
             .clicked()
         {
-            do_print(state);
+            action = Some(ToolbarAction::Print);
         }
 
         if ui
@@ -54,44 +64,77 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                 egui::Button::new("Feed & Cut"),
             )
             .clicked()
-            && let Some(ref tx) = state.printer_cmd_tx
         {
-            let cancellation = ptouch_core::CancellationToken::default();
-            state.cancellation = Some(cancellation.clone());
-            let _ = tx.send(PrinterCommand::FeedAndCut {
-                target: state.selection(),
-                cancellation,
-            });
-            state.operation_in_progress = true;
-            state.status_message = "Feeding & cutting...".to_string();
+            action = Some(ToolbarAction::Feed);
         }
 
         if state.operation_in_progress
             && !state.printer_target.is_bluetooth()
             && ui.button("Cancel").clicked()
-            && let Some(token) = &state.cancellation
         {
-            token.cancel();
-            state.status_message = "Cancelling; sent data may still print".into();
+            action = Some(ToolbarAction::Cancel);
         }
 
         if ui
             .add_enabled(has_bitmap, egui::Button::new("Export Image"))
             .clicked()
         {
-            do_export_image(state);
+            action = Some(ToolbarAction::Export);
         }
 
         ui.separator();
 
         if ui.button("Save Layout").clicked() {
-            do_save_layout(state);
+            action = Some(ToolbarAction::Save);
         }
 
         if ui.button("Open Layout").clicked() {
-            do_open_layout(state);
+            action = Some(ToolbarAction::Open);
         }
     });
+    action
+}
+
+pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
+    match action {
+        ToolbarAction::Convert => match state.convert_to_free_layout() {
+            Ok(()) => {
+                state.status_message =
+                    "Converted to free layout. Review text sizing and rotated images before saving."
+                        .into()
+            }
+            Err(error) => state.status_message = format!("Conversion error: {error}"),
+        },
+        ToolbarAction::Print => do_print(state),
+        ToolbarAction::Feed => {
+            if !state.printer_connected
+                || state.is_printer_busy()
+                || state.printer_target.is_bluetooth()
+                || state.printer_target.is_network()
+            {
+                return;
+            }
+            if let Some(tx) = &state.printer_cmd_tx {
+                let cancellation = ptouch_core::CancellationToken::default();
+                state.cancellation = Some(cancellation.clone());
+                let _ = tx.send(PrinterCommand::FeedAndCut {
+                    target: state.selection(),
+                    cancellation,
+                });
+                state.operation_in_progress = true;
+                state.status_message = "Feeding & cutting...".into();
+            }
+        }
+        ToolbarAction::Cancel => {
+            if let Some(token) = &state.cancellation {
+                token.cancel();
+                state.status_message = "Cancelling; sent data may still print".into();
+            }
+        }
+        ToolbarAction::Export => do_export_image(state),
+        ToolbarAction::Save => do_save_layout(state),
+        ToolbarAction::Open => do_open_layout(state),
+    }
 }
 
 /// Creation controls live directly below the object list.
@@ -273,6 +316,7 @@ pub(crate) fn apply_layout(state: &mut AppState, document: LabelDocument) -> Res
     state.overall_flip_v = document.flip_v;
     state.elements = document.elements;
     state.select_element(None);
+    state.selection_revision = state.selection_revision.wrapping_add(1);
     state.mark_dirty();
     Ok(())
 }
