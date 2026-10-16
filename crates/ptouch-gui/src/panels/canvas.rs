@@ -41,6 +41,7 @@ struct CanvasDrag {
     rotation: Option<RotationDrag>,
     content: Option<ContentDrag>,
     font_size: Option<f32>,
+    font_styles: Vec<ptouch_render::styled_text::StyleSpan>,
 }
 
 /// Render and edit at the original raster scale, independent of GPU downsampling.
@@ -233,6 +234,12 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                                 ^ state.overall_flip_v,
                         }),
                         content,
+                        font_styles: match &object.content {
+                            ptouch_render::document::ObjectContent::Text { styles, .. } => {
+                                styles.clone()
+                            }
+                            _ => Vec::new(),
+                        },
                         font_size: match &object.content {
                             ptouch_render::document::ObjectContent::Text { font_size, .. } => {
                                 *font_size
@@ -420,20 +427,36 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             object.frame = frame;
                             state.mark_dirty();
                         } else if let Some(content) = new_content {
+                            let mut allowed = true;
                             if drag.resize
                                 && let Some(size) = drag.font_size
                                 && let Some(start) = &drag.content
                                 && let ptouch_render::document::ObjectContent::Text {
                                     font_size,
+                                    styles,
                                     ..
                                 } = &mut object.content
                             {
-                                *font_size = Some(
-                                    size * (content.width_mm / start.original.width_mm) as f32,
-                                );
+                                let ratio = (content.width_mm / start.original.width_mm) as f32;
+                                let mut scaled = drag.font_styles.clone();
+                                for span in &mut scaled {
+                                    if let Some(size) = &mut span.style.font_size {
+                                        *size *= ratio;
+                                    }
+                                }
+                                allowed = scaled.iter().all(|s| s.style.validate().is_ok());
+                                if allowed {
+                                    *font_size = Some(size * ratio);
+                                    *styles = scaled;
+                                }
                             }
-                            object.content_box = Some(content);
-                            state.mark_dirty();
+                            if allowed {
+                                object.content_box = Some(content);
+                                state.mark_dirty();
+                            } else {
+                                state.status_message =
+                                    "Resize exceeds the inline font size limit".into();
+                            }
                         } else if let Some(rotation) = rotation {
                             object.rotation = rotation;
                             state.mark_dirty();
@@ -886,6 +909,7 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
             rotation: None,
             content: None,
             font_size: None,
+            font_styles: Vec::new(),
         };
         let frame = dragged_frame(
             &drag,
@@ -1586,6 +1610,7 @@ mod tests {
             rotation: None,
             content: None,
             font_size: None,
+            font_styles: Vec::new(),
         }
     }
 
@@ -1975,10 +2000,20 @@ mod tests {
                 for resize in [false, true] {
                     let context = egui::Context::default();
                     let mut state = canvas_fixture(&context, image, mirrors);
-                    if let ObjectContent::Text { font_size, .. } =
-                        &mut state.elements[0].as_object_mut().unwrap().content
+                    if let ObjectContent::Text {
+                        font_size, styles, ..
+                    } = &mut state.elements[0].as_object_mut().unwrap().content
                     {
                         *font_size = Some(5.0);
+                        styles.push(ptouch_render::styled_text::StyleSpan {
+                            start: 0,
+                            end: 1,
+                            style: ptouch_render::styled_text::TextStyle {
+                                font_size: Some(7.5),
+                                bold: true,
+                                ..Default::default()
+                            },
+                        });
                     }
                     let original = state.elements[0].as_object().unwrap().clone();
                     let (quad, _) =
@@ -2019,8 +2054,13 @@ mod tests {
                                 .abs()
                                 < 1e-8
                         );
-                        if let ObjectContent::Text { font_size, .. } = &object.content {
+                        if let ObjectContent::Text {
+                            font_size, styles, ..
+                        } = &object.content
+                        {
                             assert!((font_size.unwrap() - 6.0).abs() < 0.001);
+                            assert!((styles[0].style.font_size.unwrap() - 9.0).abs() < 0.001);
+                            assert!(styles[0].style.bold);
                         }
                         let (resized, _) =
                             selected_quad_and_circle(&canvas_event(&context, &mut state, vec![]));

@@ -7,6 +7,34 @@
 
 use cosmic_text::FontSystem;
 
+/// Load a system face for a GUI editing adapter. Printing still uses cosmic-text.
+pub fn face_data(name: &str, bold: bool, italic: bool) -> Option<(Vec<u8>, u32)> {
+    let fonts = FontSystem::new();
+    let id = fonts.db().query(&cosmic_text::fontdb::Query {
+        families: &[
+            cosmic_text::Family::Name(name),
+            cosmic_text::Family::SansSerif,
+        ],
+        weight: if bold {
+            cosmic_text::Weight::BOLD
+        } else {
+            cosmic_text::Weight::NORMAL
+        },
+        style: if italic {
+            cosmic_text::Style::Italic
+        } else {
+            cosmic_text::Style::Normal
+        },
+        ..Default::default()
+    })?;
+    fonts
+        .db()
+        .with_face_data(id, |data, index| {
+            (data.len() <= 33_554_432).then(|| (data.to_vec(), index))
+        })
+        .flatten()
+}
+
 /// Find a font by name and return its full family name if found.
 ///
 /// The search is case-insensitive and matches on family name.
