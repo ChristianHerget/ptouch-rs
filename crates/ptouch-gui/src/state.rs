@@ -516,6 +516,47 @@ impl AppState {
         self.mark_dirty();
     }
 
+    /// Copy after the source. Relative copies reuse their gap; absolute copies
+    /// start 3 mm after the source's right edge, like Add Text.
+    /// Existing absolute anchors and object-local geometry are untouched.
+    pub fn duplicate_element(&mut self, index: usize) -> bool {
+        let Some(mut copy) = self.elements.get(index).cloned() else {
+            return false;
+        };
+        let frame = match &mut copy {
+            LabelElement::Object(object) => Some(&mut object.frame),
+            LabelElement::Text { text_box, .. } => text_box.as_mut(),
+            _ => None,
+        };
+        if let Some(frame) = frame
+            && frame.position == PositionMode::Absolute
+        {
+            let Some((x, _, width, _)) = self.element_rect_mm(index) else {
+                return false;
+            };
+            frame.x_mm = x + width + 3.0;
+        }
+        let edit = if self.selected_element == Some(index) {
+            self.canvas_edit_target
+        } else {
+            CanvasEditTarget::Content
+        };
+        self.elements.insert(index + 1, copy);
+        self.select_canvas_target(Some(CanvasTarget {
+            element: index + 1,
+            edit,
+        }));
+        self.canvas_hover_target = None;
+        self.canvas_drag_target = None;
+        self.mark_dirty();
+        true
+    }
+
+    pub fn duplicate_selected(&mut self) -> bool {
+        self.selected_element
+            .is_some_and(|index| self.duplicate_element(index))
+    }
+
     pub fn add_text(&mut self) {
         let element = if self.is_free_layout() {
             let mut object =
@@ -843,6 +884,161 @@ mod tests {
         state.elements[0] = LabelElement::CutMark;
         assert!(state.canvas_hint().unwrap().contains("Legacy layout"));
         assert_eq!(state.status_message, "Render error: keep this visible");
+    }
+
+    #[test]
+    fn duplicates_insert_into_relative_chains_without_moving_absolute_anchors() {
+        let object = |x, position, gap| {
+            LabelElement::Object(LabelObject::text(
+                "PORT",
+                TextBox {
+                    x_mm: x,
+                    position,
+                    gap_mm: gap,
+                    ..Default::default()
+                },
+            ))
+        };
+        let mut state = AppState {
+            elements: vec![
+                object(5.0, PositionMode::Absolute, 3.0),
+                object(0.0, PositionMode::Relative, 2.8),
+                object(100.0, PositionMode::Absolute, 3.0),
+            ],
+            selected_element: Some(0),
+            canvas_edit_target: CanvasEditTarget::Slot,
+            ..Default::default()
+        };
+        assert!(state.duplicate_selected());
+        assert_eq!(state.selected_element, Some(1));
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+        for (i, x) in [5.0, 18.0, 30.8, 100.0].into_iter().enumerate() {
+            assert!((state.element_rect_mm(i).unwrap().0 - x).abs() < 1e-10);
+        }
+        assert!(state.duplicate_element(2));
+        assert!((state.element_rect_mm(3).unwrap().0 - 43.6).abs() < 1e-10);
+        assert_eq!(state.element_rect_mm(4).unwrap().0, 100.0);
+        assert!(!state.duplicate_element(999));
+    }
+
+    #[test]
+    fn duplicate_all_object_types_keeps_content_transforms_and_embedded_images() {
+        let image = LabelObject::image_from_bytes(None, br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>"#.to_vec(), TextBox::default());
+        for content in [
+            ObjectContent::Text {
+                content: "{{port}}".into(),
+                font_size: Some(9.0),
+                align: TextAlign::Right,
+            },
+            image.content,
+            ObjectContent::CutMark,
+            ObjectContent::Padding,
+        ] {
+            let object = LabelObject {
+                frame: TextBox {
+                    x_mm: 5.0,
+                    ..Default::default()
+                },
+                content_box: Some(ContentBox {
+                    width_mm: 7.0,
+                    height_mm: 3.0,
+                    offset_x_mm: 0.8,
+                    offset_y_mm: -0.2,
+                }),
+                rotation: 30.0,
+                flip_h: true,
+                flip_v: true,
+                content,
+            };
+            let mut state = AppState {
+                document_version: 4,
+                elements: vec![LabelElement::Object(object.clone())],
+                selected_element: Some(0),
+                ..Default::default()
+            };
+            assert!(state.duplicate_selected());
+            let saved = state.document().to_toml_string().unwrap();
+            let restored = LabelDocument::from_toml_str(&saved).unwrap();
+            let copy = restored.elements[1].as_object().unwrap();
+            assert_eq!(copy.content_box, object.content_box);
+            assert_eq!(
+                (copy.rotation, copy.flip_h, copy.flip_v),
+                (30.0, true, true)
+            );
+            assert_eq!(copy.frame.x_mm, 18.0);
+            let mut normalized = restored.clone();
+            normalized.elements[1].as_object_mut().unwrap().frame = object.frame.clone();
+            let mut first = normalized.clone();
+            first.elements.truncate(1);
+            normalized.elements.remove(0);
+            assert_eq!(
+                normalized.to_toml_string().unwrap(),
+                first.to_toml_string().unwrap()
+            );
+            if let ObjectContent::Image {
+                bitmap, image_data, ..
+            } = &copy.content
+            {
+                assert!(bitmap.is_some());
+                assert!(!image_data.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn duplication_keeps_legacy_versions_and_does_not_pin_auto_fit_objects() {
+        let legacy = LabelElement::Text {
+            content: "PORT".into(),
+            font_size: None,
+            align: TextAlign::Center,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            text_box: None,
+        };
+        let mut boxed = legacy.clone();
+        if let LabelElement::Text { text_box, .. } = &mut boxed {
+            *text_box = Some(TextBox {
+                x_mm: 5.0,
+                ..Default::default()
+            });
+        }
+        for (version, elements) in [
+            (
+                1,
+                vec![
+                    legacy,
+                    LabelElement::CutMark,
+                    LabelElement::Padding { pixels: 20 },
+                ],
+            ),
+            (2, vec![boxed]),
+            (
+                3,
+                vec![LabelElement::Object(LabelObject::text(
+                    "PORT",
+                    TextBox::default(),
+                ))],
+            ),
+        ] {
+            for index in 0..elements.len() {
+                let mut state = AppState {
+                    document_version: version,
+                    elements: elements.clone(),
+                    selected_element: Some(index),
+                    ..Default::default()
+                };
+                assert!(state.duplicate_selected());
+                let restored =
+                    LabelDocument::from_toml_str(&state.document().to_toml_string().unwrap())
+                        .unwrap();
+                assert_eq!(restored.version, version);
+                assert_eq!(restored.elements.len(), elements.len() + 1);
+                if let Some(object) = restored.elements[index + 1].as_object() {
+                    assert!(object.content_box.is_none());
+                }
+            }
+        }
     }
 
     #[test]

@@ -241,7 +241,15 @@ New text starts as a 10 mm wide box with automatic font size; its height is
 X=0, Y=0. Subsequent slots start 3 mm after the rightmost slot, using absolute
 coordinates. Images keep their aspect ratio inside their object boxes.
 
+Use **Duplicate** in the element list or its context menu, or Ctrl+D (Cmd+D on
+macOS), to copy any element with its settings. The copy follows the source in
+the list: relative slots reuse their gap; absolute slots start 3 mm after the
+source. Following relative slots move along;
+existing absolute slots stay put. Text-field shortcuts retain their normal use.
+
 Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
+Click the image row to move, resize or rotate its object; click **Slot** to edit
+its absolute position or gap, just like text.
 The source bytes are embedded in the saved `.ptl`, so reopening does not require
 the original image file. SVG sources should embed any linked images as well.
 
