@@ -17,7 +17,7 @@ use image::{GrayImage, RgbaImage};
 use crate::Result;
 
 /// A 1-bit packed bitmap suitable for label printing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LabelBitmap {
     width: u32,
     height: u32,

@@ -1347,6 +1347,7 @@ mod tests {
                 LabelElement::Object(image),
                 LabelElement::Object(LabelObject {
                     content_box: None,
+                    layout: None,
                     frame: TextBox {
                         position: PositionMode::Relative,
                         gap_mm: 1.0,
@@ -1361,6 +1362,7 @@ mod tests {
                 }),
                 LabelElement::Object(LabelObject {
                     content_box: None,
+                    layout: None,
                     frame: TextBox {
                         position: PositionMode::Relative,
                         gap_mm: 2.0,

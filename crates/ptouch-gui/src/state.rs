@@ -15,7 +15,7 @@ use ptouch_render::text::{TextAlign, TextRenderer};
 
 pub use ptouch_render::document::LabelElement;
 
-/// Select the visible object or the fixed template slot for canvas editing.
+/// Operation on the selected object. Layout is entered explicitly in properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CanvasEditTarget {
     #[default]
@@ -132,6 +132,8 @@ pub enum PrinterResponse {
 
 /// Central application state shared across all panels.
 pub struct AppState {
+    pub history: crate::history::DocumentHistory,
+    pub edit_revision: u64,
     /// Preserve an opened legacy format until the user explicitly converts it.
     pub document_version: u32,
     /// List of label elements in composition order.
@@ -224,6 +226,8 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            history: Default::default(),
+            edit_revision: 0,
             document_version: DEFAULT_DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
@@ -278,6 +282,276 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn use_flow_allocation(object: &mut LabelObject, height: f64) {
+        use ptouch_render::object_layout::{Placement, WidthSizing};
+        if object
+            .layout
+            .as_ref()
+            .is_none_or(|p| p.placement != Placement::Free)
+        {
+            return;
+        }
+        if let Some(content) = &mut object.content_box {
+            let sign = if object.flip_v { -1.0 } else { 1.0 };
+            let center =
+                object.frame.y_mm + object.frame.height_mm / 2.0 + content.offset_y_mm * sign;
+            object.frame.y_mm = 0.0;
+            object.frame.height_mm = height;
+            content.offset_y_mm = (center - height / 2.0) * sign;
+        }
+        let policy = object.layout.as_mut().unwrap();
+        policy.placement = Placement::Flow;
+        policy.width = WidthSizing::Fixed;
+    }
+    /// A flow chain starts at an absolute anchor and ends before the next one.
+    pub fn flow_chain(&self, index: usize) -> Option<std::ops::RangeInclusive<usize>> {
+        self.elements.get(index)?.as_object()?;
+        let mut start = index;
+        while start > 0
+            && slot_frame(&self.elements[start])?.position == PositionMode::Relative
+            && self.elements[start - 1].as_object().is_some()
+        {
+            start -= 1;
+        }
+        let end = self
+            .slot_followers(start)
+            .into_iter()
+            .take_while(|i| self.elements[*i].as_object().is_some())
+            .last()
+            .unwrap_or(start);
+        let object = self.elements[start].as_object()?;
+        (end > start
+            || object.frame.position == PositionMode::Relative
+            || object
+                .layout
+                .as_ref()
+                .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow))
+        .then_some(start..=end)
+    }
+
+    pub fn can_swap_positions(&self, a: usize, b: usize) -> bool {
+        if a == b || a >= self.elements.len() || b >= self.elements.len() {
+            return false;
+        }
+        let free = |i| {
+            self.flow_chain(i).is_none()
+                && self.elements[i].as_object().is_some_and(|o| {
+                    o.frame.position == PositionMode::Absolute
+                        && o.layout.as_ref().is_none_or(|p| {
+                            p.placement == ptouch_render::object_layout::Placement::Free
+                        })
+                })
+        };
+        free(a) && free(b)
+    }
+
+    pub fn swap_positions(&mut self, a: usize, b: usize) -> bool {
+        if !self.can_swap_positions(a, b) {
+            self.status_message = "Use sequence reordering for these objects".into();
+            return false;
+        }
+        let first = self.elements[a].as_object().unwrap().frame.clone();
+        let second = self.elements[b].as_object().unwrap().frame.clone();
+        if first.y_mm + second.height_mm > self.printable_height_mm()
+            || second.y_mm + first.height_mm > self.printable_height_mm()
+        {
+            self.status_message = "Swapped positions would exceed the printable height".into();
+            return false;
+        }
+        for (index, x, y) in [(a, second.x_mm, second.y_mm), (b, first.x_mm, first.y_mm)] {
+            let frame = &mut self.elements[index].as_object_mut().unwrap().frame;
+            frame.x_mm = x;
+            frame.y_mm = y;
+        }
+        self.validate_selection();
+        self.mark_dirty();
+        true
+    }
+
+    pub fn can_swap_content(&self, a: usize, b: usize) -> bool {
+        a != b
+            && [a, b].into_iter().all(|i| {
+                self.elements
+                    .get(i)
+                    .and_then(|e| e.as_object())
+                    .is_some_and(|o| {
+                        o.layout.as_ref().is_none_or(|p| {
+                            p.placement == ptouch_render::object_layout::Placement::Flow
+                                && p.width == ptouch_render::object_layout::WidthSizing::Fixed
+                        })
+                    })
+            })
+    }
+
+    pub fn swap_content(&mut self, a: usize, b: usize) -> bool {
+        if !self.can_swap_content(a, b) {
+            self.status_message = "Use fixed allocations before swapping template content".into();
+            return false;
+        }
+        if a == b {
+            return false;
+        }
+        let (Some(mut first), Some(mut second)) = (
+            self.elements.get(a).and_then(|e| e.as_object()).cloned(),
+            self.elements.get(b).and_then(|e| e.as_object()).cloned(),
+        ) else {
+            return false;
+        };
+        let before_a = first.clone();
+        let before_b = second.clone();
+        std::mem::swap(&mut first.content, &mut second.content);
+        std::mem::swap(&mut first.content_box, &mut second.content_box);
+        std::mem::swap(&mut first.rotation, &mut second.rotation);
+        std::mem::swap(&mut first.flip_h, &mut second.flip_h);
+        std::mem::swap(&mut first.flip_v, &mut second.flip_v);
+        if let Err(message) = self
+            .constrain_transform(a, &before_a, &mut first)
+            .and_then(|_| self.constrain_transform(b, &before_b, &mut second))
+        {
+            self.status_message = message.into();
+            return false;
+        }
+        self.elements[a] = LabelElement::Object(first);
+        self.elements[b] = LabelElement::Object(second);
+        self.validate_selection();
+        self.mark_dirty();
+        true
+    }
+
+    /// Keep the chain anchor at its physical position while content order changes.
+    /// Free objects retain coordinates; crossing an anchor never changes bindings.
+    pub fn reorder_object(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.elements.len() || to >= self.elements.len() {
+            return false;
+        }
+        let chain = self.flow_chain(from);
+        if chain.as_ref().is_some_and(|r| !r.contains(&to))
+            || chain.is_none() && self.flow_chain(to).is_some()
+        {
+            self.status_message =
+                "Reorder within this sequence; change positioning to move between sequences".into();
+            return false;
+        }
+        let anchor = chain.as_ref().map(|r| {
+            let start = *r.start();
+            let f = self.elements[start].as_object().unwrap().frame.clone();
+            let gap = self
+                .elements
+                .get(start + 1)
+                .and_then(|e| e.as_object())
+                .map_or(3.0, |o| o.frame.gap_mm);
+            (start, *r.end(), f.x_mm, gap, f.position, f.gap_mm)
+        });
+        let element = self.elements.remove(from);
+        self.elements.insert(to, element);
+        if let Some((start, end, x, gap, position, first_gap)) = anchor {
+            for i in start..=end {
+                let object = self.elements[i].as_object_mut().unwrap();
+                if i == start {
+                    object.frame.position = position;
+                    object.frame.x_mm = x;
+                    object.frame.gap_mm = first_gap;
+                } else {
+                    if object.frame.position == PositionMode::Absolute {
+                        object.frame.gap_mm = gap;
+                    }
+                    object.frame.position = PositionMode::Relative;
+                    object.frame.x_mm = 0.0;
+                }
+            }
+        }
+        self.editor_generation = self.editor_generation.wrapping_add(1);
+        self.select_canvas_target(Some(CanvasTarget {
+            element: to,
+            edit: self.canvas_edit_target,
+        }));
+        self.canvas_hover_target = None;
+        self.canvas_drag_target = None;
+        self.mark_dirty();
+        true
+    }
+
+    /// Normalize free content into its own bounding frame, or clamp offsets
+    /// inside a declared allocation. Rotation/size that cannot fit is rejected.
+    pub fn constrain_transform(
+        &self,
+        index: usize,
+        before: &LabelObject,
+        candidate: &mut LabelObject,
+    ) -> Result<bool, &'static str> {
+        use ptouch_render::object_layout::{Placement, WidthSizing, content_extent};
+        let Some(policy) = candidate.layout.clone() else {
+            return Ok(false);
+        };
+        if policy.placement == Placement::Flow
+            && policy.width == WidthSizing::Content
+            && let Some(c) = candidate.content_box.as_mut()
+        {
+            let width = c.width_mm + 2.0 * policy.padding_mm;
+            c.offset_x_mm +=
+                (before.frame.width_mm - width) / 2.0 * if candidate.flip_h { -1.0 } else { 1.0 };
+            candidate.frame.width_mm = width;
+        }
+        let Some((dx, dy, w, h)) = content_extent(candidate) else {
+            return Ok(false);
+        };
+        let pad = policy.padding_mm;
+        let tape_h = self.printable_height_mm();
+        let (x, _, _, _) = self
+            .element_rect_mm(index)
+            .ok_or("Object geometry is unavailable")?;
+        let y = candidate.frame.y_mm;
+        let fh = candidate.frame.height_mm;
+        let fw = candidate.frame.width_mm;
+        if policy.placement == Placement::Free {
+            let c = candidate.content_box.as_ref().unwrap();
+            let cx = before.frame.x_mm
+                + before.frame.width_mm / 2.0
+                + c.offset_x_mm * if candidate.flip_h { -1.0 } else { 1.0 };
+            let cy = before.frame.y_mm
+                + before.frame.height_mm / 2.0
+                + c.offset_y_mm * if candidate.flip_v { -1.0 } else { 1.0 };
+            let new_w = w + pad * 2.0;
+            let new_h = h + pad * 2.0;
+            if new_h > tape_h + 1e-7 {
+                return Err("Content exceeds printable height — shrink it or use Fit inside");
+            }
+            candidate.frame.width_mm = new_w;
+            candidate.frame.height_mm = new_h;
+            let requested_x = cx - new_w / 2.0;
+            let requested_y = cy - new_h / 2.0;
+            candidate.frame.x_mm = requested_x.max(0.0);
+            candidate.frame.y_mm = (cy - new_h / 2.0).clamp(0.0, (tape_h - new_h).max(0.0));
+            let c = candidate.content_box.as_mut().unwrap();
+            c.offset_x_mm = 0.0;
+            c.offset_y_mm = 0.0;
+            return Ok((candidate.frame.x_mm - requested_x).abs() > 1e-9
+                || (candidate.frame.y_mm - requested_y).abs() > 1e-9);
+        }
+        if !policy.constrain {
+            return Ok(false);
+        }
+        let fw = if policy.width == WidthSizing::Content {
+            candidate.content_box.as_ref().unwrap().width_mm + pad * 2.0
+        } else {
+            fw
+        };
+        if w + pad * 2.0 > fw + 1e-7 || h + pad * 2.0 > fh + 1e-7 {
+            return Err(
+                "Content exceeds its allocation — shrink it, enlarge the allocation or allow overflow",
+            );
+        }
+        let left = (-fw / 2.0 + pad).max(-x - fw / 2.0);
+        let top = (-fh / 2.0 + pad).max(-y - fh / 2.0);
+        let bottom = (fh / 2.0 - pad).min(tape_h - y - fh / 2.0);
+        let c = candidate.content_box.as_mut().unwrap();
+        let adjusted_x = dx.clamp(left, fw / 2.0 - pad - w) - dx;
+        let adjusted_y = dy.clamp(top, (bottom - h).max(top)) - dy;
+        c.offset_x_mm += adjusted_x * if candidate.flip_h { -1.0 } else { 1.0 };
+        c.offset_y_mm += adjusted_y * if candidate.flip_v { -1.0 } else { 1.0 };
+        Ok(adjusted_x.abs() > 1e-9 || adjusted_y.abs() > 1e-9)
+    }
+
     pub fn selected_canvas_target(&self) -> Option<CanvasTarget> {
         self.selected_element
             .filter(|index| *index < self.elements.len())
@@ -285,6 +559,22 @@ impl AppState {
                 element,
                 edit: self.canvas_edit_target,
             })
+    }
+
+    pub fn transform_feedback(&mut self, clamped: bool, free: bool) {
+        if clamped {
+            self.status_message = if free {
+                "At printable edge"
+            } else {
+                "At allocation edge"
+            }
+            .into();
+        } else if self.status_message.starts_with("At printable edge")
+            || self.status_message.starts_with("At allocation edge")
+            || self.status_message.starts_with("Content exceeds")
+        {
+            self.status_message = "Ready".into();
+        }
     }
 
     /// Selecting a target is UI state only: never detach auto-fit content,
@@ -344,11 +634,20 @@ impl AppState {
             ("Selected", self.selected_canvas_target()?)
         };
         let name = match target.edit {
-            CanvasEditTarget::Content => "Object",
-            CanvasEditTarget::Slot => "Slot",
+            CanvasEditTarget::Content => "Content",
+            CanvasEditTarget::Slot => "Layout",
         };
+        let free = self.elements[target.element].as_object().is_some_and(|o| {
+            o.layout
+                .as_ref()
+                .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Free)
+        });
         let consequence = match target.edit {
-            CanvasEditTarget::Content => "Spacing unchanged.".to_string(),
+            CanvasEditTarget::Content if free => "Move, resize or rotate this object.".into(),
+            CanvasEditTarget::Content => "Move, resize or rotate content.".to_string(),
+            CanvasEditTarget::Slot if free => {
+                "Free positioning; use the blue object handles.".into()
+            }
             CanvasEditTarget::Slot => {
                 let count = self.slot_followers(target.element).len();
                 format!(
@@ -363,13 +662,13 @@ impl AppState {
             " Turn off label horizontal mirroring to drag."
         } else if phase == "Candidate" {
             " Click to select."
-        } else if phase == "Selected" && target.edit == CanvasEditTarget::Slot {
-            " Drag border to move."
+        } else if phase == "Selected" && target.edit == CanvasEditTarget::Slot && !free {
+            " Drag to reorder; use handles for size and gap."
         } else {
             ""
         };
         Some(format!(
-            "{phase} {name} {}: {consequence}{action}",
+            "{phase} object {} · {name}: {consequence}{action}",
             target.element + 1
         ))
     }
@@ -508,17 +807,68 @@ impl AppState {
         }
     }
 
-    fn add_element(&mut self, element: LabelElement) {
-        self.editor_generation = self.editor_generation.wrapping_add(1);
-        if element
-            .as_object()
-            .is_some_and(|object| object.content_box.is_some())
+    fn add_element(&mut self, mut element: LabelElement) {
+        use ptouch_render::object_layout::{Placement, WidthSizing};
+        let insertion = self.selected_element.filter(|i| {
+            self.elements
+                .get(*i)
+                .and_then(|e| e.as_object())
+                .is_some_and(|o| {
+                    o.frame.position == PositionMode::Relative
+                        || o.layout
+                            .as_ref()
+                            .is_some_and(|p| p.placement == Placement::Flow)
+                })
+                || !self.slot_followers(*i).is_empty()
+        });
+        if let Some(source) = insertion.and_then(|i| self.elements[i].as_object())
+            && let Some(new) = element.as_object_mut()
         {
-            self.document_version = self.document_version.max(4);
+            new.frame.position = PositionMode::Relative;
+            new.frame.gap_mm = if source.frame.position == PositionMode::Relative {
+                source.frame.gap_mm
+            } else {
+                insertion
+                    .and_then(|i| self.elements.get(i + 1))
+                    .and_then(|e| e.as_object())
+                    .filter(|o| o.frame.position == PositionMode::Relative)
+                    .map_or(3.0, |o| o.frame.gap_mm)
+            };
+            new.frame.height_mm = source.frame.height_mm;
+            new.frame.y_mm = source.frame.y_mm;
+            if let Some(policy) = &mut new.layout {
+                policy.placement = Placement::Flow;
+                policy.width = source
+                    .layout
+                    .as_ref()
+                    .map_or(WidthSizing::Fixed, |p| p.width);
+                policy.padding_mm = source.layout.as_ref().map_or(0.0, |p| p.padding_mm);
+            }
+            if new
+                .layout
+                .as_ref()
+                .is_some_and(|p| p.width == WidthSizing::Fixed)
+            {
+                new.frame.width_mm = source.frame.width_mm;
+                let pad = new.layout.as_ref().map_or(0.0, |p| p.padding_mm) * 2.0;
+                if let Some(c) = &mut new.content_box {
+                    let scale = ((new.frame.width_mm - pad) / c.width_mm)
+                        .min((new.frame.height_mm - pad) / c.height_mm)
+                        .clamp(0.01, 1.0);
+                    c.width_mm *= scale;
+                    c.height_mm *= scale;
+                }
+            }
         }
-        self.elements.push(element);
+        if let Some(object) = element.as_object_mut() {
+            ptouch_render::object_layout::update_allocation(object);
+        }
+        self.editor_generation = self.editor_generation.wrapping_add(1);
+        self.document_version = self.document_version.max(element.minimum_version());
+        let index = insertion.map_or(self.elements.len(), |i| i + 1);
+        self.elements.insert(index, element);
         self.select_canvas_target(Some(CanvasTarget {
-            element: self.elements.len() - 1,
+            element: index,
             edit: CanvasEditTarget::Content,
         }));
         self.mark_dirty();
@@ -528,6 +878,13 @@ impl AppState {
     /// start 3 mm after the source's right edge, like Add Text.
     /// Existing absolute anchors and object-local geometry are untouched.
     pub fn duplicate_element(&mut self, index: usize) -> bool {
+        let sequence = self.flow_chain(index).is_some()
+            || self
+                .elements
+                .get(index)
+                .and_then(|e| e.as_object())
+                .and_then(|o| o.layout.as_ref())
+                .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow);
         let Some(mut copy) = self.elements.get(index).cloned() else {
             return false;
         };
@@ -542,7 +899,17 @@ impl AppState {
             let Some((x, _, width, _)) = self.element_rect_mm(index) else {
                 return false;
             };
-            frame.x_mm = x + width + 3.0;
+            if sequence {
+                frame.position = PositionMode::Relative;
+                frame.gap_mm = self
+                    .elements
+                    .get(index + 1)
+                    .and_then(|e| e.as_object())
+                    .filter(|o| o.frame.position == PositionMode::Relative)
+                    .map_or(3.0, |o| o.frame.gap_mm);
+            } else {
+                frame.x_mm = x + width + 3.0;
+            }
         }
         let edit = if self.selected_element == Some(index) {
             self.canvas_edit_target
@@ -568,9 +935,18 @@ impl AppState {
 
     pub fn add_text(&mut self) {
         let element = if self.is_free_layout() {
-            let mut object =
-                LabelObject::text("Label".to_string(), self.default_object_frame(10.0, 8.0));
+            let mut object = LabelObject::text(
+                "Label".to_string(),
+                self.default_object_frame(10.0, self.printable_height_mm()),
+            );
             object.content_box = Some(content_box_for_frame(&object.frame));
+            object.content_box.as_mut().unwrap().height_mm *= 0.8;
+            object.layout = Some(Default::default());
+            object.frame.y_mm = (self.printable_height_mm()
+                - object.content_box.as_ref().unwrap().height_mm
+                - object.layout.as_ref().unwrap().padding_mm * 2.0)
+                .max(0.0)
+                / 2.0;
             LabelElement::Object(object)
         } else {
             LabelElement::Text {
@@ -602,10 +978,12 @@ impl AppState {
             };
             // Fit the original aspect ratio inside a useful initial footprint.
             let aspect = f64::from(bitmap.width()) / f64::from(bitmap.height().max(1));
-            let height = self.printable_height_mm().min(40.0 / aspect);
+            let height = (self.printable_height_mm() * 0.8).min(40.0 / aspect);
             object.frame.width_mm = (height * aspect).max(25.4 / f64::from(self.target_dpi()));
             object.frame.height_mm = height.max(25.4 / f64::from(self.target_dpi()));
+            object.frame.y_mm = (self.printable_height_mm() - object.frame.height_mm) / 2.0;
             object.content_box = Some(content_box_for_frame(&object.frame));
+            object.layout = Some(Default::default());
             LabelElement::Object(object)
         } else {
             let element = LabelElement::image_from_bytes(path, bytes);
@@ -623,6 +1001,10 @@ impl AppState {
             let frame = self.default_object_frame(1.27, self.printable_height_mm());
             LabelElement::Object(LabelObject {
                 content_box: Some(content_box_for_frame(&frame)),
+                layout: Some(ptouch_render::object_layout::LayoutOptions {
+                    padding_mm: 0.0,
+                    ..Default::default()
+                }),
                 frame,
                 rotation: 0.0,
                 flip_h: false,
@@ -671,7 +1053,43 @@ impl AppState {
 
     /// Mark the preview as needing re-render.
     pub fn mark_dirty(&mut self) {
+        self.edit_revision = self.edit_revision.wrapping_add(1);
         self.needs_rerender = true;
+    }
+
+    pub fn history_step(&mut self, redo: bool) {
+        if let Some(snapshot) = self.history.step(redo) {
+            self.restore_document(snapshot.document);
+            self.selected_element = snapshot.selection;
+            self.status_message = if redo { "Redo" } else { "Undo" }.into();
+        }
+    }
+
+    pub fn restore_document(&mut self, doc: LabelDocument) {
+        let same_content = self.elements.len() == doc.elements.len()
+            && self.elements.iter().zip(&doc.elements).all(|(a, b)| {
+                match (a.as_object(), b.as_object()) {
+                    (Some(a), Some(b)) => a.content == b.content,
+                    _ => false,
+                }
+            });
+        let generation = self.editor_generation;
+        self.document_version = doc.version;
+        self.elements = doc.elements;
+        self.tape_width_mm = doc.tape_width_mm;
+        self.design_dpi = doc.dpi;
+        self.font_name = doc.font_name;
+        self.font_margin = doc.font_margin;
+        self.overall_flip_h = doc.flip_h;
+        self.overall_flip_v = doc.flip_v;
+        self.update_tape_pixels();
+        self.validate_selection();
+        if same_content {
+            self.editor_generation = generation;
+        }
+        self.canvas_hover_target = None;
+        self.canvas_drag_target = None;
+        self.mark_dirty();
     }
 
     /// Ensure the selected element index is valid.
@@ -870,17 +1288,17 @@ mod tests {
         };
         state.select_canvas_target(Some(selected));
         let hint = state.canvas_hint().unwrap();
-        assert!(hint.starts_with("Selected Slot 2"));
+        assert!(hint.starts_with("Selected object 2 · Layout:"));
         assert!(hint.contains("0 following objects"));
-        assert!(hint.contains("Drag border to move."));
+        assert!(hint.contains("Drag to reorder; use handles for size and gap."));
         state.canvas_hover_target = Some(hovered);
         let hint = state.canvas_hint().unwrap();
-        assert!(hint.starts_with("Candidate Object 1"));
-        assert!(hint.contains("Spacing unchanged"));
+        assert!(hint.starts_with("Candidate object 1 · Content:"));
+        assert!(hint.contains("Move, resize or rotate content"));
         assert!(hint.contains("Click to select."));
         state.canvas_drag_target = Some(dragged);
         let hint = state.canvas_hint().unwrap();
-        assert!(hint.starts_with("Dragging Slot 1"));
+        assert!(hint.starts_with("Dragging object 1 · Layout:"));
         assert!(hint.contains("1 following object"));
         state.overall_flip_h = true;
         assert!(
@@ -922,11 +1340,11 @@ mod tests {
         assert!(state.duplicate_selected());
         assert_eq!(state.selected_element, Some(1));
         assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
-        for (i, x) in [5.0, 18.0, 30.8, 100.0].into_iter().enumerate() {
+        for (i, x) in [5.0, 17.8, 30.6, 100.0].into_iter().enumerate() {
             assert!((state.element_rect_mm(i).unwrap().0 - x).abs() < 1e-10);
         }
         assert!(state.duplicate_element(2));
-        assert!((state.element_rect_mm(3).unwrap().0 - 43.6).abs() < 1e-10);
+        assert!((state.element_rect_mm(3).unwrap().0 - 43.4).abs() < 1e-10);
         assert_eq!(state.element_rect_mm(4).unwrap().0, 100.0);
         assert!(!state.duplicate_element(999));
     }
@@ -955,6 +1373,7 @@ mod tests {
             ObjectContent::Padding,
         ] {
             let object = LabelObject {
+                layout: None,
                 frame: TextBox {
                     x_mm: 5.0,
                     ..Default::default()
@@ -1064,7 +1483,10 @@ mod tests {
     #[test]
     fn line_spacing_upgrades_render_and_save_together_and_survives_duplication() {
         let mut state = AppState::default();
-        state.add_text();
+        let mut old = LabelObject::text("Label", TextBox::default());
+        old.content_box = Some(content_box_for_frame(&old.frame));
+        state.elements.push(LabelElement::Object(old));
+        state.selected_element = Some(0);
         assert_eq!(state.document().version, 4);
         if let ObjectContent::Text { line_spacing, .. } =
             &mut state.elements[0].as_object_mut().unwrap().content
@@ -1107,22 +1529,16 @@ mod tests {
         let first = state.elements[0].as_object_mut().unwrap();
         first.frame.x_mm = 40.0;
         state.add_text();
-        let positions: Vec<_> = state
-            .elements
-            .iter()
-            .map(|element| {
-                let object = element.as_object().unwrap();
-                let frame = &object.frame;
-                assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
-                assert_eq!(frame.position, PositionMode::Absolute);
-                assert_eq!(
-                    (frame.width_mm, frame.height_mm, frame.y_mm),
-                    (10.0, 8.0, 0.0)
-                );
-                frame.x_mm
-            })
-            .collect();
-        assert_eq!(positions, [40.0, 13.0, 53.0]);
+        let width = state.elements[0].as_object().unwrap().frame.width_mm;
+        for element in &state.elements {
+            let object = element.as_object().unwrap();
+            let content = object.content_box.as_ref().unwrap();
+            assert!((content.height_mm / state.printable_height_mm() - 0.8).abs() < 1e-9);
+            assert_eq!(object.frame.height_mm, content.height_mm);
+            assert_eq!(object.frame.position, PositionMode::Absolute);
+        }
+        assert_eq!(state.element_rect_mm(1).unwrap().0, width + 3.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 40.0 + width + 3.0);
         assert!(state.needs_rerender);
     }
 
@@ -1166,12 +1582,9 @@ mod tests {
         let mut state = AppState::default();
         assert!(state.add_image_bytes(None, bytes.clone()));
         let object = state.elements[0].as_object().unwrap();
-        assert_eq!(
-            object.content_box,
-            Some(content_box_for_frame(&object.frame))
-        );
-        assert!((object.frame.width_mm / object.frame.height_mm - 2.0).abs() < 1e-9);
-        assert_eq!(object.frame.height_mm, state.printable_height_mm());
+        let content = object.content_box.as_ref().unwrap();
+        assert!((content.width_mm / content.height_mm - 2.0).abs() < 1e-9);
+        assert!((object.frame.height_mm - state.printable_height_mm() * 0.8).abs() < 1e-9);
         let ObjectContent::Image {
             image_data, bitmap, ..
         } = &object.content
@@ -1197,9 +1610,10 @@ mod tests {
         for element in &state.elements {
             let object = element.as_object().unwrap();
             let frame = &object.frame;
-            assert_eq!(object.content_box, Some(content_box_for_frame(frame)));
+            let content = object.content_box.as_ref().unwrap();
+            assert!(content.height_mm <= frame.height_mm);
             assert!(frame.height_mm <= state.printable_height_mm());
-            assert_eq!(frame.y_mm, 0.0);
+            assert!(frame.y_mm + frame.height_mm <= state.printable_height_mm() + 1e-9);
         }
     }
 
@@ -1287,6 +1701,94 @@ mod tests {
                 .elements
                 .iter()
                 .all(|element| element.as_object().unwrap().content_box.is_none())
+        );
+    }
+    fn small_free(text: &str, x: f64, y: f64) -> LabelElement {
+        let mut object = LabelObject::text(
+            text,
+            TextBox {
+                width_mm: 4.0,
+                height_mm: 2.0,
+                x_mm: x,
+                y_mm: y,
+                ..Default::default()
+            },
+        );
+        object.content_box = Some(ContentBox {
+            width_mm: 4.0,
+            height_mm: 2.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        object.layout = Some(ptouch_render::object_layout::LayoutOptions {
+            width: ptouch_render::object_layout::WidthSizing::Fixed,
+            ..Default::default()
+        });
+        LabelElement::Object(object)
+    }
+
+    #[test]
+    fn free_geometry_has_no_hidden_allocation_and_clamps_at_printable_edge() {
+        let state = AppState {
+            document_version: 7,
+            elements: vec![small_free("A", 2.0, 1.0)],
+            ..Default::default()
+        };
+        let before = state.elements[0].as_object().unwrap();
+        let mut rotated = before.clone();
+        rotated.rotation = 90.0;
+        assert!(!state.constrain_transform(0, before, &mut rotated).unwrap());
+        assert!((rotated.frame.width_mm - 2.0).abs() < 1e-9);
+        assert!((rotated.frame.height_mm - 4.0).abs() < 1e-9);
+        assert!((rotated.frame.x_mm - 3.0).abs() < 1e-9);
+        assert!(rotated.frame.y_mm.abs() < 1e-9);
+        let mut moved = before.clone();
+        moved.content_box.as_mut().unwrap().offset_x_mm = -20.0;
+        moved.content_box.as_mut().unwrap().offset_y_mm = -20.0;
+        assert!(state.constrain_transform(0, before, &mut moved).unwrap());
+        assert_eq!((moved.frame.x_mm, moved.frame.y_mm), (0.0, 0.0));
+        assert_eq!(
+            (
+                moved.content_box.as_ref().unwrap().offset_x_mm,
+                moved.content_box.as_ref().unwrap().offset_y_mm
+            ),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn swapping_positions_and_template_content_are_distinct_operations() {
+        let mut state = AppState {
+            document_version: 7,
+            elements: vec![small_free("A", 2.0, 1.0), small_free("B", 20.0, 2.0)],
+            ..Default::default()
+        };
+        assert!(state.swap_positions(0, 1));
+        assert_eq!(state.elements[0].as_object().unwrap().frame.x_mm, 20.0);
+        assert!(
+            matches!(&state.elements[0].as_object().unwrap().content,ObjectContent::Text{content,..} if content=="A")
+        );
+        let height = state.printable_height_mm();
+        for element in &mut state.elements {
+            AppState::use_flow_allocation(element.as_object_mut().unwrap(), height);
+        }
+        let frames: Vec<_> = state
+            .elements
+            .iter()
+            .map(|e| e.as_object().unwrap().frame.clone())
+            .collect();
+        assert!(!state.can_swap_positions(0, 1));
+        assert!(state.swap_content(0, 1));
+        assert_eq!(
+            state
+                .elements
+                .iter()
+                .map(|e| e.as_object().unwrap().frame.clone())
+                .collect::<Vec<_>>(),
+            frames
+        );
+        assert!(
+            matches!(&state.elements[0].as_object().unwrap().content,ObjectContent::Text{content,..} if content=="B")
         );
     }
 }

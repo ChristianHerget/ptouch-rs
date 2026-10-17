@@ -340,7 +340,7 @@ fn show_mirror_section(ui: &mut egui::Ui, state: &mut AppState) {
 /// Element list section with reorder and delete controls.
 fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Elements");
-    ui.small("Row: object. Slot: template position. Drag rows to reorder.");
+    ui.small("Select an object. Drag rows to reorder.");
     ui.add_space(4.0);
 
     if state.elements.is_empty() {
@@ -369,32 +369,36 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                     ..
                 }
         );
-        let label = format!("{}. {}", idx + 1, element.display_name());
+        let flow = element.as_object().is_some_and(|o| {
+            o.frame.position == ptouch_render::document::PositionMode::Relative
+                || o.layout
+                    .as_ref()
+                    .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow)
+        }) || !state.slot_followers(idx).is_empty();
+        let label = format!(
+            "{}. {} {}",
+            idx + 1,
+            if flow { "↔" } else { "•" },
+            element.display_name()
+        );
         let response = ui
             .horizontal(|ui| {
-                let row_width = (ui.available_width() - 48.0).max(20.0);
-                let response = ui
-                    .add_sized(
-                        [row_width, ui.spacing().interact_size.y],
-                        egui::Button::selectable(selected == Some(object_target), &label)
-                            .truncate()
-                            .sense(egui::Sense::click_and_drag()),
-                    )
-                    .on_hover_text(&label);
-                if ui
-                    .add_enabled(
-                        has_slot,
-                        egui::Button::selectable(selected == Some(slot_target), "Slot").small(),
-                    )
-                    .on_hover_text("Select the template slot to edit position and spacing")
-                    .on_disabled_hover_text(
-                        "Convert this legacy element to free layout to create a slot",
-                    )
-                    .clicked()
-                {
-                    selection = Some(slot_target);
-                }
-                response
+                let row_width = ui.available_width().max(20.0);
+
+                ui.add_sized(
+                    [row_width, ui.spacing().interact_size.y],
+                    egui::Button::selectable(selected.is_some_and(|t| t.element == idx), &label)
+                        .truncate()
+                        .sense(egui::Sense::click_and_drag()),
+                )
+                .on_hover_text(format!(
+                    "{label}\n{}",
+                    if flow {
+                        "In sequence: reordering changes physical placement."
+                    } else {
+                        "Free position: reordering preserves X/Y coordinates."
+                    }
+                ))
             })
             .inner;
         if response.clicked() || response.drag_started() {
@@ -405,12 +409,36 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 action = Some(ElementAction::Duplicate(idx));
                 ui.close();
             }
-            if ui.button("Select object").clicked() {
+            if idx > 0 {
+                if state.can_swap_positions(idx, idx - 1)
+                    && ui
+                        .button("Swap positions with previous")
+                        .on_hover_text(
+                            "Exchange X/Y coordinates; each object keeps its size and content",
+                        )
+                        .clicked()
+                {
+                    action = Some(ElementAction::SwapPositions(idx));
+                    ui.close();
+                }
+                if state.can_swap_content(idx, idx - 1)
+                    && ui
+                        .button("Swap content with previous")
+                        .on_hover_text(
+                            "Exchange content and its transforms while keeping layout allocations",
+                        )
+                        .clicked()
+                {
+                    action = Some(ElementAction::SwapContent(idx));
+                    ui.close();
+                }
+            }
+            if ui.button("Edit content").clicked() {
                 selection = Some(object_target);
                 ui.close();
             }
             if ui
-                .add_enabled(has_slot, egui::Button::new("Select slot"))
+                .add_enabled(has_slot, egui::Button::new("Adjust layout…"))
                 .clicked()
             {
                 selection = Some(slot_target);
@@ -418,12 +446,18 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
         response.dnd_set_drag_payload(ElementDrag(idx));
-        if response.dnd_hover_payload::<ElementDrag>().is_some() {
-            ui.painter().rect_stroke(
-                response.rect,
-                0.0,
-                egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
-                egui::StrokeKind::Outside,
+        if let Some(source) = response.dnd_hover_payload::<ElementDrag>() {
+            let y = if source.0 < idx {
+                response.rect.bottom()
+            } else {
+                response.rect.top()
+            };
+            ui.painter().line_segment(
+                [
+                    egui::pos2(response.rect.left(), y),
+                    egui::pos2(response.rect.right(), y),
+                ],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(205, 115, 0)),
             );
         }
         if let Some(source) = response.dnd_release_payload::<ElementDrag>() {
@@ -485,6 +519,12 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     // Apply deferred action
     if let Some(act) = action {
         match act {
+            ElementAction::SwapPositions(index) => {
+                state.swap_positions(index, index - 1);
+            }
+            ElementAction::SwapContent(index) => {
+                state.swap_content(index, index - 1);
+            }
             ElementAction::Duplicate(idx) => {
                 state.duplicate_element(idx);
             }
@@ -514,23 +554,13 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
 struct ElementDrag(usize);
 
 fn move_element(state: &mut AppState, from: usize, to: usize) {
-    if from == to || from >= state.elements.len() || to >= state.elements.len() {
-        return;
-    }
-    let element = state.elements.remove(from);
-    state.elements.insert(to, element);
-    state.selection_revision = state.selection_revision.wrapping_add(1);
-    state.select_canvas_target(Some(CanvasTarget {
-        element: to,
-        edit: state.canvas_edit_target,
-    }));
-    state.canvas_hover_target = None;
-    state.canvas_drag_target = None;
-    state.mark_dirty();
+    state.reorder_object(from, to);
 }
 
 /// Deferred actions for element list manipulation.
 enum ElementAction {
+    SwapPositions(usize),
+    SwapContent(usize),
     Duplicate(usize),
     MoveUp(usize),
     MoveDown(usize),
@@ -599,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_keyboard_entry_row_click_and_context_menu_select_without_pinning() {
+    fn row_selects_one_object_and_layout_is_an_explicit_context_action() {
         let mut state = AppState {
             document_version: 3,
             elements: vec![LabelElement::Object(LabelObject::text(
@@ -619,7 +649,7 @@ mod tests {
             state.selected_canvas_target(),
             Some(CanvasTarget {
                 element: 0,
-                edit: CanvasEditTarget::Slot,
+                edit: CanvasEditTarget::Content,
             })
         );
         let row = text_position(&output, "1. ");
@@ -651,7 +681,7 @@ mod tests {
             vec![pointer_event(row, egui::PointerButton::Secondary, false)],
         );
         let menu = list_frame(&context, &mut state, vec![]);
-        let slot = text_position(&menu, "Select slot");
+        let slot = text_position(&menu, "Adjust layout…");
         list_frame(
             &context,
             &mut state,
@@ -675,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn reordering_keeps_absolute_coordinates_and_rebinds_relative_followers() {
+    fn reordering_keeps_chain_anchor_and_rejects_crossing_free_objects() {
         let mut state = AppState {
             elements: vec![
                 LabelElement::Object(LabelObject::text(
@@ -708,11 +738,17 @@ mod tests {
             element: 0,
             edit: CanvasEditTarget::Slot,
         }));
+        let before = state.document();
         move_element(&mut state, 0, 1);
+        assert_eq!(state.document(), before);
+        move_element(&mut state, 2, 1);
         assert_eq!(state.selected_element, Some(1));
         assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
-        assert_eq!(state.element_rect_mm(0).unwrap().0, 30.0);
-        assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
-        assert_eq!(state.element_rect_mm(2).unwrap().0, 18.0);
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 5.0);
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 30.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
+        assert!(
+            matches!(&state.elements[1].as_object().unwrap().content, ptouch_render::document::ObjectContent::Text { content, .. } if content == "C")
+        );
     }
 }

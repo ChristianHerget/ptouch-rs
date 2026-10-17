@@ -47,7 +47,7 @@ pub fn show_status_bar(ui: &mut egui::Ui, state: &AppState) {
     // Keep a separate, stable-height row so hover feedback never replaces an
     // error/save message or changes the canvas origin during an active drag.
     let hint = state.canvas_hint().unwrap_or_else(|| {
-        "Point at an object or slot. Use the element list to choose overlapping targets.".into()
+        "Select an object. Use Adjust layout for positioning and spacing.".into()
     });
     ui.add(egui::Label::new(egui::RichText::new(&hint).small()).truncate())
         .on_hover_text(hint);
@@ -97,7 +97,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|text| text.contains("Candidate Slot 1")
+                .any(|text| text.contains("Candidate object 1 · Layout:")
                     && text.contains("0 following objects"))
         );
         assert_eq!(state.status_message, "Render error: invalid dimensions");

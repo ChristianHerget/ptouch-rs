@@ -24,6 +24,7 @@ struct Snapshot {
 
 #[derive(Clone, Default)]
 struct Session {
+    last_action: f64,
     current: Snapshot,
     committed: StyledText,
     undo: Vec<Arc<Snapshot>>,
@@ -49,6 +50,7 @@ impl Session {
         if before.document == self.current.document && before.pending == self.current.pending {
             return;
         }
+        self.last_action = time;
         let coalesce = typing
             && self
                 .typing_group
@@ -104,6 +106,35 @@ impl Session {
         self.record(before, false, time);
         self.committed = self.current.document.clone();
     }
+}
+
+/// Insertion formatting is transient editor state, so it does not create a
+/// document snapshot. Route only such a newer action ahead of document undo.
+pub fn pending_history(ctx: &Context, id: Id, redo: bool, after: f64) -> bool {
+    let session_id = id.with("session");
+    let Some(mut session) = ctx.data_mut(|d| d.get_temp::<Session>(session_id)) else {
+        return false;
+    };
+    let source = if redo { &session.redo } else { &session.undo };
+    if session.last_action < after
+        || source
+            .last()
+            .is_none_or(|s| s.document != session.current.document)
+    {
+        return false;
+    }
+    if !session.history(redo) {
+        return false;
+    }
+    session.last_action = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(session_id, session));
+    ctx.request_repaint();
+    true
+}
+
+pub fn is_composing(ctx: &Context, id: Id) -> bool {
+    ctx.data_mut(|d| d.get_temp::<Session>(id.with("session")))
+        .is_some_and(|s| s.composition.is_some())
 }
 
 #[derive(Clone)]
@@ -359,6 +390,10 @@ pub fn show(
     }
     let before = session.current.clone();
     let events = ui.input(|i| i.events.clone());
+    let document_history = ui.ctx().data_mut(|d| {
+        d.get_temp::<bool>(Id::new("document_history"))
+            .unwrap_or(false)
+    });
     let mut action = None;
     if focused || !ui.ctx().text_edit_focused() {
         // More specific modifiers first: egui's logical shortcuts can accept Shift.
@@ -376,7 +411,7 @@ pub fn show(
                 Action::Redo,
             ),
         ] {
-            if ui.input_mut(|i| i.consume_shortcut(&shortcut)) {
+            if !document_history && ui.input_mut(|i| i.consume_shortcut(&shortcut)) {
                 action = Some(command);
                 break;
             }
@@ -575,15 +610,17 @@ pub fn show(
                 action = Some(Action::Format(patch));
             }
         }
-        if ui
-            .add_enabled(!session.undo.is_empty(), Button::new("Undo"))
-            .clicked()
+        if !document_history
+            && ui
+                .add_enabled(!session.undo.is_empty(), Button::new("Undo"))
+                .clicked()
         {
             action = Some(Action::Undo);
         }
-        if ui
-            .add_enabled(!session.redo.is_empty(), Button::new("Redo"))
-            .clicked()
+        if !document_history
+            && ui
+                .add_enabled(!session.redo.is_empty(), Button::new("Redo"))
+                .clicked()
         {
             action = Some(Action::Redo);
         }

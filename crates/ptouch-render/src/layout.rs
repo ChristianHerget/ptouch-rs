@@ -188,6 +188,19 @@ pub fn render_document(
     target_dpi: u16,
     renderer: &mut TextRenderer,
 ) -> Result<RenderedLabel> {
+    let mut resolved;
+    let doc = if doc
+        .elements
+        .iter()
+        .filter_map(LabelElement::as_object)
+        .any(|o| o.layout.is_some())
+    {
+        resolved = doc.clone();
+        crate::object_layout::resolve(&mut resolved, renderer)?;
+        &resolved
+    } else {
+        doc
+    };
     if doc.version == 0 || doc.version > DOCUMENT_VERSION {
         return Err(RenderError::Layout(format!(
             "unsupported layout version {}",
@@ -598,6 +611,7 @@ pub fn convert_to_objects(
                 LabelObject {
                     frame,
                     content_box: None,
+                    layout: None,
                     rotation: *rotation,
                     flip_h: *flip_h,
                     flip_v: *flip_v,
@@ -632,6 +646,7 @@ pub fn convert_to_objects(
                 LabelObject {
                     frame,
                     content_box: None,
+                    layout: None,
                     rotation: *rotation,
                     flip_h: *flip_h,
                     flip_v: *flip_v,
@@ -645,6 +660,7 @@ pub fn convert_to_objects(
             LabelElement::CutMark | LabelElement::Padding { .. } => LabelObject {
                 frame,
                 content_box: None,
+                layout: None,
                 rotation: 0.0,
                 flip_h: false,
                 flip_v: false,
@@ -1666,6 +1682,7 @@ mod tests {
             content,
             frame,
             content_box: None,
+            layout: None,
             rotation: 0.0,
             flip_h: false,
             flip_v: false,

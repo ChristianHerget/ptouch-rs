@@ -28,8 +28,8 @@ pub use crate::layout::{
 };
 
 /// Newest supported on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 6;
-/// New layouts use v4; custom line spacing needs v5 and inline styles need v6.
+pub const DOCUMENT_VERSION: u32 = 7;
+/// Empty layouts start at v4; content features raise the version when needed.
 pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
@@ -38,7 +38,7 @@ fn default_dpi() -> u16 {
 }
 
 /// A complete label design: global settings plus an ordered element list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LabelDocument {
     /// Layout format version. See [`DOCUMENT_VERSION`].
     pub version: u32,
@@ -125,6 +125,7 @@ impl LabelDocument {
             ));
         }
         for object in doc.elements.iter().filter_map(LabelElement::as_object) {
+            crate::object_layout::validate(object, doc.version)?;
             if let ObjectContent::Text {
                 content,
                 styles,
@@ -329,7 +330,7 @@ fn substitute_placeholders(content: &str, lookup: impl Fn(&str) -> Option<String
 }
 
 /// A single element in the label composition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LabelElement {
     /// A physical object; v4 optionally separates content geometry from its slot.
@@ -396,10 +397,13 @@ pub enum LabelElement {
 /// `content_box`, content rotates and fits inside that slot. With one, content
 /// rotates independently and may extend beyond it. Object mirroring reflects
 /// the content and its offset around the slot center afterwards.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabelObject {
     pub frame: TextBox,
+    /// Explicit sizing/containment policy. Absent preserves v1–v6 geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<crate::object_layout::LayoutOptions>,
     /// Independent, unrotated content dimensions and offset from the slot center.
     /// Absent in v3: retain the original fit-to-slot rendering behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -415,7 +419,7 @@ pub struct LabelObject {
 
 /// Editable content of a physical object. Geometry and transforms are stored
 /// only on the containing [`LabelObject`], never recursively on the content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObjectContent {
     Text {
@@ -450,6 +454,7 @@ impl LabelObject {
     pub fn text(content: impl Into<String>, frame: TextBox) -> Self {
         Self {
             frame,
+            layout: None,
             content_box: None,
             rotation: 0.0,
             flip_h: false,
@@ -472,6 +477,7 @@ impl LabelObject {
         .ok();
         Self {
             frame,
+            layout: None,
             content_box: None,
             rotation: 0.0,
             flip_h: false,
@@ -490,6 +496,9 @@ impl LabelElement {
     pub fn minimum_version(&self) -> u32 {
         match self {
             Self::Object(object) => {
+                if object.layout.is_some() {
+                    return 7;
+                }
                 if let ObjectContent::Text { styles, .. } = &object.content
                     && !styles.is_empty()
                 {
@@ -966,6 +975,7 @@ mod tests {
                 LabelElement::Object(LabelObject {
                     frame: frame.clone(),
                     content_box: None,
+                    layout: None,
                     rotation: 90.0,
                     flip_h: false,
                     flip_v: false,
@@ -974,6 +984,7 @@ mod tests {
                 LabelElement::Object(LabelObject {
                     frame: frame.clone(),
                     content_box: None,
+                    layout: None,
                     rotation: 0.0,
                     flip_h: false,
                     flip_v: false,

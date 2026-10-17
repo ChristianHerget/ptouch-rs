@@ -15,6 +15,8 @@ use crate::state::{AppState, LabelElement, PrinterCommand};
 /// Toolbar actions run after properties commit pending keyboard edits.
 #[derive(Clone, Copy)]
 pub enum ToolbarAction {
+    Undo,
+    Redo,
     Convert,
     AddText,
     AddImage,
@@ -41,6 +43,19 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &AppState) -> Option<ToolbarAction
         });
     }
     ui.horizontal(|ui| {
+        if ui
+            .add_enabled(state.history.can_undo(), egui::Button::new("Undo"))
+            .clicked()
+        {
+            action = Some(ToolbarAction::Undo);
+        }
+        if ui
+            .add_enabled(state.history.can_redo(), egui::Button::new("Redo"))
+            .clicked()
+        {
+            action = Some(ToolbarAction::Redo);
+        }
+        ui.separator();
         for (label, command) in [
             ("Add Text", ToolbarAction::AddText),
             ("Add Image", ToolbarAction::AddImage),
@@ -96,6 +111,8 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &AppState) -> Option<ToolbarAction
 
 pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
     match action {
+        ToolbarAction::Undo => state.history_step(false),
+        ToolbarAction::Redo => state.history_step(true),
         ToolbarAction::Convert => match state.convert_to_free_layout() {
             Ok(()) => {
                 state.status_message =

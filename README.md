@@ -203,74 +203,72 @@ ptouch list
 
 ### Free layout and precise patch-panel labels
 
-New GUI layouts give text, images, and cut marks a millimeter **slot** for
-template position and spacing, plus an independent **object** box for content
-size and center offsets. In **Object** mode, dragging moves the content within
-or beyond its slot. Its square handle scales proportionally, including an
-explicit text font size; its round handle rotates the object and its handles
-without shrinking it back into the slot. **Slot** mode moves or resizes the
-template frame without scaling a manually sized object. Hover an object to
-preview its selection; elsewhere on the paper, its slot's X interval selects
-the slot. Overlapping slots prefer the nearest Y range, then list order.
-Only hovered/selected outlines appear, with dashed related slots shown faintly.
-Click selects the target; dragging keeps that target until release. Selection
-handles stay visible while hovering another element.
+Select an object on the canvas or in the element list. Its blue dashed frame
+has a square handle for proportional scaling and a round handle for rotation;
+both follow the rotated content. Click empty canvas space to clear selection.
+There is one selected object, with an explicit **Adjust layout…** action for
+positioning and spacing.
 
-Click an element row to select its object, or use its **Slot** button or the
-context menu. A selected dashed border also acts as a move handle when another
-object covers it. Moving a slot horizontally or changing its width updates the
-X positions of consecutive **After previous** objects; an absolute slot ends
-that chain. The bottom hint identifies the target and affected follower count.
-Hold Shift while rotating to snap to 15° increments. The optional 0.1 mm snap and arrow keys
-allow fine position adjustments (Shift moves 1 mm).
-Turn off whole-label horizontal mirroring before using mouse transforms or
-arrow-key movement. Numeric properties remain available; each object's own
-mirroring and whole-label vertical mirroring also allow mouse transforms. This
-avoids an ambiguous origin when the horizontally mirrored label changes length.
-The X and Y millimeter rulers remain visible while scrolling and follow the
-original print pixels even when a long preview texture is reduced for display.
-The Y endpoint shows the actual printable height at the current DPI, which can
-be smaller than the nominal tape width.
-Numeric fields accept either `14.5` or `14,5`; press Enter or leave the field to
-apply the complete value. The tape panel shows the printable height separately.
-Object and slot outlines use their physical dimensions, independently of print
-pixel rounding, so equal boxes share an edge.
+**Free positioning** moves the whole object without moving its neighbours.
+New text starts with **Auto width** sizing: its measured ink height targets
+80% of the printable height and its width follows the text and font. Manual
+scaling switches free text to **Manual** sizing so its frame does not change
+again on release; select **Auto width** to restore automatic width. Images
+keep their aspect ratio, including intentional transparent source margins.
 
-New text starts as a 10 mm wide box with automatic font size; its height is
-8 mm or the printable height, whichever is smaller. The first object starts at
-X=0, Y=0. Subsequent slots start 3 mm after the rightmost slot, using absolute
-coordinates. Images keep their aspect ratio inside their object boxes.
+**In sequence** places objects horizontally after their predecessor. Choose
+**Fixed** allocation width for port labels whose positions must survive text,
+font and rotation changes, or **Auto width** to reflow the sequence as
+text grows. New or duplicated sequence objects follow the selected object and
+inherit its layout settings. Free objects start 3 mm after the rightmost object.
 
-Use **Duplicate** in the element list or its context menu, or Ctrl+D (Cmd+D on
-macOS), to copy any element with its settings. The copy follows the source in
-the list: relative slots reuse their gap; absolute slots start 3 mm after the
-source. Following relative slots move along;
-existing absolute slots stay put. Text-field shortcuts retain their normal use.
+During **Adjust layout…**, an orange dashed allocation replaces the active blue
+handles. The content remains faint blue for reference; related allocations are
+fainter orange. Drag an allocation to reorder within its sequence, its square
+handle to resize it, or its left gap handle to adjust spacing. The canvas shows
+the resulting arrangement while dragging. Ordinary blue-frame dragging never
+silently becomes a reorder operation.
 
-Use **Add Image** or **Change File...** to add or replace PNG, SVG, or SVGZ images.
-Click the image row to move, resize or rotate its object; click **Slot** to edit
-its absolute position or gap, just like text.
-The source bytes are embedded in the saved `.ptl`, so reopening does not require
-the original image file. SVG sources should embed any linked images as well.
+Drag sequence rows in the element list to change their physical order. Free
+objects retain their coordinates when list order changes; their context menu
+provides **Swap positions with previous**. **Swap content with previous** exchanges
+content and its transforms between fixed allocations, retaining template positions.
+Reordering cannot silently cross a sequence anchor or detach a relative object.
+Black pixels combine at overlaps; white pixels do not erase other objects.
+List order determines which overlapping object is selected first.
 
-Choose **After previous** to position a slot after the previous slot's right
-edge with a specified gap. Empty text still reserves the whole slot, so template
-values do not shift later ports. Dragging a relative slot changes its gap; if
-it crosses to the left of its predecessor's right edge, it becomes absolute to
-allow overlap. Dragging list rows or using Up/Down changes composition order:
-absolute coordinates stay fixed, while relative objects follow their new
-predecessors. Black pixels combine at overlaps; white pixels do not erase other
-objects. The list order also determines which overlapping object is selected.
+New layouts keep content inside the printable area. Fixed sequence allocations
+also constrain their content unless **Keep content inside allocation** is turned
+off. Boundary feedback explains when a transform cannot fit. **Fit inside**
+shrinks content proportionally and enables automatic text sizing; resizing an
+allocation does not silently change the text's font size. Existing layouts
+retain their saved behaviour until positioning or sizing is explicitly changed.
 
-Object width and height describe the unrotated content box; offsets move its
-center relative to the slot center. Auto font size fits that box without
-stretching letters; an explicit size uses points and clipped text raises a
-warning. **Line spacing** controls baseline distance as a multiple of font size
-(0.5–3.0); 1.20 preserves the original spacing. Reduce it for compact multiline
-labels. Custom values are saved as `line_spacing` in the text object's
-`[elements.content]` table. Rotation keeps the object size and slot spacing. Content can overlap
-neighboring slots or extend the label length; the printable tape edges clip it
-with a warning. **Auto fit slot** restores the older fit-inside-slot behavior.
+One complete mouse drag is one **Undo** step. **Esc** cancels the current drag;
+Ctrl+Z undoes and Ctrl+Shift+Z or Ctrl+Y redoes (Cmd on macOS). Text, formatting,
+geometry and ordering participate in document history. Hold Shift while rotating
+to snap to 15° increments. The optional 0.1 mm snap and arrow keys provide fine
+position adjustments; Shift moves 1 mm. Use **Duplicate**, its context menu entry,
+or Ctrl+D/Cmd+D to copy an object with its settings.
+
+The X and Y millimeter rulers remain visible while scrolling and use the original
+print geometry even when the preview texture is reduced. The Y ruler covers the
+full nominal tape width: light bands are printable and dark edges are not. Their
+boundaries align on the tape and ruler. Edge placement is schematic when the
+printer's exact vertical head offset is unknown; property coordinates still use
+the printable area's top-left origin. Numeric fields accept `14.5` or `14,5`;
+press Enter or leave the field to apply the complete value.
+
+Turn off whole-label horizontal mirroring before mouse transforms or arrow-key
+movement. Numeric editing remains available. Per-object mirroring and whole-label
+vertical mirroring support mouse transforms.
+
+Use **Add Image** or **Change File...** for PNG, SVG and SVGZ images. Source bytes
+are embedded in `.ptl` files, so reopening does not require the original file.
+SVG sources should embed linked images. **Line spacing** controls text baseline
+distance (0.5–3.0 times the font size); 1.20 preserves the original spacing.
+Automatic text fitting preserves glyph proportions and rich text size ratios;
+fixed font sizes use points and report clipping when too large.
 
 The [patch panel example](examples/patch-panel.ptl) has three 10 mm boxes starting
 at 5, 18, and 31 mm, with 3 mm gaps:
@@ -288,19 +286,35 @@ ptouch print --layout examples/patch-panel.ptl \
 Coordinates start at the **printable area's top-left**, not the physical tape
 edge or cut. Printer feed and cutter offsets can add leading tape; verify those
 on the device before using the first coordinate as a cut-edge measurement.
-Each slot sets the next relative start to its own right edge, even if it was
-moved backwards with absolute positioning. Negative/non-finite slot coordinates,
-zero or excessive dimensions, and slots beyond the printable tape height are
+Each allocation sets the next relative start to its own right edge, even if it was
+moved backwards with absolute positioning. Negative/non-finite allocation coordinates,
+zero or excessive dimensions, and allocations beyond the printable tape height are
 errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
-New free layouts use format version 4. Non-default line spacing requires version
-5, and inline text styles require version 6. Older builds reject newer features.
-Versions 1–5 retain their rendering and version when saved without new inline
-styles. Objects without a `content_box` keep fitting inside their slots;
-their first Object move, resize, or rotation fixes the current content size and
-saves it as v4. Content previously clipped by the slot may reappear on that
-first edit. **Convert to free layout** preserves the exact dimensions of
+New GUI object layouts use format version 7. The optional
+`[elements.layout]` table stores positioning, width sizing and containment:
+
+```toml
+[elements.layout]
+placement = "flow" # "free" for independent positioning
+width = "fixed"    # "content" to measure text width automatically
+constrain = true
+padding_mm = 0.5
+```
+
+`frame` stores the allocation or free object's bounding frame; `content_box`
+stores the unrotated content size and offset. Content-sized text is measured at
+the saved design DPI, keeping physical flow spacing independent of output DPI.
+Free objects use frame X/Y, zero content offsets and zero allocation padding. The same
+policies drive preview, templates, CLI export and printing.
+
+Versions 1–6 retain their rendering and version when saved without new features.
+Independent content needs v4, custom line spacing v5, inline styles v6, and layout
+policies v7; older builds reject unsupported versions. Objects without a
+`content_box` keep their original fitting behaviour. Their first content move,
+resize or rotation fixes the current content size and requires v4; previously
+clipped content may reappear on that first edit. **Convert to free layout** preserves the exact dimensions of
 existing millimeter frames and resolves their positions without rounding
 through preview pixels. Legacy natural dimensions are frozen into physical
 frames at the selected preview DPI.
@@ -332,8 +346,8 @@ text inherits the insertion style.
 **Default font (label)** supplies the font for text without an inline override.
 **Auto font size** scales the whole block while preserving the size ratios;
 turn it off to use exact point sizes. Mouse resizing of a fixed-size Object
-scales all its inline point sizes together. Slot editing retains its spacing
-behavior. Legacy text can use **Convert to free layout** to enable inline styles.
+scales all its inline point sizes together. Fixed layout allocations retain
+their spacing when content rotates. Legacy text can use **Convert to free layout** to enable inline styles.
 
 Styled content is shared by GUI, templates and CLI rendering. Template matching
 uses the complete text even when a placeholder crosses style boundaries; its
@@ -356,7 +370,8 @@ font_size = 12.0
 bold = true
 ```
 
-Only styled content needs v6; plain text keeps the original rendering path.
+Inline styles need v6; explicit layout policies additionally require v7.
+Documents without either feature retain the original rendering path.
 
 ### Optional print-position calibration
 
@@ -386,8 +401,8 @@ exports, copies and CSV rows use the same correction at their output DPI.
 Text in a layout may contain `{{name}}` placeholders. Fill them through the CLI
 per print, or drive a batch from a CSV file. The GUI edits and saves placeholders
 but does not have a variable-value form; its preview shows the literal tokens.
-CLI substitution changes only text content, preserving slots, independent
-object dimensions, offsets, and rotation.
+CLI substitution retains fixed allocations and content transforms.
+Content-sized v7 allocations remeasure the replacement text and reflow their sequence.
 
 By default, USB CSV batches print as one continuous strip, including all
 `--copies`, with final feed/cut only after the last row. `--chain` skips that final step. Printers

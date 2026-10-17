@@ -64,6 +64,14 @@ impl PtouchApp {
     pub fn update_preview(&mut self, ctx: &egui::Context) {
         self.state.needs_rerender = false;
 
+        let mut resolved = self.state.document();
+        if let Err(error) = ptouch_render::object_layout::resolve(&mut resolved, &mut self.renderer)
+        {
+            self.state.status_message = format!("Render error: {error}");
+        } else {
+            self.state.elements = resolved.elements;
+        }
+
         if self.state.elements.is_empty() {
             self.state.preview_bitmap = None;
             self.state.preview_texture = None;
@@ -215,6 +223,75 @@ impl PtouchApp {
 impl PtouchApp {
     fn show_editor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("document_history"), true));
+        if !self.state.history.initialized() {
+            let doc = self.state.document();
+            self.state.history.observe(
+                doc,
+                self.state.selected_element,
+                false,
+                false,
+                ctx.input(|i| i.time),
+            );
+        }
+        let revision = self.state.edit_revision;
+        let rich_id = egui::Id::new((
+            "inline_editor",
+            self.state.editor_generation,
+            self.state.selected_element,
+        ));
+        let mut replayed = false;
+        let rich_focused = ctx.memory(|m| m.has_focus(rich_id));
+        if (!ctx.text_edit_focused() || rich_focused)
+            && !crate::rich_text_editor::is_composing(&ctx, rich_id)
+            && !ctx.input(|i| i.pointer.primary_down())
+        {
+            for (shortcut, redo) in [
+                (
+                    egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::Z,
+                    ),
+                    true,
+                ),
+                (
+                    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z),
+                    false,
+                ),
+                (
+                    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y),
+                    true,
+                ),
+            ] {
+                if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                    if !rich_focused
+                        || !crate::rich_text_editor::pending_history(
+                            &ctx,
+                            rich_id,
+                            redo,
+                            self.state.history.last_edit_at(),
+                        )
+                    {
+                        let prior = egui::text_edit::TextEditState::load(&ctx, rich_id);
+                        self.state.history_step(redo);
+                        if rich_focused {
+                            let next_id = egui::Id::new((
+                                "inline_editor",
+                                self.state.editor_generation,
+                                self.state.selected_element,
+                            ));
+                            if let Some(mut prior) = prior {
+                                prior.clear_undoer();
+                                prior.store(&ctx, next_id);
+                            }
+                            ctx.memory_mut(|m| m.request_focus(next_id));
+                        }
+                    }
+                    replayed = true;
+                    break;
+                }
+            }
+        }
         self.drain_printer_responses();
 
         // Top toolbar
@@ -256,7 +333,41 @@ impl PtouchApp {
             self.update_preview(&ctx);
         }
         if let Some(action) = toolbar_action {
-            panels::toolbar::execute_action(&mut self.state, action);
+            let history_action = matches!(
+                action,
+                panels::toolbar::ToolbarAction::Undo | panels::toolbar::ToolbarAction::Redo
+            );
+            if history_action && self.state.edit_revision != revision {
+                let doc = self.state.document();
+                self.state.history.observe(
+                    doc,
+                    self.state.selected_element,
+                    false,
+                    false,
+                    ctx.input(|i| i.time),
+                );
+            }
+            replayed |= matches!(
+                action,
+                panels::toolbar::ToolbarAction::Undo | panels::toolbar::ToolbarAction::Redo
+            );
+            let pending = history_action
+                && rich_focused
+                && crate::rich_text_editor::pending_history(
+                    &ctx,
+                    rich_id,
+                    matches!(action, panels::toolbar::ToolbarAction::Redo),
+                    self.state.history.last_edit_at(),
+                );
+            if !pending {
+                panels::toolbar::execute_action(&mut self.state, action);
+            }
+            if matches!(action, panels::toolbar::ToolbarAction::Open)
+                && self.state.edit_revision != revision
+            {
+                self.state.history = Default::default();
+                replayed = true;
+            }
         }
 
         // Numeric edits and pointer gestures can arrive in the same frame.
@@ -272,6 +383,27 @@ impl PtouchApp {
         // Re-render preview if dirty
         if self.state.needs_rerender {
             self.update_preview(&ctx);
+        }
+
+        if !replayed
+            && (self.state.edit_revision != revision || self.state.history.active_gesture())
+        {
+            let doc = self.state.document();
+            let (down, typing, time) = ctx.input(|i| {
+                (
+                    i.pointer.primary_down(),
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Text(_) | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                        )
+                    }),
+                    i.time,
+                )
+            });
+            self.state
+                .history
+                .observe(doc, self.state.selected_element, down, typing, time);
         }
 
         // Exit only after multiple frames exercised the actual window renderer.
@@ -516,14 +648,14 @@ mod tests {
                     .iter()
                     .filter_map(|s| {
                         if let egui::Shape::Text(t) = &s.shape
-                            && t.galley.job.text == "Slot"
+                            && t.galley.job.text.starts_with("2. ")
                         {
                             Some(t.pos + t.galley.size() / 2.0)
                         } else {
                             None
                         }
                     })
-                    .nth(1)
+                    .next()
                     .unwrap()
             };
             frame(click(input));

@@ -30,13 +30,7 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading(
-        match state.selected_canvas_target().map(|target| target.edit) {
-            Some(CanvasEditTarget::Content) => "Object properties",
-            Some(CanvasEditTarget::Slot) => "Slot properties",
-            None => "Properties",
-        },
-    );
+    ui.heading("Object");
     ui.add_space(4.0);
 
     let selected = match state.selected_element {
@@ -112,6 +106,39 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if changed {
+        if let (Some(before), Some(candidate)) = (
+            state.elements[selected].as_object(),
+            element.as_object_mut(),
+        ) {
+            let geometric = candidate.content_box != before.content_box
+                || candidate.frame != before.frame
+                || candidate.layout != before.layout
+                || candidate.rotation != before.rotation
+                || candidate.flip_h != before.flip_h
+                || candidate.flip_v != before.flip_v;
+            let became_free = candidate
+                .layout
+                .as_ref()
+                .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Free)
+                && before
+                    .layout
+                    .as_ref()
+                    .is_none_or(|p| p.placement != ptouch_render::object_layout::Placement::Free);
+            if geometric && !became_free {
+                match state.constrain_transform(selected, before, candidate) {
+                    Err(message) => {
+                        state.status_message = message.into();
+                        return;
+                    }
+                    Ok(clamped) => state.transform_feedback(
+                        clamped,
+                        candidate.layout.as_ref().is_some_and(|p| {
+                            p.placement == ptouch_render::object_layout::Placement::Free
+                        }),
+                    ),
+                }
+            }
+        }
         if element
             .as_object()
             .is_some_and(|object| object.content_box.is_some())
@@ -530,6 +557,142 @@ fn set_object_rotation(object: &mut LabelObject, rotation: f32, resolved: &Conte
     true
 }
 
+fn show_layout_properties(
+    ui: &mut egui::Ui,
+    object: &mut LabelObject,
+    resolved: &ContentBox,
+    state: &mut AppState,
+) -> bool {
+    use ptouch_render::object_layout::{LayoutOptions, Placement, WidthSizing};
+    let mut changed = false;
+    let free = object
+        .layout
+        .as_ref()
+        .is_some_and(|p| p.placement == Placement::Free);
+    let legacy = object.layout.is_none();
+    if legacy {
+        ui.small("Existing layout preserved. Choose positioning to use the new layout rules.");
+    }
+    ui.horizontal(|ui| {
+        if ui.selectable_label(free, "Free positioning").clicked() && !free {
+            let original = object.clone();
+            if let Some(index) = state.selected_element
+                && let Some((x, _, _, _)) = state.element_rect_mm(index)
+            {
+                object.frame.x_mm = x;
+            }
+            object.frame.position = PositionMode::Absolute;
+            object.content_box.get_or_insert_with(|| resolved.clone());
+            object.layout = Some(LayoutOptions::default());
+            let index = state.selected_element.unwrap();
+            let mut before = original.clone();
+            before.frame.x_mm = state
+                .element_rect_mm(index)
+                .map_or(before.frame.x_mm, |r| r.0);
+            match state.constrain_transform(index, &before, object) {
+                Ok(_) => changed = true,
+                Err(message) => {
+                    *object = original;
+                    state.status_message = message.into();
+                }
+            }
+        }
+        if ui
+            .selectable_label(!free && !legacy, "In sequence")
+            .clicked()
+            && (free || legacy)
+        {
+            let index = state.selected_element.unwrap();
+            let height = state.printable_height_mm();
+            object.content_box.get_or_insert_with(|| resolved.clone());
+            object.layout.get_or_insert(LayoutOptions {
+                placement: Placement::Flow,
+                width: WidthSizing::Fixed,
+                constrain: false,
+                padding_mm: 0.0,
+            });
+            AppState::use_flow_allocation(object, height);
+            object.layout.as_mut().unwrap().placement = Placement::Flow;
+            object.layout.as_mut().unwrap().width = WidthSizing::Fixed;
+            if index > 0 {
+                let previous_right = state
+                    .element_rect_mm(index - 1)
+                    .map_or(0.0, |(x, _, w, _)| x + w);
+                object.frame.position = PositionMode::Relative;
+                object.frame.gap_mm = (object.frame.x_mm - previous_right).max(0.0);
+                // Promoting a free predecessor to a flow anchor freezes its
+                // allocation. Its content and visible location are unchanged.
+                if let Some(previous) = state.elements[index - 1].as_object_mut() {
+                    AppState::use_flow_allocation(previous, height);
+                }
+            }
+            changed = true;
+        }
+    });
+    let free = object
+        .layout
+        .as_ref()
+        .is_some_and(|p| p.placement == Placement::Free);
+    if free {
+        ui.small("Position and size follow the object. Use its blue handles to edit it.");
+        ui.label(format!(
+            "X {:.2} · Y {:.2} mm",
+            object.frame.x_mm, object.frame.y_mm
+        ));
+        return changed;
+    }
+    let current = object
+        .layout
+        .as_ref()
+        .map_or(WidthSizing::Fixed, |p| p.width);
+    ui.horizontal(|ui| {
+        ui.label("Width:");
+        for (sizing, label) in [
+            (WidthSizing::Fixed, "Fixed"),
+            (WidthSizing::Content, "Auto width"),
+        ] {
+            if ui.selectable_label(current == sizing, label).clicked() && current != sizing {
+                object.content_box.get_or_insert_with(|| resolved.clone());
+                object
+                    .layout
+                    .get_or_insert(LayoutOptions {
+                        placement: Placement::Flow,
+                        width: sizing,
+                        constrain: false,
+                        padding_mm: 0.5,
+                    })
+                    .width = sizing;
+                changed = true;
+            }
+        }
+    });
+    if let Some(policy) = &mut object.layout {
+        changed |= ui
+            .checkbox(&mut policy.constrain, "Keep content inside allocation")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Inner margin:");
+            changed |= ui
+                .add(
+                    crate::widgets::decimal_drag(&mut policy.padding_mm)
+                        .range(0.0..=1000.0)
+                        .speed(0.1)
+                        .suffix(" mm"),
+                )
+                .changed();
+        });
+    }
+    let old_width = object.frame.width_mm;
+    let edited = show_text_box(ui, &mut object.frame, state, false);
+    if edited
+        && object.frame.width_mm != old_width
+        && let Some(policy) = &mut object.layout
+    {
+        policy.width = WidthSizing::Fixed;
+    }
+    changed | edited
+}
+
 fn show_content_box(
     ui: &mut egui::Ui,
     object: &mut LabelObject,
@@ -537,8 +700,16 @@ fn show_content_box(
     state: &AppState,
 ) -> bool {
     let mut changed = false;
+    let free = object
+        .layout
+        .as_ref()
+        .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Free);
     let mut auto_fit = object.content_box.is_none();
-    if ui.checkbox(&mut auto_fit, "Auto fit slot").changed() {
+    if object.layout.is_none()
+        && ui
+            .checkbox(&mut auto_fit, "Follow allocation size")
+            .changed()
+    {
         object.content_box = (!auto_fit).then(|| resolved.clone());
         changed = true;
     }
@@ -546,7 +717,58 @@ fn show_content_box(
         .content_box
         .clone()
         .unwrap_or_else(|| resolved.clone());
+    if free && matches!(object.content, ObjectContent::Text { .. }) {
+        let policy = object.layout.as_mut().unwrap();
+        ui.horizontal(|ui| {
+            ui.label("Size:");
+            for (value, label) in [
+                (
+                    ptouch_render::object_layout::WidthSizing::Content,
+                    "Auto width",
+                ),
+                (ptouch_render::object_layout::WidthSizing::Fixed, "Manual"),
+            ] {
+                changed |= ui
+                    .selectable_value(&mut policy.width, value, label)
+                    .changed();
+            }
+        });
+    }
     let minimum = 25.4 / f64::from(state.target_dpi());
+    let old = dimensions.clone();
+    if free {
+        ui.horizontal(|ui| {
+            for (label, position, offset, flipped) in [
+                (
+                    "X",
+                    object.frame.x_mm,
+                    &mut dimensions.offset_x_mm,
+                    object.flip_h,
+                ),
+                (
+                    "Y",
+                    object.frame.y_mm,
+                    &mut dimensions.offset_y_mm,
+                    object.flip_v,
+                ),
+            ] {
+                ui.label(label);
+                let mut value = position;
+                if ui
+                    .add(
+                        crate::widgets::decimal_drag(&mut value)
+                            .range(0.0..=10_000.0)
+                            .speed(0.1)
+                            .suffix(" mm"),
+                    )
+                    .changed()
+                {
+                    *offset += (value - position) * if flipped { -1.0 } else { 1.0 };
+                    changed = true;
+                }
+            }
+        });
+    }
     ui.add_enabled_ui(!auto_fit, |ui| {
         egui::Grid::new("object_content_dimensions")
             .num_columns(2)
@@ -557,6 +779,9 @@ fn show_content_box(
                     ("Offset X", &mut dimensions.offset_x_mm, -10_000.0),
                     ("Offset Y", &mut dimensions.offset_y_mm, -10_000.0),
                 ] {
+                    if free && label.starts_with("Offset") {
+                        continue;
+                    }
                     ui.label(label);
                     changed |= ui
                         .add(
@@ -572,16 +797,75 @@ fn show_content_box(
             });
     });
     if changed && !auto_fit {
+        if object
+            .layout
+            .as_ref()
+            .is_some_and(|p| p.width == ptouch_render::object_layout::WidthSizing::Content)
+            && dimensions.width_mm != old.width_mm
+            && dimensions.height_mm == old.height_mm
+        {
+            dimensions.height_mm *= dimensions.width_mm / old.width_mm;
+        }
+        if free && (dimensions.width_mm != old.width_mm || dimensions.height_mm != old.height_mm) {
+            object.layout.as_mut().unwrap().width =
+                ptouch_render::object_layout::WidthSizing::Fixed;
+        }
         object.content_box = Some(dimensions);
     }
-    ui.small(
-        "Offsets move the object's center from the slot center. Rotation keeps this object size.",
-    );
-    if auto_fit {
-        ui.small("Auto fit follows the slot. Rotating or dragging fixes the current object size.");
-        ui.small("Previously clipped content may reappear when detached from the slot.");
+    ui.small(if free {
+        "Move, resize and rotate this object within the printable area."
     } else {
-        ui.small("Object content may extend beyond its slot. The printable tape edge clips it.");
+        "Content transforms keep the layout allocation fixed."
+    });
+    if ui
+        .button("Fit inside")
+        .on_hover_text("Fit proportionally to the available area; text uses automatic font size")
+        .clicked()
+    {
+        let c = object.content_box.get_or_insert_with(|| resolved.clone());
+        let (sin, cos) = f64::from(object.rotation).to_radians().sin_cos();
+        let w = c.width_mm * cos.abs() + c.height_mm * sin.abs();
+        let h = c.width_mm * sin.abs() + c.height_mm * cos.abs();
+        let pad = object.layout.as_ref().map_or(0.0, |p| p.padding_mm) * 2.0;
+        let available_w = if free {
+            10_000.0
+        } else {
+            object.frame.width_mm - pad
+        };
+        let available_h = if free {
+            state.printable_height_mm() - pad
+        } else {
+            object.frame.height_mm - pad
+        };
+        let ratio = (available_w / w).min(available_h / h).clamp(0.01, 1.0);
+        c.width_mm *= ratio;
+        c.height_mm *= ratio;
+        c.offset_x_mm = 0.0;
+        c.offset_y_mm = 0.0;
+        if let ObjectContent::Text {
+            content,
+            font_size,
+            styles,
+            ..
+        } = &mut object.content
+            && let Some(size) = *font_size
+        {
+            if !styles.is_empty() {
+                *styles = ptouch_render::styled_text::style_regions(content, styles)
+                    .into_iter()
+                    .map(|(range, mut style)| {
+                        style.font_size = Some(style.font_size.unwrap_or(size) * ratio as f32);
+                        ptouch_render::styled_text::StyleSpan {
+                            start: range.start,
+                            end: range.end,
+                            style,
+                        }
+                    })
+                    .collect();
+            }
+            *font_size = None;
+        }
+        changed = true;
     }
     changed
 }
@@ -603,6 +887,21 @@ fn show_object_properties(
             offset_x_mm: 0.0,
             offset_y_mm: 0.0,
         });
+    let layout = state.canvas_edit_target == CanvasEditTarget::Slot;
+    if ui
+        .button(if layout {
+            "Done adjusting layout"
+        } else {
+            "Adjust layout…"
+        })
+        .clicked()
+    {
+        state.canvas_edit_target = if layout {
+            CanvasEditTarget::Content
+        } else {
+            CanvasEditTarget::Slot
+        };
+    }
     let mut changed = match state.canvas_edit_target {
         CanvasEditTarget::Content => {
             let mut changed = show_content_box(ui, object, &resolved, state);
@@ -610,12 +909,15 @@ fn show_object_properties(
             changed
         }
         CanvasEditTarget::Slot => {
-            ui.label("Slot (template position and spacing)");
-            let changed = show_text_box(ui, &mut object.frame, state, false);
-            ui.small("Slot dimensions control spacing. Resizing a slot does not scale a manually sized object.");
+            ui.label("Layout — position and spacing");
+            let changed = show_layout_properties(ui, object, &resolved, state);
+            ui.small("Allocation width and gap affect following objects. Rotation changes only this object's content.");
             changed
         }
     };
+    if state.canvas_edit_target == CanvasEditTarget::Slot {
+        return changed;
+    }
     ui.separator();
     match &mut object.content {
         ObjectContent::Text {
@@ -640,7 +942,9 @@ fn show_object_properties(
                 font_size.unwrap_or(12.0),
                 &state.available_fonts,
             );
-            ui.small("Template variables such as {{port}} keep the slot in place.");
+            if content.contains("{{") {
+                ui.small("Fixed allocations keep template positions unchanged.");
+            }
             let old_base_size = *font_size;
             changed |= show_font_properties(ui, font_size, align, true, state);
             if let Some(old) = old_base_size
@@ -717,7 +1021,7 @@ fn show_object_properties(
             ui.small("A printed guide only; it does not trigger the cutter.");
         }
         ObjectContent::Padding => {
-            ui.label("Blank slot (converted padding)");
+            ui.label("Blank allocation (converted padding)");
             ui.small("Keeps its extent and can anchor relative objects. Use positions or gaps for new spacing.");
         }
     }

@@ -29,6 +29,10 @@ struct ContentDrag {
 
 #[derive(Clone)]
 struct CanvasDrag {
+    before: Option<ptouch_render::document::LabelDocument>,
+    reorder: Option<ReorderDrag>,
+    gap: bool,
+    scroll_offset: egui::Vec2,
     element: usize,
     start: egui::Pos2,
     frame: TextBox,
@@ -44,6 +48,13 @@ struct CanvasDrag {
     font_styles: Vec<ptouch_render::styled_text::StyleSpan>,
 }
 
+#[derive(Clone)]
+struct ReorderDrag {
+    start: usize,
+    centers_mm: Vec<f64>,
+    current: usize,
+}
+
 /// Render and edit at the original raster scale, independent of GPU downsampling.
 pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let drag_id = ui.id().with("object_drag");
@@ -52,6 +63,22 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let menu_id = ui.id().with("canvas_menu_target");
     let previous_hover = state.canvas_hover_target;
     let previous_drag = state.canvas_drag_target;
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let active = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<CanvasDrag>(drag_id));
+        if let Some(active) = active
+            && let Some(before) = active.before
+        {
+            state.restore_document(before);
+            state.selected_element = Some(active.element);
+        }
+        ui.ctx().data_mut(|data| {
+            data.remove::<CanvasDrag>(drag_id);
+            data.remove::<CanvasPress>(press_id);
+        });
+        state.canvas_drag_target = None;
+    }
     state.canvas_hover_target = None;
     let mut snap = ui
         .ctx()
@@ -76,6 +103,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         ui.checkbox(&mut snap, "Snap 0.1 mm");
     });
     ui.ctx().data_mut(|data| data.insert_temp(snap_id, snap));
+    ui.small(format!("{} mm tape · {:.2} mm printable · edge placement schematic",
+        if state.tape_width_mm == 4 { 3.5 } else { f64::from(state.tape_width_mm) },
+        state.printable_height_mm()))
+        .on_hover_text("Y measures the full tape. Dark bands cannot be printed. Exact top/bottom head offsets are not known; properties use the printable area's origin.");
     let can_edit = state.is_free_layout();
     let can_drag = can_edit && !state.overall_flip_h;
     if let Some(diagnostic) = state.preview_diagnostics.first() {
@@ -89,6 +120,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         };
         ui.colored_label(ui.visuals().warn_fg_color, message)
             .on_hover_text(state.preview_diagnostics.join("\n"));
+    } else {
+        // Reserve the diagnostic row so clipping feedback cannot move the
+        // document origin under a held pointer.
+        ui.label(" ");
     }
     ui.separator();
 
@@ -114,7 +149,15 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         );
         return;
     };
-    let original_size = egui::vec2(bitmap.width() as f32, bitmap.height() as f32);
+    let printable_size = egui::vec2(bitmap.width() as f32, bitmap.height() as f32);
+    let physical_mm = if state.tape_width_mm == 4 {
+        3.5
+    } else {
+        f32::from(state.tape_width_mm)
+    };
+    let physical_height =
+        (physical_mm * f32::from(state.target_dpi()) / 25.4).max(printable_size.y);
+    let original_size = egui::vec2(printable_size.x, physical_height);
     // Selecting an item can widen the properties panel before drag detection.
     // Keep the press geometry stable until release, including that first frame.
     if state.zoom_fit
@@ -158,9 +201,15 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(200));
             // A stable left/top origin prevents auto-length changes from moving
             // the canvas under the pointer during a drag.
-            let label_rect =
+            let tape_rect =
                 egui::Rect::from_min_size(rect.min + egui::vec2(PADDING, PADDING), display_size);
-            ruler_label = Some(label_rect);
+            let margin = (physical_height - printable_size.y) * state.zoom / 2.0;
+            let label_rect = egui::Rect::from_min_size(
+                tape_rect.min + egui::vec2(0.0, margin),
+                printable_size * state.zoom,
+            );
+            ruler_label = Some((tape_rect, label_rect));
+            painter.rect_filled(tape_rect, 0.0, egui::Color32::from_gray(110));
             painter.rect_filled(label_rect, 0.0, egui::Color32::WHITE);
             painter.image(
                 texture_id,
@@ -193,11 +242,24 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             };
             // Resolve once on press, before the drag threshold. Crossing a
             // different target later must never change the meaning of a gesture.
-            if (response.is_pointer_button_down_on() || response.clicked())
-                && ui.input(|i| i.pointer.primary_pressed())
-                && let Some(start) = ui
-                    .input(|i| i.pointer.press_origin())
-                    .or_else(|| response.interact_pointer_pos())
+            let raw_press = ui.input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    return None;
+                }
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+            });
+            if let Some(start) = raw_press
+                && response.rect.contains(start)
+                && painter.clip_rect().contains(start)
+                && ui.ctx().layer_id_at(start) == Some(ui.layer_id())
             {
                 let press_hit = hit(start);
                 let drag = press_hit.filter(|_| can_drag).and_then(|hit| {
@@ -213,6 +275,26 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         None
                     };
                     Some(CanvasDrag {
+                        before: Some(state.document()),
+                        gap: hit.action == CanvasAction::Gap,
+                        scroll_offset: viewport_rect.min - rect.min,
+                        reorder: if !content_edit && hit.action == CanvasAction::Move {
+                            state
+                                .flow_chain(index)
+                                .filter(|chain| chain.start() != chain.end())
+                                .map(|chain| ReorderDrag {
+                                    start: *chain.start(),
+                                    centers_mm: chain
+                                        .filter(|i| *i != index)
+                                        .filter_map(|i| {
+                                            state.element_rect_mm(i).map(|(x, _, w, _)| x + w / 2.0)
+                                        })
+                                        .collect(),
+                                    current: index,
+                                })
+                        } else {
+                            None
+                        },
                         element: index,
                         start,
                         frame: object.frame.clone(),
@@ -283,18 +365,22 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     .data_mut(|data| data.get_temp::<Option<CanvasTarget>>(menu_id))
                     .flatten();
                 if let Some(target) = target {
-                    if ui.button("Select object").clicked() {
+                    if ui.button("Edit content").clicked() {
                         state.select_canvas_target(Some(CanvasTarget {
                             edit: CanvasEditTarget::Content,
                             ..target
                         }));
                         ui.close();
                     }
-                    let has_slot = geometry
-                        .iter()
-                        .any(|g| g.element == target.element && g.has_slot);
+                    let has_slot = state
+                        .elements
+                        .get(target.element)
+                        .is_some_and(|e| e.as_object().is_some())
+                        || geometry
+                            .iter()
+                            .any(|g| g.element == target.element && g.has_slot);
                     if ui
-                        .add_enabled(has_slot, egui::Button::new("Select slot"))
+                        .add_enabled(has_slot, egui::Button::new("Adjust layout…"))
                         .clicked()
                     {
                         state.select_canvas_target(Some(CanvasTarget {
@@ -307,8 +393,31 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.weak("No object here");
                 }
             });
+            let raw_release = ui.input(|i| {
+                i.events.iter().rev().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+            });
+            // egui may see movement and release in the same frame and never
+            // report drag_started, even when the press was an earlier frame.
+            // Finish from that frozen press; do not restart an active rotation.
+            let fast_release = raw_release.is_some_and(|end| {
+                ui.ctx().data_mut(|data| {
+                    data.get_temp::<CanvasDrag>(drag_id).is_none()
+                        && data
+                            .get_temp::<CanvasPress>(press_id)
+                            .and_then(|p| p.drag)
+                            .is_some_and(|d| d.start.distance(end) > 4.0)
+                })
+            });
             if can_drag
-                && response.drag_started()
+                && (response.drag_started() || fast_release)
                 && let Some(press) = ui
                     .ctx()
                     .data_mut(|data| data.get_temp::<CanvasPress>(press_id))
@@ -350,21 +459,83 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         resize_cursor(quad[2] - quad[0])
                     }
                     CanvasAction::Move => egui::CursorIcon::Move,
+                    CanvasAction::Gap => egui::CursorIcon::ResizeHorizontal,
                 };
                 response.clone().on_hover_cursor(cursor);
             }
             draw_targets(painter, state, &geometry, can_drag);
             if can_edit
-                && (response.dragged() || response.drag_stopped())
-                && let Some(pos) = response.interact_pointer_pos()
+                && (response.dragged()
+                    || response.drag_stopped()
+                    || fast_release
+                    || raw_release.is_some())
+                && let Some(pos) = response.interact_pointer_pos().or(raw_release)
                 && let Some(mut drag) = ui
                     .ctx()
                     .data_mut(|data| data.get_temp::<CanvasDrag>(drag_id))
             {
+                let scroll_offset = viewport_rect.min - rect.min;
+                if drag.rotation.is_none() {
+                    drag.start -= scroll_offset - drag.scroll_offset;
+                    let visible = ui.clip_rect();
+                    if ui.input(|i| i.pointer.primary_down())
+                        && (pos.x < visible.left() + 24.0
+                            || pos.x > visible.right() - 24.0
+                            || pos.y < visible.top() + 24.0
+                            || pos.y > visible.bottom() - 24.0)
+                    {
+                        ui.scroll_to_rect(
+                            egui::Rect::from_center_size(pos, egui::vec2(64.0, 64.0)),
+                            None,
+                        );
+                        ui.ctx().request_repaint();
+                    }
+                }
+                drag.scroll_offset = scroll_offset;
                 drag.pointer_moved |= pos != drag.start;
                 // A long press can cross egui's drag threshold without moving.
                 // It must not pin legacy content or quantize saved coordinates.
-                if drag.pointer_moved {
+                if drag.pointer_moved
+                    && let Some(reorder) = drag.reorder.as_mut()
+                {
+                    let x_mm = f64::from(pos.x - label_rect.left()) / drag.pixels_per_mm;
+                    let to =
+                        reorder.start + reorder.centers_mm.iter().filter(|x| x_mm > **x).count();
+                    if to != reorder.current
+                        && let Some(before) = &drag.before
+                    {
+                        state.elements = before.elements.clone();
+                        state.selected_element = Some(drag.element);
+                        if to != drag.element {
+                            state.reorder_object(drag.element, to);
+                        } else {
+                            state.mark_dirty();
+                        }
+                        state.selected_element = Some(to);
+                        reorder.current = to;
+                        let target = CanvasTarget {
+                            element: to,
+                            edit: CanvasEditTarget::Slot,
+                        };
+                        state.canvas_drag_target = Some(target);
+                        ui.ctx().data_mut(|data| {
+                            if let Some(mut press) = data.get_temp::<CanvasPress>(press_id) {
+                                press.target = Some(target);
+                                data.insert_temp(press_id, press);
+                            }
+                        });
+                    }
+                    if let Some(g) = geometry.iter().find(|g| g.element == reorder.current) {
+                        let x = g.slot.left();
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, g.slot.top() - 8.0),
+                                egui::pos2(x, g.slot.bottom() + 8.0),
+                            ],
+                            egui::Stroke::new(3.0, egui::Color32::from_rgb(205, 115, 0)),
+                        );
+                    }
+                } else if drag.pointer_moved {
                     let rotation = if let Some(rotation) = drag.rotation.as_mut() {
                         let center = geometry
                             .iter()
@@ -372,7 +543,37 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             .and_then(|g| g.object)
                             .map(quad_center);
                         center.and_then(|center| {
+                            let mut angle = None;
+                            let events = ui.input(|i| i.events.clone());
+                            let first = if raw_press.is_some() {
+                                events
+                                    .iter()
+                                    .rposition(|e| {
+                                        matches!(
+                                            e,
+                                            egui::Event::PointerButton {
+                                                button: egui::PointerButton::Primary,
+                                                pressed: true,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                    .map_or(0, |i| i + 1)
+                            } else {
+                                0
+                            };
+                            for event in &events[first..] {
+                                if let egui::Event::PointerMoved(point) = event {
+                                    angle = dragged_rotation(
+                                        rotation,
+                                        *point,
+                                        center,
+                                        ui.input(|i| i.modifiers.shift),
+                                    );
+                                }
+                            }
                             dragged_rotation(rotation, pos, center, ui.input(|i| i.modifiers.shift))
+                                .or(angle)
                         })
                     } else {
                         None
@@ -391,13 +592,23 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         None
                     };
                     let frame = if drag.content.is_none() && drag.rotation.is_none() && can_drag {
-                        Some(dragged_frame(
+                        let mut frame = dragged_frame(
                             &drag,
                             pos - drag.start,
                             f64::from(state.tape_width_px) * 25.4 / f64::from(dpi),
                             snap,
                             25.4 / f64::from(dpi),
-                        ))
+                        );
+                        if drag.gap {
+                            frame = drag.frame.clone();
+                            frame.gap_mm = (drag.frame.gap_mm
+                                + f64::from(pos.x - drag.start.x) / drag.pixels_per_mm)
+                                .max(0.0);
+                            if snap {
+                                frame.gap_mm = (frame.gap_mm * 10.0).round() / 10.0;
+                            }
+                        }
+                        Some(frame)
                     } else {
                         None
                     };
@@ -408,15 +619,20 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             .and_then(|e| e.as_object())
                             .is_some_and(|o| o.rotation != *angle)
                     });
-                    if rotation.is_some() {
-                        state.pin_content_box(drag.element);
-                    }
-                    if let Some(object) = state
+                    if let Some(before) = state
                         .elements
-                        .get_mut(drag.element)
-                        .and_then(|e| e.as_object_mut())
+                        .get(drag.element)
+                        .and_then(|e| e.as_object())
+                        .cloned()
                     {
+                        let mut object = before.clone();
                         if let Some(frame) = frame {
+                            if drag.resize
+                                && frame.width_mm != drag.frame.width_mm
+                                && let Some(policy) = &mut object.layout
+                            {
+                                policy.width = ptouch_render::object_layout::WidthSizing::Fixed;
+                            }
                             if drag.frame.position == PositionMode::Relative
                                 && frame.position == PositionMode::Absolute
                             {
@@ -425,8 +641,15 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                                         .into();
                             }
                             object.frame = frame;
-                            state.mark_dirty();
                         } else if let Some(content) = new_content {
+                            if drag.resize
+                                && object.layout.as_ref().is_some_and(|p| {
+                                    p.placement == ptouch_render::object_layout::Placement::Free
+                                })
+                            {
+                                object.layout.as_mut().unwrap().width =
+                                    ptouch_render::object_layout::WidthSizing::Fixed;
+                            }
                             let mut allowed = true;
                             if drag.resize
                                 && let Some(size) = drag.font_size
@@ -452,14 +675,39 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             }
                             if allowed {
                                 object.content_box = Some(content);
-                                state.mark_dirty();
                             } else {
                                 state.status_message =
                                     "Resize exceeds the inline font size limit".into();
                             }
                         } else if let Some(rotation) = rotation {
+                            if object.content_box.is_none() {
+                                object.content_box =
+                                    drag.content.as_ref().map(|c| c.original.clone());
+                            }
                             object.rotation = rotation;
-                            state.mark_dirty();
+                        }
+                        let original = drag
+                            .before
+                            .as_ref()
+                            .and_then(|d| d.elements.get(drag.element))
+                            .and_then(|e| e.as_object())
+                            .unwrap_or(&before);
+                        match state.constrain_transform(drag.element, original, &mut object) {
+                            Err(message) => state.status_message = message.into(),
+                            Ok(clamped) => {
+                                state.transform_feedback(
+                                    clamped,
+                                    object.layout.as_ref().is_some_and(|p| {
+                                        p.placement == ptouch_render::object_layout::Placement::Free
+                                    }),
+                                );
+                                if object != before {
+                                    state.elements[drag.element] =
+                                        crate::state::LabelElement::Object(object);
+                                    state.document_version = state.document_version.max(4);
+                                    state.mark_dirty();
+                                }
+                            }
                         }
                     }
                 }
@@ -473,15 +721,31 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 state.canvas_drag_target = None;
             }
         });
-    if let Some(label) = ruler_label {
+    if let Some((tape, label)) = ruler_label {
         draw_rulers(
             ui.painter(),
             canvas_rect,
             scroll.inner_rect,
+            tape,
             label,
             dpi,
             state.zoom,
         );
+        // The scale and the tape share the same physical band boundaries.
+        let y_clip = egui::Rect::from_min_max(
+            egui::pos2(canvas_rect.left(), scroll.inner_rect.top()),
+            egui::pos2(scroll.inner_rect.left(), scroll.inner_rect.bottom()),
+        );
+        let band_painter = ui.painter().with_clip_rect(y_clip);
+        for y in [label.top(), label.bottom()] {
+            band_painter.line_segment(
+                [
+                    egui::pos2(scroll.inner_rect.left() - 10.0, y),
+                    egui::pos2(scroll.inner_rect.left(), y),
+                ],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(30, 110, 160)),
+            );
+        }
     }
     if previous_hover != state.canvas_hover_target || previous_drag != state.canvas_drag_target {
         ui.ctx().request_repaint();
@@ -503,6 +767,7 @@ enum CanvasAction {
     Move,
     Resize,
     Rotate,
+    Gap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,6 +781,7 @@ struct CanvasGeometry {
     slot: egui::Rect,
     object: Option<[egui::Pos2; 4]>,
     has_slot: bool,
+    relative: bool,
 }
 
 /// Independent objects have exact physical edit geometry. Raster bounds stay
@@ -582,6 +848,9 @@ fn editing_geometry(
         element: index,
         slot,
         object,
+        relative: element
+            .as_object()
+            .is_some_and(|o| o.frame.position == PositionMode::Relative),
         has_slot: matches!(
             element,
             crate::state::LabelElement::Object(_)
@@ -589,11 +858,15 @@ fn editing_geometry(
                     text_box: Some(_),
                     ..
                 }
-        ),
+        ) && !element
+            .as_object()
+            .and_then(|o| o.layout.as_ref())
+            .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Free),
     })
 }
 
 /// Omit only coincident edges, not merely nearby shapes at a low zoom.
+#[cfg(test)]
 fn same_edge(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2) -> bool {
     let close = |x: egui::Pos2, y: egui::Pos2| x.distance_sq(y) < 0.0001;
     close(a, c) && close(b, d) || close(a, d) && close(b, c)
@@ -615,9 +888,13 @@ fn resize_position(quad: [egui::Pos2; 4], target: CanvasTarget, flip_v: bool) ->
     }
 }
 
+fn gap_position(quad: [egui::Pos2; 4]) -> egui::Pos2 {
+    quad[0].lerp(quad[3], 0.5) - egui::vec2(14.0, 0.0)
+}
+
 fn canvas_hit(
     pos: egui::Pos2,
-    paper: egui::Rect,
+    _paper: egui::Rect,
     clip: egui::Rect,
     geometry: &[CanvasGeometry],
     selected: Option<CanvasTarget>,
@@ -635,6 +912,14 @@ fn canvas_hit(
             && rotation_handle(quad).distance(pos) <= ROTATE_RADIUS + 4.0
         {
             Some(CanvasAction::Rotate)
+        } else if target.edit == CanvasEditTarget::Slot
+            && geometry
+                .iter()
+                .any(|g| g.element == target.element && g.relative)
+            && egui::Rect::from_center_size(gap_position(quad), egui::vec2(12.0, 12.0))
+                .contains(pos)
+        {
+            Some(CanvasAction::Gap)
         } else if egui::Rect::from_center_size(
             resize_position(quad, target, flip_v),
             egui::vec2(12.0, 12.0),
@@ -647,6 +932,14 @@ fn canvas_hit(
         };
         if let Some(action) = action {
             return Some(CanvasHit { target, action });
+        }
+        // Layout editing is entered explicitly in properties. Its interior is
+        // then a layout drag surface, never an implicit second selection.
+        if target.edit == CanvasEditTarget::Slot && quad_contains(quad, pos) {
+            return Some(CanvasHit {
+                target,
+                action: CanvasAction::Move,
+            });
         }
         // The selected dashed border doubles as a move handle. It keeps
         // fully covered slots and lower overlapping objects mouse-accessible.
@@ -675,29 +968,7 @@ fn canvas_hit(
             action: CanvasAction::Move,
         });
     }
-    if !paper.contains(pos) {
-        return None;
-    }
-    // Prefer the slot containing this Y coordinate, then the nearest slot.
-    // Equal distances retain reverse composition order, including shared edges.
-    let mut nearest: Option<(&CanvasGeometry, f32)> = None;
-    for g in geometry
-        .iter()
-        .rev()
-        .filter(|g| g.has_slot && g.slot.x_range().contains(pos.x))
-    {
-        let distance = (g.slot.top() - pos.y).max(pos.y - g.slot.bottom()).max(0.0);
-        if nearest.is_none_or(|(_, old)| distance < old) {
-            nearest = Some((g, distance));
-        }
-    }
-    nearest.map(|(g, _)| CanvasHit {
-        target: CanvasTarget {
-            element: g.element,
-            edit: CanvasEditTarget::Slot,
-        },
-        action: CanvasAction::Move,
-    })
+    None
 }
 
 fn draw_targets(
@@ -709,6 +980,7 @@ fn draw_targets(
     let selected = state.selected_canvas_target();
     let hovered = state.canvas_hover_target;
     let blue = egui::Color32::from_rgb(0, 90, 190);
+    let orange = egui::Color32::from_rgb(205, 115, 0);
     for target in [selected, hovered.filter(|target| Some(*target) != selected)]
         .into_iter()
         .flatten()
@@ -719,43 +991,43 @@ fn draw_targets(
                 dashed_quad(
                     painter,
                     rect_quad(g.slot),
-                    egui::Stroke::new(1.0, blue.gamma_multiply(0.28)),
+                    egui::Stroke::new(1.0, orange.gamma_multiply(0.28)),
                 );
             }
         }
-        if let (Some(quad), Some(slot)) = (
-            target_quad(
-                geometry,
-                CanvasTarget {
-                    edit: CanvasEditTarget::Content,
-                    ..target
-                },
-            ),
-            target_quad(geometry, target),
+        if let Some(quad) = target_quad(
+            geometry,
+            CanvasTarget {
+                edit: CanvasEditTarget::Content,
+                ..target
+            },
         ) {
-            for edge in 0..4 {
-                let a = quad[edge];
-                let b = quad[(edge + 1) % 4];
-                if !(0..4).any(|i| same_edge(a, b, slot[i], slot[(i + 1) % 4])) {
-                    dashed_quad_edge(
-                        painter,
-                        a,
-                        b,
-                        egui::Stroke::new(1.0, blue.gamma_multiply(0.45)),
-                    );
-                }
-            }
+            dashed_quad(
+                painter,
+                quad,
+                egui::Stroke::new(1.0, blue.gamma_multiply(0.4)),
+            );
         }
     }
     if let Some(target) = hovered.filter(|t| Some(*t) != selected)
         && let Some(quad) = target_quad(geometry, target)
     {
-        dashed_quad(painter, quad, egui::Stroke::new(1.5, blue));
+        let color = if target.edit == CanvasEditTarget::Slot {
+            orange
+        } else {
+            blue
+        };
+        dashed_quad(painter, quad, egui::Stroke::new(1.5, color));
     }
     if let Some(target) = selected
         && let Some(quad) = target_quad(geometry, target)
     {
-        dashed_quad(painter, quad, egui::Stroke::new(2.0, blue));
+        let color = if target.edit == CanvasEditTarget::Slot {
+            orange
+        } else {
+            blue
+        };
+        dashed_quad(painter, quad, egui::Stroke::new(2.0, color));
         if can_drag {
             painter.rect_filled(
                 egui::Rect::from_center_size(
@@ -763,13 +1035,34 @@ fn draw_targets(
                     egui::vec2(10.0, 10.0),
                 ),
                 1.0,
-                blue,
+                color,
             );
             if target.edit == CanvasEditTarget::Content {
                 let center = rotation_handle(quad);
                 painter.line_segment([quad[1], center], egui::Stroke::new(1.5, blue));
                 painter.circle_filled(center, ROTATE_RADIUS, egui::Color32::WHITE);
                 painter.circle_stroke(center, ROTATE_RADIUS, egui::Stroke::new(2.0, blue));
+            } else if state.elements[target.element]
+                .as_object()
+                .is_some_and(|o| o.frame.position == PositionMode::Relative)
+            {
+                let center = gap_position(quad);
+                painter.line_segment(
+                    [quad[0].lerp(quad[3], 0.5), center],
+                    egui::Stroke::new(1.0, orange),
+                );
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center, egui::vec2(10.0, 8.0)),
+                    1.0,
+                    orange,
+                );
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "↔",
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::WHITE,
+                );
             }
         }
     }
@@ -800,12 +1093,6 @@ fn clipped_segment(a: egui::Pos2, b: egui::Pos2, clip: egui::Rect) -> Option<[eg
         }
     }
     Some([a + delta * start, a + delta * end])
-}
-
-fn dashed_quad_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: egui::Stroke) {
-    if let Some(line) = clipped_segment(a, b, painter.clip_rect().expand(stroke.width)) {
-        painter.extend(egui::Shape::dashed_line(&line, stroke, 6.0, 4.0));
-    }
 }
 
 fn dashed_quad(painter: &egui::Painter, quad: [egui::Pos2; 4], stroke: egui::Stroke) {
@@ -848,12 +1135,7 @@ fn dragged_frame(
         let left = quantize(drag.left_mm + dx).max(0.0);
         if frame.position == PositionMode::Relative {
             let gap = left - (drag.left_mm - drag.frame.gap_mm);
-            if gap >= 0.0 {
-                frame.gap_mm = gap;
-            } else {
-                frame.position = PositionMode::Absolute;
-                frame.x_mm = left;
-            }
+            frame.gap_mm = gap.max(0.0);
         } else {
             frame.x_mm = left;
         }
@@ -884,17 +1166,43 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
         && let Some(object) = state.elements[index].as_object()
     {
         if state.canvas_edit_target == CanvasEditTarget::Content {
+            let before = object.clone();
             let flip_h = object.flip_h ^ state.overall_flip_h;
             let flip_v = object.flip_v ^ state.overall_flip_v;
-            if let Some(mut content) = state.pin_content_box(index) {
+            let resolved = if before.content_box.is_none() {
+                state.pin_content_box(index)
+            } else {
+                state.resolved_content_box(index)
+            };
+            if let Some(mut content) = resolved {
                 content.offset_x_mm += f64::from(delta.x) * if flip_h { -1.0 } else { 1.0 };
                 content.offset_y_mm += f64::from(delta.y) * if flip_v { -1.0 } else { 1.0 };
-                state.elements[index].as_object_mut().unwrap().content_box = Some(content);
-                state.mark_dirty();
+                let mut candidate = before.clone();
+                candidate.content_box = Some(content);
+                match state.constrain_transform(index, &before, &mut candidate) {
+                    Err(message) => state.status_message = message.into(),
+                    Ok(clamped) => {
+                        state.transform_feedback(
+                            clamped,
+                            candidate.layout.as_ref().is_some_and(|p| {
+                                p.placement == ptouch_render::object_layout::Placement::Free
+                            }),
+                        );
+                        if candidate != before {
+                            state.elements[index] = crate::state::LabelElement::Object(candidate);
+                            state.document_version = state.document_version.max(4);
+                            state.mark_dirty();
+                        }
+                    }
+                }
             }
             return;
         }
         let drag = CanvasDrag {
+            before: None,
+            gap: false,
+            scroll_offset: egui::Vec2::ZERO,
+            reorder: None,
             element: index,
             start: egui::Pos2::ZERO,
             frame: object.frame.clone(),
@@ -1096,6 +1404,7 @@ fn draw_rulers(
     canvas: egui::Rect,
     viewport: egui::Rect,
     label: egui::Rect,
+    printable: egui::Rect,
     dpi: u16,
     zoom: f32,
 ) {
@@ -1114,6 +1423,22 @@ fn draw_rulers(
     );
     let x_painter = painter.with_clip_rect(painter.clip_rect().intersect(x_band));
     let y_painter = painter.with_clip_rect(painter.clip_rect().intersect(y_band));
+    y_painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(y_band.left(), label.top()),
+            egui::pos2(y_band.right(), label.bottom()),
+        ),
+        0.0,
+        egui::Color32::from_gray(150),
+    );
+    y_painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(y_band.left(), printable.top()),
+            egui::pos2(y_band.right(), printable.bottom()),
+        ),
+        0.0,
+        egui::Color32::from_gray(235),
+    );
     let text = |mm: f32, step: f32| {
         if step < 1.0 {
             format!("{mm:.1}")
@@ -1238,7 +1563,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hit_priority_uses_rotated_content_then_x_band_and_nearest_y() {
+    fn blank_layout_bands_never_implicitly_select_a_second_target() {
         let rect = |x, y, w, h| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
         let geometry = vec![
             CanvasGeometry {
@@ -1251,18 +1576,21 @@ mod tests {
                     egui::pos2(10.0, 30.0),
                 ]),
                 has_slot: true,
+                relative: false,
             },
             CanvasGeometry {
                 element: 1,
                 slot: rect(10.0, 60.0, 40.0, 20.0),
                 object: None,
                 has_slot: true,
+                relative: false,
             },
             CanvasGeometry {
                 element: 2,
                 slot: rect(10.0, 60.0, 40.0, 20.0),
                 object: None,
                 has_slot: true,
+                relative: false,
             },
         ];
         let paper = rect(0.0, 0.0, 100.0, 100.0);
@@ -1280,9 +1608,9 @@ mod tests {
         };
         let target = |element, edit| Some(CanvasTarget { element, edit });
         assert_eq!(hit(30.0, 40.0), target(0, CanvasEditTarget::Content)); // content beyond slot
-        assert_eq!(hit(11.0, 11.0), target(0, CanvasEditTarget::Slot)); // outside rotated quad
-        assert_eq!(hit(30.0, 95.0), target(2, CanvasEditTarget::Slot)); // X band, not full rectangle
-        assert_eq!(hit(11.0, 45.0), target(2, CanvasEditTarget::Slot)); // nearest tie, reverse order
+        assert_eq!(hit(11.0, 11.0), None); // outside rotated quad
+        assert_eq!(hit(30.0, 95.0), None); // X band, not full rectangle
+        assert_eq!(hit(11.0, 45.0), None); // nearest tie, reverse order
         assert_eq!(hit(30.0, 105.0), None); // gray workspace
         assert_eq!(hit(70.0, 20.0), None);
         let selected = CanvasTarget {
@@ -1324,6 +1652,7 @@ mod tests {
             slot: rect,
             object: Some(rect_quad(rect)),
             has_slot: true,
+            relative: false,
         }];
         let selected = CanvasTarget {
             element: 0,
@@ -1336,7 +1665,7 @@ mod tests {
         assert_eq!(hit(rect.left_center(), Some(selected)).target, selected);
         assert_eq!(
             hit(rect.center(), Some(selected)).target.edit,
-            CanvasEditTarget::Content
+            CanvasEditTarget::Slot
         );
         assert_eq!(
             hit(rect.left_center(), None).target.edit,
@@ -1357,6 +1686,7 @@ mod tests {
                 slot: rect,
                 object: Some(rect_quad(rect)),
                 has_slot: true,
+                relative: false,
             })
             .collect();
         let selected = CanvasTarget {
@@ -1598,6 +1928,10 @@ mod tests {
 
     fn drag(frame: TextBox, left_mm: f64) -> CanvasDrag {
         CanvasDrag {
+            before: None,
+            gap: false,
+            scroll_offset: egui::Vec2::ZERO,
+            reorder: None,
             element: 0,
             start: egui::Pos2::ZERO,
             frame,
@@ -1797,7 +2131,8 @@ mod tests {
                         };
                         match dashes.first()? {
                             egui::Shape::LineSegment { points, stroke }
-                                if stroke.color == egui::Color32::from_rgb(0, 90, 190)
+                                if (stroke.color == egui::Color32::from_rgb(0, 90, 190)
+                                    || stroke.color == egui::Color32::from_rgb(205, 115, 0))
                                     && stroke.width == 2.0 =>
                             {
                                 Some(points[0])
@@ -1906,6 +2241,59 @@ mod tests {
                     ((rotated[1] - rotated[0]).length() - (frame[1] - frame[0]).length()).abs()
                         < 0.01
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_move_resize_and_rotation_finish_with_same_or_separate_press_frame() {
+        for separate_press in [false, true] {
+            for action in [
+                CanvasAction::Move,
+                CanvasAction::Resize,
+                CanvasAction::Rotate,
+            ] {
+                let context = egui::Context::default();
+                let mut state = canvas_fixture(&context, true, 0);
+                let output = canvas_event(&context, &mut state, vec![]);
+                let (quad, circle) = selected_quad_and_circle(&output);
+                let center = quad_center(quad);
+                let original = state.elements[0]
+                    .as_object()
+                    .unwrap()
+                    .content_box
+                    .clone()
+                    .unwrap();
+                let (start, end) = match action {
+                    CanvasAction::Rotate => (
+                        circle,
+                        center + egui::vec2(-(circle - center).y, (circle - center).x),
+                    ),
+                    CanvasAction::Resize => (quad[2], quad[2] + (quad[2] - quad[0]) * 0.2),
+                    _ => (center, center + egui::vec2(20.0, 10.0)),
+                };
+                let mut events = vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, true),
+                ];
+                if separate_press {
+                    canvas_event(&context, &mut state, std::mem::take(&mut events));
+                }
+                events.extend([egui::Event::PointerMoved(end), pointer_button(end, false)]);
+                canvas_event(&context, &mut state, events);
+                assert_eq!(state.selected_element, Some(0));
+                assert!(state.canvas_drag_target.is_none());
+                let object = state.elements[0].as_object().unwrap();
+                let content = object.content_box.as_ref().unwrap();
+                match action {
+                    CanvasAction::Rotate => assert!(
+                        (object.rotation - 120.0).abs() < 0.01,
+                        "angle: {}",
+                        object.rotation
+                    ),
+                    CanvasAction::Resize => assert!(content.width_mm > original.width_mm * 1.1),
+                    _ => assert!(content.offset_x_mm > original.offset_x_mm),
+                }
             }
         }
     }
@@ -2178,8 +2566,8 @@ mod tests {
     }
 
     #[test]
-    fn y_ruler_uses_printable_pixels_and_tracks_scrolled_original_coordinates() {
-        for (dpi, height, endpoint) in [(180, 76, "10.72"), (360, 150, "10.58")] {
+    fn y_ruler_uses_physical_tape_and_tracks_scrolled_original_coordinates() {
+        for (dpi, height, endpoint) in [(180, 76, "12.00"), (360, 150, "12.00")] {
             let context = egui::Context::default();
             let mut state = canvas_fixture(&context, false, 0);
             state.design_dpi = dpi;
@@ -2307,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn dragging_relative_objects_preserves_gap_until_they_cross_the_predecessor() {
+    fn dragging_relative_allocations_stops_at_the_predecessor_without_detaching() {
         let original = TextBox {
             position: PositionMode::Relative,
             gap_mm: 3.0,
@@ -2319,8 +2707,8 @@ mod tests {
         assert_eq!(moved.position, PositionMode::Relative);
         assert_eq!((moved.gap_mm, moved.y_mm), (5.0, 1.0));
         let overlap = dragged_frame(&drag, egui::vec2(-80.0, 0.0), 10.0, true, 0.15);
-        assert_eq!(overlap.position, PositionMode::Absolute);
-        assert_eq!(overlap.x_mm, 14.0);
+        assert_eq!(overlap.position, PositionMode::Relative);
+        assert_eq!(overlap.gap_mm, 0.0);
     }
 
     #[test]
