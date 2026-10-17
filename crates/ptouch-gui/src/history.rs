@@ -39,6 +39,16 @@ impl DocumentHistory {
         self.gesture
     }
 
+    /// Selection itself is not an edit, but undo must return to the object
+    /// being edited rather than an old selection from when the file opened.
+    pub fn set_selection(&mut self, selection: Option<usize>) {
+        if !self.gesture
+            && let Some(current) = &mut self.current
+        {
+            current.selection = selection;
+        }
+    }
+
     pub fn observe(
         &mut self,
         document: LabelDocument,
@@ -194,6 +204,18 @@ mod tests {
         h.observe(doc(1), None, false, false, 3.0);
         assert!(h.can_redo());
         assert_eq!(h.step(true).unwrap().document, doc(2));
+    }
+
+    #[test]
+    fn selection_changes_do_not_add_undo_steps_or_lose_the_edited_object() {
+        let mut h = DocumentHistory::default();
+        h.observe(doc(1), None, false, false, 0.0);
+        h.set_selection(Some(0));
+        assert!(!h.can_undo());
+        h.observe(doc(2), Some(0), false, true, 1.0);
+        let restored = h.step(false).unwrap();
+        assert_eq!(restored.document, doc(1));
+        assert_eq!(restored.selection, Some(0));
     }
 
     #[test]

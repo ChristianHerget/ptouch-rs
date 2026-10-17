@@ -234,6 +234,9 @@ impl PtouchApp {
                 ctx.input(|i| i.time),
             );
         }
+        self.state
+            .history
+            .set_selection(self.state.selected_element);
         let revision = self.state.edit_revision;
         let rich_id = egui::Id::new((
             "inline_editor",
