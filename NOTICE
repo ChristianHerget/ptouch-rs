@@ -32,3 +32,32 @@ Original, independently written parts of this project (the egui GUI, the
 command-line front end, and the rendering code other than raster conversion)
 are additionally available under the MIT license. See README.md for the
 per-directory breakdown and LICENSE / LICENSE-MIT for the full texts.
+
+Network printing incorporates selected GPL-3.0-or-later code from:
+    nhimc0n/ptouch-yuri, feat/e850-network-printing
+    https://github.com/nhimc0n/ptouch-yuri
+    Commit 10e14876c35ef0e09889657d53bd8a9c34cd3808
+
+Adapted portions: SNMP BER encoding/decoding, LPR submission, P900/E850
+command builders, 560-pin media bands, and raster placement with tests.
+The E850-specific command remains limited to that model's dialect.
+
+PT-P750W capabilities and commands are also informed by:
+    Brother PT-E550W/PT-P750W/PT-P710BT Raster Command Reference v1.02
+    https://download.brother.com/welcome/docp100064/cv_pte550wp750wp710bt_eng_raster_102.pdf
+
+The new ptouch-profiles crate is independent of printer protocol code and
+available under MIT. The independently written printer_model.rs capability
+selection and GUI profile editor are also MIT. These additional permissions
+do not change the GPL license of the combined application.
+
+The GUI bundles 7,188 non-deprecated, non-brand symbols from Material Design
+Icons 7.4.47 by the Pictogrammers contributors:
+    https://pictogrammers.com/library/mdi/
+    https://github.com/Templarian/MaterialDesign-SVG
+
+The icon artwork is licensed under Apache License 2.0. The original collection
+license and full Apache license are included in crates/ptouch-gui/assets/symbols
+and are available in the symbol picker's library credits. Individual author
+names are retained in the catalogue and embedded SVG metadata. Label categories
+and display names are generated locally; the path artwork is unchanged.

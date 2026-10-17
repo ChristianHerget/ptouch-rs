@@ -17,6 +17,7 @@ pub mod layout;
 pub mod object_layout;
 pub mod raster;
 pub mod styled_text;
+pub mod symbol;
 pub mod text;
 
 /// Errors produced by the render crate.

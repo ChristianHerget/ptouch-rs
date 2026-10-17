@@ -36,12 +36,13 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
     let selected = match state.selected_element {
         Some(idx) if idx < state.elements.len() => idx,
         _ => {
-            ui.label("Select an element to edit properties");
+            ui.label("Select an object to edit properties");
             return;
         }
     };
 
     // We need to clone the element to avoid borrow issues, then write back.
+    let before = state.content_snapshot();
     let mut element = state.elements[selected].clone();
     let mut changed = false;
 
@@ -101,7 +102,7 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("No editable properties.");
         }
         LabelElement::Padding { pixels } => {
-            changed |= show_padding_properties(ui, pixels);
+            changed |= show_padding_properties(ui, pixels, state);
         }
     }
 
@@ -146,7 +147,12 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
             state.document_version = state.document_version.max(4);
         }
         state.elements[selected] = element;
-        state.mark_dirty();
+        state.record_content(
+            before,
+            "Edit properties",
+            state.editor.changed_group,
+            ui.input(|i| i.time),
+        );
     }
 }
 
@@ -203,7 +209,9 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     let mut changed = false;
 
     ui.label("Text Content:");
-    let response = ui.add(
+    let response = crate::editor::content_input(
+        ui,
+        &mut state.editor,
         egui::TextEdit::multiline(content)
             .desired_width(f32::INFINITY)
             .desired_rows(4),
@@ -223,18 +231,22 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
                 .find(|bound| Some(bound.element_index) == state.selected_element)
                 .map_or(0.0, |bound| {
                     let x = if state.overall_flip_h {
-                        state.preview_bitmap.as_ref().map_or(bound.x, |bitmap| {
-                            bitmap.width().saturating_sub(bound.x + bound.width)
+                        state.preview.as_ref().map_or(bound.x, |preview| {
+                            preview.bitmap.width().saturating_sub(bound.x + bound.width)
                         })
                     } else {
                         bound.x
                     };
-                    f64::from(x) * 25.4 / f64::from(state.target_dpi())
+                    f64::from(x) * 25.4
+                        / f64::from(
+                            state
+                                .preview_resolution()
+                                .map_or(state.target_dpi(), |r| r.feed_dpi),
+                        )
                 });
             TextBox {
                 x_mm,
-                height_mm: 8.0_f64
-                    .min(f64::from(state.tape_width_px) * 25.4 / f64::from(state.target_dpi())),
+                height_mm: state.printable_height_mm(),
                 ..TextBox::default()
             }
         });
@@ -253,7 +265,7 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     if let Some(bounds) = text_box {
         changed |= show_text_box(ui, bounds, state, true);
     } else {
-        ui.small("Natural width; follows the previous element.");
+        ui.small("Natural width; follows the previous object.");
     }
     ui.separator();
 
@@ -263,15 +275,16 @@ fn show_text_properties(ui: &mut egui::Ui, props: TextProps, state: &mut AppStat
     // Rotation
     ui.label("Rotation:");
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                crate::widgets::decimal_drag(rotation)
-                    .speed(1.0)
-                    .clamp_existing_to_range(false)
-                    .range(-360.0..=360.0)
-                    .suffix(" deg"),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            crate::widgets::decimal_drag(rotation)
+                .speed(1.0)
+                .clamp_existing_to_range(false)
+                .range(-360.0..=360.0)
+                .suffix(" deg"),
+        )
+        .changed()
         {
             state.rotation_input = format!("{}", *rotation as i32);
             changed = true;
@@ -328,6 +341,7 @@ fn show_font_properties(
     ui.label("Default font (label):");
     ui.add(
         egui::TextEdit::singleline(&mut state.font_search)
+            .id(egui::Id::new("label_font_search"))
             .desired_width(f32::INFINITY)
             .hint_text("Search fonts..."),
     );
@@ -359,14 +373,15 @@ fn show_font_properties(
     if let Some(size) = font_size {
         ui.horizontal(|ui| {
             ui.label(if points { "Size (pt):" } else { "Size (px):" });
-            changed |= ui
-                .add(
-                    crate::widgets::decimal_drag(size)
-                        .speed(0.5)
-                        .clamp_existing_to_range(false)
-                        .range(1.0..=200.0),
-                )
-                .changed();
+            changed |= crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                crate::widgets::decimal_drag(size)
+                    .speed(0.5)
+                    .clamp_existing_to_range(false)
+                    .range(1.0..=200.0),
+            )
+            .changed();
         });
     }
     ui.horizontal(|ui| {
@@ -381,13 +396,14 @@ fn show_font_properties(
     });
     ui.horizontal(|ui| {
         ui.label("Font margin (px):");
-        changed |= ui
-            .add(
-                crate::widgets::decimal_drag(&mut state.font_margin)
-                    .clamp_existing_to_range(false)
-                    .range(0..=50),
-            )
-            .changed();
+        changed |= crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            crate::widgets::decimal_drag(&mut state.font_margin)
+                .clamp_existing_to_range(false)
+                .range(0..=50),
+        )
+        .changed();
     });
     changed
 }
@@ -452,6 +468,15 @@ fn show_text_box(
     let minimum = 25.4 / f64::from(state.target_dpi());
     let printable_height = state.printable_height_mm();
     let mut height_changed = false;
+    let fill = ui.button("Fill printable height")
+        .on_hover_text("Set frame Y to 0 and height to the printable area. Manually sized content keeps its size and center offsets.");
+    state.editor.surface(&fill);
+    if fill.clicked() {
+        fill.request_focus();
+        state.editor.history.finish_group();
+        state.editor.changed_group = None;
+        changed |= fill_printable_height(bounds, printable_height);
+    }
     egui::Grid::new("object_frame_dimensions")
         .num_columns(2)
         .show(ui, |ui| {
@@ -461,20 +486,21 @@ fn show_text_box(
             ] {
                 ui.label(label);
                 let requested = std::cell::Cell::new(None);
-                let edited = ui
-                    .add(
-                        crate::widgets::decimal_drag(value)
-                            .custom_parser(|text| {
-                                let parsed = crate::widgets::parse_decimal(text);
-                                requested.set(parsed);
-                                parsed
-                            })
-                            .speed(0.1)
-                            .clamp_existing_to_range(false)
-                            .range(minimum..=maximum)
-                            .suffix(" mm"),
-                    )
-                    .changed();
+                let edited = crate::editor::content_input(
+                    ui,
+                    &mut state.editor,
+                    crate::widgets::decimal_drag(value)
+                        .custom_parser(|text| {
+                            let parsed = crate::widgets::parse_decimal(text);
+                            requested.set(parsed);
+                            parsed
+                        })
+                        .speed(0.1)
+                        .clamp_existing_to_range(false)
+                        .range(minimum..=maximum)
+                        .suffix(" mm"),
+                )
+                .changed();
                 if label == "Height" && requested.get().is_some_and(|height| height > maximum) {
                     state.status_message = format!(
                         "Height limited to the printable area: {maximum:.3} mm on {} mm tape.",
@@ -490,26 +516,28 @@ fn show_text_box(
                 PositionMode::Relative => ("Gap", &mut bounds.gap_mm),
             };
             ui.label(label);
-            changed |= ui
-                .add(
-                    crate::widgets::decimal_drag(value)
-                        .speed(0.1)
-                        .clamp_existing_to_range(false)
-                        .range(0.0..=10_000.0)
-                        .suffix(" mm"),
-                )
-                .changed();
+            changed |= crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                crate::widgets::decimal_drag(value)
+                    .speed(0.1)
+                    .clamp_existing_to_range(false)
+                    .range(0.0..=10_000.0)
+                    .suffix(" mm"),
+            )
+            .changed();
             ui.end_row();
             ui.label("Y");
-            changed |= ui
-                .add(
-                    crate::widgets::decimal_drag(&mut bounds.y_mm)
-                        .speed(0.1)
-                        .clamp_existing_to_range(false)
-                        .range(0.0..=(printable_height - bounds.height_mm).max(0.0))
-                        .suffix(" mm"),
-                )
-                .changed();
+            changed |= crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                crate::widgets::decimal_drag(&mut bounds.y_mm)
+                    .speed(0.1)
+                    .clamp_existing_to_range(false)
+                    .range(0.0..=(printable_height - bounds.height_mm).max(0.0))
+                    .suffix(" mm"),
+            )
+            .changed();
             ui.end_row();
         });
     if height_changed {
@@ -526,6 +554,13 @@ fn show_text_box(
             "Gap follows the previous object's right edge. Reordering changes its predecessor.",
         );
     }
+    changed
+}
+
+fn fill_printable_height(frame: &mut TextBox, printable_height: f64) -> bool {
+    let changed = frame.y_mm != 0.0 || frame.height_mm != printable_height;
+    frame.y_mm = 0.0;
+    frame.height_mm = printable_height;
     changed
 }
 
@@ -672,14 +707,15 @@ fn show_layout_properties(
             .changed();
         ui.horizontal(|ui| {
             ui.label("Inner margin:");
-            changed |= ui
-                .add(
-                    crate::widgets::decimal_drag(&mut policy.padding_mm)
-                        .range(0.0..=1000.0)
-                        .speed(0.1)
-                        .suffix(" mm"),
-                )
-                .changed();
+            changed |= crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                crate::widgets::decimal_drag(&mut policy.padding_mm)
+                    .range(0.0..=1000.0)
+                    .speed(0.1)
+                    .suffix(" mm"),
+            )
+            .changed();
         });
     }
     let old_width = object.frame.width_mm;
@@ -697,7 +733,7 @@ fn show_content_box(
     ui: &mut egui::Ui,
     object: &mut LabelObject,
     resolved: &ContentBox,
-    state: &AppState,
+    state: &mut AppState,
 ) -> bool {
     let mut changed = false;
     let free = object
@@ -783,15 +819,16 @@ fn show_content_box(
                         continue;
                     }
                     ui.label(label);
-                    changed |= ui
-                        .add(
-                            crate::widgets::decimal_drag(value)
-                                .speed(0.1)
-                                .clamp_existing_to_range(false)
-                                .range(min..=10_000.0)
-                                .suffix(" mm"),
-                        )
-                        .changed();
+                    changed |= crate::editor::content_input(
+                        ui,
+                        &mut state.editor,
+                        crate::widgets::decimal_drag(value)
+                            .speed(0.1)
+                            .clamp_existing_to_range(false)
+                            .range(min..=10_000.0)
+                            .suffix(" mm"),
+                    )
+                    .changed();
                     ui.end_row();
                 }
             });
@@ -941,6 +978,7 @@ fn show_object_properties(
                 &state.font_name,
                 font_size.unwrap_or(12.0),
                 &state.available_fonts,
+                &mut state.editor,
             );
             if content.contains("{{") {
                 ui.small("Fixed allocations keep template positions unchanged.");
@@ -968,7 +1006,7 @@ fn show_object_properties(
             ui.small("Auto font size scales all inline sizes together.");
             ui.horizontal(|ui| {
                 ui.label("Line spacing:");
-                changed |= ui.add(crate::widgets::decimal_drag(line_spacing)
+                changed |= crate::editor::content_input(ui, &mut state.editor, crate::widgets::decimal_drag(line_spacing)
                     .range(ptouch_render::text::LINE_SPACING_RANGE)
                     .speed(0.05).min_decimals(2).max_decimals(2).suffix(" ×"))
                     .on_hover_text("Baseline distance as a multiple of font size. 1.20 keeps the original spacing.")
@@ -980,22 +1018,26 @@ fn show_object_properties(
             image_data,
             bitmap,
         } => {
-            ui.label("Image");
-            let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
-                || "embedded".to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            );
-            ui.label(format!("File: {filename}"));
-            if let Some(bitmap) = bitmap {
-                ui.small(format!(
-                    "Original: {} x {} px",
-                    bitmap.width(),
-                    bitmap.height()
-                ));
+            if !show_image_identity(ui, image_data) {
+                let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
+                    || "embedded".to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                ui.label(format!("File: {filename}"));
+                if let Some(bitmap) = bitmap {
+                    ui.small(format!(
+                        "Original: {} x {} px",
+                        bitmap.width(),
+                        bitmap.height()
+                    ));
+                }
             }
             ui.small(
                 "The image keeps its aspect ratio inside the object box, then rotates with it.",
             );
+            if ui.button("Change Symbol…").clicked() {
+                state.open_symbol_picker(state.selected_element);
+            }
             if let Some(path) = path.clone()
                 && ui.button("Reload").clicked()
             {
@@ -1028,15 +1070,16 @@ fn show_object_properties(
     ui.separator();
     ui.label("Object rotation:");
     let mut rotation = object.rotation;
-    let mut rotation_changed = ui
-        .add(
-            crate::widgets::decimal_drag(&mut rotation)
-                .speed(1.0)
-                .clamp_existing_to_range(false)
-                .range(-360.0..=360.0)
-                .suffix(" deg"),
-        )
-        .changed();
+    let mut rotation_changed = crate::editor::content_input(
+        ui,
+        &mut state.editor,
+        crate::widgets::decimal_drag(&mut rotation)
+            .speed(1.0)
+            .clamp_existing_to_range(false)
+            .range(-360.0..=360.0)
+            .suffix(" deg"),
+    )
+    .changed();
     ui.horizontal(|ui| {
         for degrees in [0.0_f32, 45.0, 90.0, 180.0, 270.0] {
             rotation_changed |= ui
@@ -1081,6 +1124,16 @@ fn load_image_into(
     }
 }
 
+fn show_image_identity(ui: &mut egui::Ui, image_data: &[u8]) -> bool {
+    if let Some(symbol) = ptouch_render::symbol::metadata(image_data) {
+        ui.label(format!("Symbol: {}", symbol.name));
+        true
+    } else {
+        ui.label("Image");
+        false
+    }
+}
+
 /// Show properties for an image element. Returns true if changed.
 fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppState) -> bool {
     let ImageProps {
@@ -1094,20 +1147,26 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     } = props;
     let mut changed = false;
 
-    ui.label("Image");
+    let is_symbol = show_image_identity(ui, image_data);
     ui.add_space(4.0);
 
-    let file_label = path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "embedded".to_string());
-    ui.label(format!("File: {}", file_label));
+    if !is_symbol {
+        let file_label = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "embedded".to_string());
+        ui.label(format!("File: {}", file_label));
 
-    if let &mut Some(ref bmp) = bitmap {
-        ui.label(format!("Original: {} x {} px", bmp.width(), bmp.height()));
+        if let &mut Some(ref bmp) = bitmap {
+            ui.label(format!("Original: {} x {} px", bmp.width(), bmp.height()));
+        }
     }
 
     ui.add_space(4.0);
+
+    if ui.button("Change Symbol…").clicked() {
+        state.open_symbol_picker(state.selected_element);
+    }
 
     // Reload re-reads the original file when its path is still known.
     if let Some(p) = path.clone()
@@ -1143,14 +1202,15 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     if let Some(h) = target_height {
         ui.horizontal(|ui| {
             ui.label("Height:");
-            if ui
-                .add(
-                    crate::widgets::decimal_drag(h)
-                        .speed(1.0)
-                        .clamp_existing_to_range(false)
-                        .range(1..=1000),
-                )
-                .changed()
+            if crate::editor::content_input(
+                ui,
+                &mut state.editor,
+                crate::widgets::decimal_drag(h)
+                    .speed(1.0)
+                    .clamp_existing_to_range(false)
+                    .range(1..=1000),
+            )
+            .changed()
             {
                 changed = true;
             }
@@ -1163,15 +1223,16 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
     // Rotation
     ui.label("Rotation:");
     ui.horizontal(|ui| {
-        if ui
-            .add(
-                crate::widgets::decimal_drag(rotation)
-                    .speed(1.0)
-                    .clamp_existing_to_range(false)
-                    .range(-360.0..=360.0)
-                    .suffix(" deg"),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            crate::widgets::decimal_drag(rotation)
+                .speed(1.0)
+                .clamp_existing_to_range(false)
+                .range(-360.0..=360.0)
+                .suffix(" deg"),
+        )
+        .changed()
         {
             state.rotation_input = format!("{}", *rotation as i32);
             changed = true;
@@ -1216,7 +1277,7 @@ fn show_image_properties(ui: &mut egui::Ui, props: ImageProps, state: &mut AppSt
 }
 
 /// Show properties for a padding element. Returns true if changed.
-fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
+fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32, state: &mut AppState) -> bool {
     let mut changed = false;
 
     ui.label("Padding");
@@ -1224,14 +1285,15 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
 
     ui.horizontal(|ui| {
         ui.label("Pixels:");
-        if ui
-            .add(
-                crate::widgets::decimal_drag(pixels)
-                    .speed(1.0)
-                    .clamp_existing_to_range(false)
-                    .range(1..=500),
-            )
-            .changed()
+        if crate::editor::content_input(
+            ui,
+            &mut state.editor,
+            crate::widgets::decimal_drag(pixels)
+                .speed(1.0)
+                .clamp_existing_to_range(false)
+                .range(1..=500),
+        )
+        .changed()
         {
             changed = true;
         }
@@ -1255,6 +1317,135 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn properties_frame(
+        ctx: &egui::Context,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(340.0, 1100.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                crate::editor::begin_frame(ui.ctx(), state);
+                show_properties(ui, state);
+                crate::editor::end_frame(ui.ctx(), state);
+            },
+        )
+    }
+
+    fn click_property(ctx: &egui::Context, state: &mut AppState, label: &str) {
+        properties_frame(ctx, state, vec![]).textures_delta.clear();
+        let output = properties_frame(ctx, state, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing control: {label}"));
+        for pressed in [true, false] {
+            properties_frame(
+                ctx,
+                state,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        pressed,
+                        button: egui::PointerButton::Primary,
+                        modifiers: Default::default(),
+                    },
+                ],
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    #[test]
+    fn frame_switch_and_fill_preserve_manual_content_and_support_history() {
+        for manual in [false, true] {
+            let ctx = egui::Context::default();
+            let mut object = LabelObject::text(
+                "PORT1",
+                TextBox {
+                    x_mm: 5.0,
+                    y_mm: 2.0,
+                    width_mm: 14.0,
+                    height_mm: 4.0,
+                    ..TextBox::default()
+                },
+            );
+            if manual {
+                object.content_box = Some(ContentBox {
+                    width_mm: 8.0,
+                    height_mm: 3.0,
+                    offset_x_mm: 1.0,
+                    offset_y_mm: -0.5,
+                });
+            }
+            object.rotation = 17.0;
+            let mut state = AppState {
+                elements: vec![LabelElement::Object(object.clone())],
+                selected_element: Some(0),
+                needs_rerender: false,
+                ..AppState::default()
+            };
+            let before = state.document().to_toml_string().unwrap();
+            click_property(&ctx, &mut state, "Adjust layout…");
+            assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(state.editor.history.undo_name().is_none());
+            assert!(!state.needs_rerender);
+            click_property(&ctx, &mut state, "Fill printable height");
+            let filled = state.elements[0].as_object().unwrap();
+            assert_eq!(filled.frame.y_mm, 0.0);
+            assert_eq!(filled.frame.height_mm, state.printable_height_mm());
+            assert_eq!(filled.frame.width_mm, object.frame.width_mm);
+            assert_eq!(filled.frame.x_mm, object.frame.x_mm);
+            assert_eq!(filled.content_box, object.content_box);
+            assert_eq!(filled.rotation, object.rotation);
+            let history_key = |redo| egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    command: true,
+                    ctrl: !cfg!(target_os = "macos"),
+                    mac_cmd: cfg!(target_os = "macos"),
+                    shift: redo,
+                    ..Default::default()
+                },
+            };
+            properties_frame(&ctx, &mut state, vec![history_key(false)])
+                .textures_delta
+                .clear();
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(state.editor.history.undo_name().is_none());
+            properties_frame(&ctx, &mut state, vec![history_key(true)])
+                .textures_delta
+                .clear();
+            assert_eq!(
+                state.elements[0].as_object().unwrap().frame.height_mm,
+                state.printable_height_mm()
+            );
+            let filled_document = state.document().to_toml_string().unwrap();
+            click_property(&ctx, &mut state, "Done adjusting layout");
+            assert_eq!(state.canvas_edit_target, CanvasEditTarget::Content);
+            assert_eq!(state.document().to_toml_string().unwrap(), filled_document);
+        }
+    }
 
     #[test]
     fn viewing_properties_does_not_clamp_an_existing_design() {

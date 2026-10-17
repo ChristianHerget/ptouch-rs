@@ -21,9 +21,12 @@ use ptouch_core::BluetoothDevice;
 use ptouch_core::PrinterStatus;
 use ptouch_core::device::{self, DeviceFlags, DeviceInfo};
 use ptouch_core::error::PtouchError;
+use ptouch_core::network::{NetworkPrinter, PrintOutcome};
+use ptouch_core::printer_model::PrinterModel;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_core::tape;
 use ptouch_core::transport::{PtouchDevice, UsbLocation};
+use ptouch_profiles::{Connection, PrinterProfile, ProfileStore, Quality};
 
 use ptouch_render::bitmap::LabelBitmap;
 use ptouch_render::document::{self, LabelDocument};
@@ -38,6 +41,9 @@ use ptouch_render::text::{TextAlign, TextRenderer};
 #[derive(Parser)]
 #[command(name = "ptouch", version, about = "Brother P-Touch label printer tool")]
 struct Cli {
+    /// Directory containing portable printer TOML files
+    #[arg(long, global = true)]
+    profiles_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -49,6 +55,9 @@ struct Cli {
 enum Commands {
     /// Print labels with text, images, or both
     Print(PrintArgs),
+    /// Manage portable printer profiles
+    #[command(subcommand)]
+    Printers(ProfileCommand),
     /// Show printer and tape information
     Info(InfoArgs),
     /// List supported printer models
@@ -70,6 +79,14 @@ enum Commands {
 
 #[derive(clap::Args, Clone)]
 struct PrintArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    /// Cut each copy and CSV row separately
+    #[arg(long, conflicts_with = "chain")]
+    cut_each: bool,
+    /// Override a profile to feed and cut after the final label
+    #[arg(long, conflicts_with = "chain")]
+    final_cut: bool,
     /// Select a USB bus/address from `ptouch doctor` (changes on reconnect)
     #[arg(long, value_name = "BUS:ADDRESS", conflicts_with = "bluetooth")]
     usb: Option<UsbLocation>,
@@ -168,13 +185,24 @@ struct PrintArgs {
     #[arg(long, allow_hyphen_values = true, conflicts_with = "calibration")]
     offset_mm: Option<f64>,
 
+    /// Ignore saved printer calibration for this job
+    #[arg(long, conflicts_with_all = ["offset_mm", "calibration"])]
+    no_calibration: bool,
+
+    #[arg(skip)]
+    printer_profile: Option<PrinterProfile>,
+
     /// Apply a saved printer calibration profile (.toml), including to exports
     #[arg(long, value_name = "FILE")]
     calibration: Option<String>,
 
-    /// Cut before label
-    #[arg(long)]
+    /// Cut before label (network jobs use short margins by default)
+    #[arg(long, conflicts_with = "no_precut")]
     precut: bool,
+
+    /// Network only: use larger margins to avoid the leading cut
+    #[arg(long)]
+    no_precut: bool,
 
     /// Print quality (high and draft need a printer with quality modes)
     #[arg(long, value_enum, default_value = "standard")]
@@ -184,7 +212,7 @@ struct PrintArgs {
     #[arg(long, default_value = "1")]
     copies: u32,
 
-    /// Maximum seconds for sending and waiting for one USB label
+    /// Maximum seconds for sending and waiting for one label
     #[arg(long = "job-timeout", alias = "timeout", default_value = "600", value_parser = clap::value_parser!(u32).range(1..))]
     timeout: u32,
 
@@ -195,6 +223,8 @@ struct PrintArgs {
 
 #[derive(clap::Args)]
 struct InfoArgs {
+    #[command(flatten)]
+    target: TargetArgs,
     /// Select a USB bus/address from `ptouch doctor` (changes on reconnect)
     #[arg(long, value_name = "BUS:ADDRESS", conflicts_with = "bluetooth")]
     usb: Option<UsbLocation>,
@@ -216,9 +246,189 @@ struct InfoArgs {
     timeout: u32,
 }
 
+#[derive(clap::Args, Clone, Default)]
+struct TargetArgs {
+    /// Select a saved printer alias
+    #[arg(long, conflicts_with_all = ["host", "model", "serial", "usb", "usbprint", "bluetooth"])]
+    printer: Option<String>,
+    /// Network hostname or IP address (requires --model)
+    #[arg(long, requires = "model", conflicts_with_all = ["usb", "usbprint", "bluetooth", "serial"])]
+    host: Option<String>,
+    /// Built-in model name, for network or portable USB selection
+    #[arg(long, conflicts_with_all = ["usb", "usbprint", "bluetooth"])]
+    model: Option<String>,
+    /// Stable USB serial number (requires --model)
+    #[arg(long, requires = "model")]
+    serial: Option<String>,
+    /// Enable an experimental network model
+    #[arg(long)]
+    allow_experimental: bool,
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List aliases and their source files
+    List,
+    /// Validate the entire collection
+    Validate,
+    /// Add one printer, optionally to an existing group file
+    Add {
+        alias: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, conflicts_with = "serial")]
+        host: Option<String>,
+        #[arg(long)]
+        serial: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long, value_enum, default_value = "standard")]
+        quality: QualityArg,
+        #[arg(long)]
+        no_final_cut: bool,
+        #[arg(long)]
+        allow_experimental: bool,
+    },
+    /// Remove an alias from its original file
+    Remove { alias: String },
+    /// Set a default, or clear it by omitting the alias
+    Default { alias: Option<String> },
+}
+
+fn profiles_path(path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
+    path.cloned()
+        .unwrap_or_else(ptouch_profiles::default_directory)
+}
+
+fn profile_command(command: ProfileCommand, directory: &Path) -> ptouch_profiles::Result<()> {
+    let mut store = ProfileStore::load(directory)?;
+    match command {
+        ProfileCommand::List => {
+            println!("Profiles: {}", directory.display());
+            for (alias, entry) in &store.entries {
+                println!(
+                    "{alias}{}: {} {:?} [{}]",
+                    if store.default_printer.as_deref() == Some(alias) {
+                        " (default)"
+                    } else {
+                        ""
+                    },
+                    entry.profile.model,
+                    entry.profile.connection,
+                    entry.source.display()
+                );
+            }
+        }
+        ProfileCommand::Validate => {
+            for entry in store.entries.values() {
+                validate_profile(&entry.profile)?;
+            }
+            println!("Validated {} printer(s)", store.entries.len());
+        }
+        ProfileCommand::Add {
+            alias,
+            model,
+            host,
+            serial,
+            file,
+            quality,
+            no_final_cut,
+            allow_experimental,
+        } => {
+            let profile = PrinterProfile {
+                alias,
+                model,
+                connection: host.map_or(Connection::Usb { serial }, |host| Connection::Network {
+                    host,
+                }),
+                quality: match quality {
+                    QualityArg::Standard => Quality::Standard,
+                    QualityArg::High => Quality::High,
+                    QualityArg::Draft => Quality::Draft,
+                },
+                final_cut: !no_final_cut,
+                allow_experimental,
+                calibrations: Vec::new(),
+            };
+            validate_profile(&profile)?;
+            store.add(profile, file.as_deref())?;
+        }
+        ProfileCommand::Remove { alias } => store.remove(&alias)?,
+        ProfileCommand::Default { alias } => store.set_default(alias.as_deref())?,
+    }
+    Ok(())
+}
+
+fn validate_profile(profile: &PrinterProfile) -> ptouch_profiles::Result<()> {
+    if let Connection::Network { host } = &profile.connection {
+        ptouch_core::network_host::normalize(host)?;
+    }
+    profile.validate()?;
+    let model = PrinterModel::find(&profile.model).ok_or("Unknown model")?;
+    for rule in &profile.calibrations {
+        model.quality.mode(profile_quality(rule.quality))?;
+    }
+    if matches!(profile.connection, Connection::Usb { .. }) && !model.usb {
+        return Err("USB is not implemented for this model".into());
+    }
+    if matches!(profile.connection, Connection::Network { .. }) && model.network.is_none() {
+        return Err("This model has no network backend".into());
+    }
+    if model
+        .quality
+        .mode(profile_quality(profile.quality))
+        .is_err()
+    {
+        return Err("Quality unsupported by this model".into());
+    }
+    Ok(())
+}
+
+/// Explicit connection flags take priority over the saved default.
+fn resolve_profile(
+    target: &mut TargetArgs,
+    explicit: bool,
+    directory: &Path,
+) -> ptouch_profiles::Result<Option<PrinterProfile>> {
+    if explicit || target.host.is_some() || target.model.is_some() {
+        return Ok(None);
+    }
+    let store = ProfileStore::load(directory)?;
+    let Some(profile) = store.selected(target.printer.as_deref())?.cloned() else {
+        return Ok(None);
+    };
+    validate_profile(&profile)?;
+    target.model = Some(profile.model.clone());
+    target.allow_experimental |= profile.allow_experimental;
+    match &profile.connection {
+        Connection::Network { host } => target.host = Some(host.clone()),
+        Connection::Usb { serial } => target.serial = serial.clone(),
+    }
+    Ok(Some(profile))
+}
+
+fn apply_profile_preferences(
+    args: &mut PrintArgs,
+    profile: &PrinterProfile,
+    explicit_quality: bool,
+) {
+    if !explicit_quality {
+        args.quality = match profile.quality {
+            Quality::Standard => QualityArg::Standard,
+            Quality::High => QualityArg::High,
+            Quality::Draft => QualityArg::Draft,
+        };
+    }
+    if !args.final_cut && !args.cut_each {
+        args.chain |= !profile.final_cut;
+    }
+    args.printer_profile = Some(profile.clone());
+}
+
 /// The printer selected by the CLI. USB remains the default target.
 enum CliDevice {
     Usb(PtouchDevice),
+    Network(NetworkPrinter),
     #[cfg(target_os = "macos")]
     Bluetooth(BluetoothDevice),
 }
@@ -228,7 +438,19 @@ impl CliDevice {
         bluetooth: Option<&str>,
         usb: Option<UsbLocation>,
         usbprint: Option<&str>,
+        target: &TargetArgs,
     ) -> Result<Self, PtouchError> {
+        if let Some(host) = &target.host {
+            return NetworkPrinter::open(
+                target.model.as_deref().unwrap_or(""),
+                host,
+                target.allow_experimental,
+            )
+            .map(Self::Network);
+        }
+        if let Some(model) = &target.model {
+            return PtouchDevice::open_profile(model, target.serial.as_deref()).map(Self::Usb);
+        }
         if let Some(id) = usbprint {
             #[cfg(windows)]
             {
@@ -262,6 +484,7 @@ impl CliDevice {
     fn init(&mut self) -> Result<(), PtouchError> {
         match self {
             Self::Usb(device) => device.init(),
+            Self::Network(_) => Ok(()),
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.init(),
         }
@@ -270,6 +493,8 @@ impl CliDevice {
     fn query_status(&mut self) -> Result<&PrinterStatus, PtouchError> {
         match self {
             Self::Usb(device) => device.query_status(),
+            // Opening a network printer already retrieves its status via SNMP.
+            Self::Network(device) => Ok(device.status()),
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.query_status(),
         }
@@ -278,6 +503,7 @@ impl CliDevice {
     fn status(&self) -> Option<&PrinterStatus> {
         match self {
             Self::Usb(device) => device.status(),
+            Self::Network(device) => Some(device.status()),
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.status(),
         }
@@ -286,6 +512,7 @@ impl CliDevice {
     fn model_name(&self) -> &'static str {
         match self {
             Self::Usb(device) => device.device_info().name,
+            Self::Network(device) => device.model.name,
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.model_name(),
         }
@@ -294,6 +521,7 @@ impl CliDevice {
     fn tape_width_px(&self) -> Option<u16> {
         match self {
             Self::Usb(device) => device.tape_width_px(),
+            Self::Network(device) => device.band().map(|b| b.print_pins),
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.tape_width_px(),
         }
@@ -302,6 +530,7 @@ impl CliDevice {
     fn raster_width_px(&self) -> u16 {
         match self {
             Self::Usb(device) => device.max_px(),
+            Self::Network(device) => device.model.raster_pins,
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.raster_width_px(),
         }
@@ -310,19 +539,57 @@ impl CliDevice {
     fn close(self) -> Result<(), PtouchError> {
         match self {
             Self::Usb(device) => device.close(),
+            Self::Network(_) => Ok(()),
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.close(),
         }
     }
 }
 
+fn render_resolution(
+    args: &PrintArgs,
+    device: Option<&impl PrintDevice>,
+) -> Result<ptouch_core::PrintResolution, PtouchError> {
+    if args.output.is_none()
+        && let Some(device) = device
+    {
+        return device.resolution(args.quality.to_print_quality());
+    }
+    Ok(ptouch_core::PrintResolution::square(180))
+}
+
+fn print_needs_profile(args: &PrintArgs) -> bool {
+    !args.list_vars
+        && (args.target.printer.is_some()
+            || (args.output.is_none() || (args.tape_width.is_none() && args.layout.is_none())))
+}
+
+fn profile_quality(quality: Quality) -> PrintQuality {
+    match quality {
+        Quality::Standard => PrintQuality::Standard,
+        Quality::High => PrintQuality::HighRes,
+        Quality::Draft => PrintQuality::Draft,
+    }
+}
+
 /// Operations used by label output, separate from discovery and connection setup.
 trait PrintDevice {
+    fn is_network(&self) -> bool {
+        false
+    }
+    fn band_left(&self) -> Option<u16> {
+        None
+    }
+    fn resolution(
+        &self,
+        quality: PrintQuality,
+    ) -> Result<ptouch_core::PrintResolution, PtouchError>;
     fn dpi(&self) -> u16;
     fn is_bluetooth(&self) -> bool;
     fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: ptouch_core::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: PrintQuality,
@@ -330,9 +597,31 @@ trait PrintDevice {
 }
 
 impl PrintDevice for CliDevice {
+    fn is_network(&self) -> bool {
+        matches!(self, Self::Network(_))
+    }
+    fn band_left(&self) -> Option<u16> {
+        if let Self::Network(d) = self {
+            d.band().map(|b| b.left_pins)
+        } else {
+            None
+        }
+    }
+    fn resolution(
+        &self,
+        quality: PrintQuality,
+    ) -> Result<ptouch_core::PrintResolution, PtouchError> {
+        Ok(
+            ptouch_core::quality::QualityProfile::for_model(self.model_name(), self.dpi())
+                .mode(quality)?
+                .resolution,
+        )
+    }
+
     fn dpi(&self) -> u16 {
         match self {
             Self::Usb(device) => device.device_info().dpi,
+            Self::Network(device) => device.model.head_dpi,
             #[cfg(target_os = "macos")]
             Self::Bluetooth(device) => device.dpi(),
         }
@@ -341,6 +630,7 @@ impl PrintDevice for CliDevice {
     fn is_bluetooth(&self) -> bool {
         match self {
             Self::Usb(_) => false,
+            Self::Network(_) => false,
             #[cfg(target_os = "macos")]
             Self::Bluetooth(_) => true,
         }
@@ -349,14 +639,23 @@ impl PrintDevice for CliDevice {
     fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: ptouch_core::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: PrintQuality,
     ) -> Result<(), PtouchError> {
         match self {
-            Self::Usb(device) => device.print_raster(lines, chain_print, precut, quality),
+            Self::Usb(device) => {
+                device.print_raster(lines, resolution, chain_print, precut, quality)
+            }
+            Self::Network(device) => {
+                match device.print_raster(lines, resolution, chain_print, precut, quality)? {
+                    PrintOutcome::Complete => Ok(()),
+                    PrintOutcome::SubmittedUnconfirmed => Err(PtouchError::CompletionUnknown),
+                }
+            }
             #[cfg(target_os = "macos")]
-            Self::Bluetooth(device) => device.print_raster(lines),
+            Self::Bluetooth(device) => device.print_raster(lines, resolution),
         }
     }
 }
@@ -433,13 +732,69 @@ fn main() {
         }
     }
     let matches = Cli::command().get_matches();
-    let cli = match Cli::from_arg_matches(&matches) {
+    let mut cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
 
+    let directory = profiles_path(cli.profiles_dir.as_ref());
+    let resolved: ptouch_profiles::Result<()> = (|| {
+        match &mut cli.command {
+            Commands::Info(args) => {
+                resolve_profile(
+                    &mut args.target,
+                    args.usb.is_some() || args.usbprint.is_some() || args.bluetooth.is_some(),
+                    &directory,
+                )?;
+            }
+            Commands::Print(args) if print_needs_profile(args) => {
+                if let Some(profile) = resolve_profile(
+                    &mut args.target,
+                    args.usb.is_some() || args.usbprint.is_some() || args.bluetooth.is_some(),
+                    &directory,
+                )? {
+                    let explicit_quality = matches.subcommand_matches("print").is_some_and(|m| {
+                        m.value_source("quality") == Some(ValueSource::CommandLine)
+                    });
+                    apply_profile_preferences(args, &profile, explicit_quality);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })();
+    if let Err(e) = resolved {
+        eprintln!("Profile error: {e}");
+        process::exit(1);
+    }
+
     match cli.command {
-        Commands::List => execute_list(),
+        Commands::Printers(command) => {
+            if let Err(e) = profile_command(command, &directory) {
+                eprintln!("Profile error: {e}");
+                process::exit(1);
+            }
+        }
+        Commands::List => {
+            execute_list();
+            println!("\nNetwork profiles:");
+            for model in PrinterModel::all()
+                .into_iter()
+                .filter(|m| m.network.is_some())
+            {
+                println!(
+                    "  {}: {} x {} DPI{}",
+                    model.name,
+                    model.head_dpi,
+                    model.head_dpi,
+                    if model.experimental {
+                        " (experimental)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
         Commands::Doctor { json, probe } => {
             let report = ptouch_core::diagnostics::doctor(probe);
             if json {
@@ -511,7 +866,7 @@ fn main() {
                 process::exit(1);
             }
         }
-        Commands::Gui => execute_gui(),
+        Commands::Gui => execute_gui(&directory),
         Commands::Info(args) => {
             init_logging(args.debug);
             if let Err(e) = execute_info(&args) {
@@ -529,6 +884,15 @@ fn main() {
                 Vec::new()
             };
             if let Err(e) = execute_print(&args, &ignored) {
+                if matches!(
+                    e.downcast_ref::<PtouchError>(),
+                    Some(PtouchError::CompletionUnknown)
+                ) {
+                    eprintln!(
+                        "Submitted, completion unconfirmed. Check the printer before retrying. Remaining copies or rows were not sent."
+                    );
+                    process::exit(2);
+                }
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
@@ -713,20 +1077,33 @@ fn format_flags(dev: &DeviceInfo) -> String {
 // ---------------------------------------------------------------------------
 
 /// Print a message directing users to the GUI application.
-fn execute_gui() {
-    println!("Use ptouch-gui for the graphical interface.");
+fn execute_gui(directory: &Path) {
+    let sibling = std::env::current_exe().ok().map(|p| {
+        p.with_file_name(if cfg!(windows) {
+            "ptouch-gui.exe"
+        } else {
+            "ptouch-gui"
+        })
+    });
+    let executable = sibling
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| "ptouch-gui".into());
+    if let Err(e) = std::process::Command::new(executable)
+        .arg("--profiles-dir")
+        .arg(directory)
+        .spawn()
+    {
+        eprintln!("Cannot launch ptouch-gui: {e}");
+        process::exit(1);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Subcommand: info
-// ---------------------------------------------------------------------------
-
-/// Open the printer and display status and tape information.
 fn execute_info(args: &InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut dev = CliDevice::open(
         args.bluetooth.as_deref(),
         args.usb,
         args.usbprint.as_deref(),
+        &args.target,
     )?;
     // A read-only query preserves device errors for display without resetting
     // the printer or requiring it to be ready for a new print job.
@@ -839,10 +1216,14 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
                 args.bluetooth.as_deref(),
                 args.usb,
                 args.usbprint.as_deref(),
+                &args.target,
             )?;
             #[allow(irrefutable_let_patterns)]
             if let CliDevice::Usb(usb) = &mut dev {
                 usb.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
+            }
+            if let CliDevice::Network(net) = &mut dev {
+                net.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
             }
             dev.init()?;
             // init() already called get_status() internally
@@ -855,9 +1236,24 @@ fn execute_print(args: &PrintArgs, ignored: &[String]) -> Result<(), Box<dyn std
         };
 
     // Whole-label mirroring applies once, after the label is composed.
-    let bitmap = build_label(args, print_width)?.mirrored(args.flip_h, args.flip_v);
-    let dpi = device.as_ref().map_or(180, |dev| dev.dpi());
-    emit_label(&bitmap, args, max_px, dpi, device.as_mut())?;
+    let resolution = render_resolution(args, device.as_ref())?;
+    let high = resolution.feed_dpi == resolution.head_dpi * 2;
+    let bitmap = if high {
+        let mut scaled = args.clone();
+        scaled.size = scaled.size.map(|v| v * 2.0);
+        scaled.margin *= 2;
+        scaled.pad = scaled.pad.map(|v| v * 2);
+        build_label(&scaled, print_width * 2, 2)?.halve_height()
+    } else {
+        build_label(args, print_width, 1)?
+    };
+    let bitmap = if resolution.feed_dpi * 2 == resolution.head_dpi {
+        bitmap.halve_feed()
+    } else {
+        bitmap
+    };
+    let bitmap = bitmap.mirrored(args.flip_h, args.flip_v);
+    emit_label(&bitmap, args, max_px, resolution.feed_dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -930,9 +1326,13 @@ fn print_layout(args: &PrintArgs, layout_path: &str) -> Result<(), Box<dyn std::
     doc.apply_values(&values);
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
-    let target_dpi = device.as_ref().map_or(doc.dpi, |dev| dev.dpi());
-    let bitmap = render_layout(&doc, print_width, target_dpi)?;
-    emit_label(&bitmap, args, max_px, target_dpi, device.as_mut())?;
+    let resolution = if device.is_some() {
+        render_resolution(args, device.as_ref())?
+    } else {
+        ptouch_core::PrintResolution::square(doc.dpi)
+    };
+    let bitmap = render_layout_quality(&doc, print_width, resolution)?;
+    emit_label(&bitmap, args, max_px, resolution.feed_dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -970,22 +1370,21 @@ fn print_layout_batch(
     validate_vars(&doc.placeholders(), &provided, args.allow_missing)?;
 
     let (print_width, max_px, mut device) = resolve_layout_target(args, &doc)?;
-    let target_dpi = device.as_ref().map_or(doc.dpi, |dev| dev.dpi());
 
+    let resolution = if device.is_some() {
+        render_resolution(args, device.as_ref())?
+    } else {
+        ptouch_core::PrintResolution::square(doc.dpi)
+    };
     let labels = rdr.records().map(|record| {
         let record = record?;
         let row: Vec<String> = record.iter().map(|s| s.to_string()).collect();
         let values = build_row_values(&base, &headers, &row);
         let mut row_doc = doc.clone();
         row_doc.apply_values(&values);
-        let bitmap = render_layout(&row_doc, print_width, target_dpi)?;
-        Ok(ptouch_render::calibration::apply_calibration(
-            &bitmap,
-            target_dpi,
-            args.offset_mm,
-        )?)
+        render_layout_quality(&row_doc, print_width, resolution)
     });
-    let count = emit_batch(labels, args, max_px, device.as_mut())?;
+    let count = emit_batch_at_dpi(labels, args, max_px, resolution.feed_dpi, device.as_mut())?;
 
     if let Some(dev) = device {
         dev.close()?;
@@ -1000,16 +1399,25 @@ fn print_layout_batch(
 }
 
 /// Keep at most one rendered label ahead of the current one. Only USB
-/// printing needs lookahead; exports and Bluetooth can emit each row immediately.
-fn emit_batch(
+/// printing and exports with automatic USB correction rules need lookahead.
+fn emit_batch_at_dpi(
     labels: impl Iterator<Item = Result<LabelBitmap, Box<dyn std::error::Error>>>,
     args: &PrintArgs,
     max_px: u16,
+    output_dpi: u16,
     mut device: Option<&mut impl PrintDevice>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut labels = labels.peekable();
-    let chain_rows =
-        args.output.is_none() && device.as_ref().is_some_and(|dev| !dev.is_bluetooth());
+    let chain_rows = !args.cut_each
+        && if args.output.is_some() {
+            args.printer_profile.as_ref().is_some_and(|p| {
+                !p.calibrations.is_empty() && matches!(p.connection, Connection::Usb { .. })
+            })
+        } else {
+            device
+                .as_ref()
+                .is_some_and(|dev| !dev.is_bluetooth() && !dev.is_network())
+        };
     let mut count = 0;
 
     while let Some(label) = labels.next() {
@@ -1020,7 +1428,8 @@ fn emit_batch(
         count += 1;
         if let Some(output) = &args.output {
             let path = output.replace("{n}", &count.to_string());
-            bitmap.save(Path::new(&path))?;
+            let corrected = corrected_export(&bitmap, args, output_dpi, is_last_row)?;
+            corrected.save(Path::new(&path))?;
             println!("Saved row {} to '{}'", count, path);
         } else if let Some(dev) = device.as_mut() {
             // A transport failure returns directly; never retry a printed page.
@@ -1030,6 +1439,16 @@ fn emit_batch(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+fn emit_batch(
+    labels: impl Iterator<Item = Result<LabelBitmap, Box<dyn std::error::Error>>>,
+    args: &PrintArgs,
+    max_px: u16,
+    device: Option<&mut impl PrintDevice>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    emit_batch_at_dpi(labels, args, max_px, 180, device)
 }
 
 /// Merge `--set` constants with one CSV row's columns (row values win).
@@ -1046,6 +1465,20 @@ fn build_row_values(
 }
 
 /// Render a (placeholder-resolved) layout document to a single bitmap.
+fn render_layout_quality(
+    doc: &LabelDocument,
+    width: u32,
+    resolution: ptouch_core::PrintResolution,
+) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
+    let mut renderer = TextRenderer::new();
+    let rendered = document::render_document_at_resolution(doc, width, resolution, &mut renderer)?;
+    for diagnostic in rendered.diagnostics {
+        eprintln!("WARN: {diagnostic}");
+    }
+    Ok(rendered.bitmap.ok_or("Layout produced no output")?)
+}
+
+#[cfg(test)]
 fn render_layout(
     doc: &LabelDocument,
     print_width: u32,
@@ -1090,10 +1523,14 @@ fn resolve_layout_target(
             args.bluetooth.as_deref(),
             args.usb,
             args.usbprint.as_deref(),
+            &args.target,
         )?;
         #[allow(irrefutable_let_patterns)]
         if let CliDevice::Usb(usb) = &mut dev {
             usb.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
+        }
+        if let CliDevice::Network(net) = &mut dev {
+            net.set_job_timeout(std::time::Duration::from_secs(u64::from(args.timeout)))?;
         }
         dev.init()?;
         let printer_px = u32::from(dev.tape_width_px().ok_or_else(|| {
@@ -1127,10 +1564,9 @@ fn emit_label(
     dpi: u16,
     device: Option<&mut CliDevice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let corrected = ptouch_render::calibration::apply_calibration(bitmap, dpi, args.offset_mm)?;
-    let bitmap = &corrected;
-
     if let Some(ref output_path) = args.output {
+        let corrected = corrected_export(bitmap, args, dpi, true)?;
+        let bitmap = &corrected;
         bitmap.save(Path::new(output_path))?;
         let tape_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
         println!(
@@ -1153,6 +1589,7 @@ fn emit_label(
 fn build_label(
     args: &PrintArgs,
     print_width: u32,
+    source_scale: u32,
 ) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
     let mut result: Option<LabelBitmap> = None;
 
@@ -1198,7 +1635,7 @@ fn build_label(
     // Add cut mark if requested
     if args.cut {
         debug!("Adding cut mark");
-        let mark = make_cutmark(print_width);
+        let mark = make_cutmark(print_width / source_scale).scale_to_height(print_width);
         result = Some(append_bitmap(result, mark));
     }
 
@@ -1244,6 +1681,65 @@ fn make_padding(print_width: u32, pad_px: u32) -> LabelBitmap {
     LabelBitmap::new(pad_px, print_width)
 }
 
+/// Resolve the same physical cut commands for calibration, exports and transport.
+fn label_cut_settings(
+    args: &PrintArgs,
+    network: bool,
+    bluetooth: bool,
+    is_last: bool,
+) -> (bool, bool) {
+    if bluetooth {
+        return (false, false);
+    }
+    let chain = args.chain || (!is_last && !args.cut_each && !network);
+    (
+        if network {
+            !args.no_precut
+        } else {
+            args.precut
+        },
+        !chain,
+    )
+}
+
+fn calibration_offset(args: &PrintArgs, precut: bool, final_cut: bool) -> Option<f64> {
+    if args.no_calibration {
+        return None;
+    }
+    args.offset_mm.or_else(|| {
+        args.printer_profile.as_ref().and_then(|profile| {
+            profile.calibration_offset(
+                match args.quality {
+                    QualityArg::Standard => Quality::Standard,
+                    QualityArg::High => Quality::High,
+                    QualityArg::Draft => Quality::Draft,
+                },
+                precut,
+                final_cut,
+            )
+        })
+    })
+}
+
+fn corrected_export(
+    bitmap: &LabelBitmap,
+    args: &PrintArgs,
+    dpi: u16,
+    is_last: bool,
+) -> Result<LabelBitmap, Box<dyn std::error::Error>> {
+    let (precut, final_cut) = label_cut_settings(
+        args,
+        args.target.host.is_some(),
+        args.bluetooth.is_some(),
+        is_last,
+    );
+    Ok(ptouch_render::calibration::apply_calibration(
+        bitmap,
+        dpi,
+        calibration_offset(args, precut, final_cut),
+    )?)
+}
+
 /// Send the label bitmap to the printer.
 fn print_to_device(
     dev: &mut impl PrintDevice,
@@ -1252,15 +1748,32 @@ fn print_to_device(
     args: &PrintArgs,
     is_last_row: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let raster_lines = raster::bitmap_to_raster_lines(bitmap, max_px);
-
+    if args.no_precut && !dev.is_network() {
+        return Err("--no-precut is only available for network jobs".into());
+    }
+    let resolution = dev.resolution(args.quality.to_print_quality())?;
     let total_copies = args.copies.max(1);
+    let mut lengths = (f64::INFINITY, 0.0_f64);
     for copy_idx in 0..total_copies {
-        let is_last = is_last_row && copy_idx == total_copies - 1;
-        // Chain intermediate copies (no cut between copies), and intermediate
-        // CSV rows (no cut between labels in a batch).
-        // Very last copy of the very last row: chain only if user requested --chain.
-        let chain_print = !dev.is_bluetooth() && (args.chain || !is_last);
+        let (precut, final_cut) = label_cut_settings(
+            args,
+            dev.is_network(),
+            dev.is_bluetooth(),
+            is_last_row && copy_idx == total_copies - 1,
+        );
+        let chain_print = !dev.is_bluetooth() && !final_cut;
+        let corrected = ptouch_render::calibration::apply_calibration(
+            bitmap,
+            resolution.feed_dpi,
+            calibration_offset(args, precut, final_cut),
+        )?;
+        let length = resolution.length_mm(corrected.width() as usize);
+        lengths = (lengths.0.min(length), lengths.1.max(length));
+        let raster_lines = if let Some(left) = dev.band_left() {
+            raster::bitmap_to_raster_lines_at(&corrected, max_px, left)
+        } else {
+            raster::bitmap_to_raster_lines(&corrected, max_px)
+        };
 
         debug!(
             "Printing copy {}/{} ({} raster lines, chain={})",
@@ -1272,18 +1785,23 @@ fn print_to_device(
 
         dev.print_raster(
             &raster_lines,
+            dev.resolution(args.quality.to_print_quality())?,
             chain_print,
-            args.precut,
+            precut,
             args.quality.to_print_quality(),
         )?;
     }
 
-    let tape_mm = bitmap.width() as f64 / f64::from(dev.dpi()) * 25.4;
+    let length = if lengths.0 == lengths.1 {
+        format!("{:.1}", lengths.0)
+    } else {
+        format!("{:.1}–{:.1}", lengths.0, lengths.1)
+    };
     println!(
-        "Printed {} cop{} ({:.1} mm of tape each)",
+        "Printed {} cop{} ({} mm of tape each)",
         total_copies,
         if total_copies == 1 { "y" } else { "ies" },
-        tape_mm
+        length
     );
 
     Ok(())
@@ -1681,6 +2199,9 @@ mod tests {
                 *font_size = Some(6.0);
                 *line_spacing = 0.9;
             }
+            let symbol = LabelObject::image_from_bytes(None,
+                br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><metadata><symbol xmlns="urn:ptouch-rs:symbol:1" library="test" id="square" name="Square" version="1"/></metadata><path d="M1 1H23V23H1Z"/></svg>"#.to_vec(),
+                TextBox { x_mm: 30.0, width_mm: 5.0, height_mm: 5.0, ..Default::default() });
             let doc = LabelDocument {
                 version: 4,
                 tape_width_mm: 12,
@@ -1689,11 +2210,12 @@ mod tests {
                 font_margin: 0,
                 flip_h: false,
                 flip_v: false,
-                elements: vec![LabelElement::Object(object)],
+                elements: vec![LabelElement::Object(object), LabelElement::Object(symbol)],
             };
             let serialized = doc.to_toml_string().unwrap();
             let doc = LabelDocument::from_toml_str(&serialized).unwrap();
             assert_eq!(doc.version, 5);
+            assert_eq!(doc.elements[1].display_name(), "Symbol: Square");
             let layout = dir.join(format!("spacing-{dpi}.ptl"));
             let csv = dir.join("ports.csv");
             std::fs::write(&layout, &serialized).unwrap();
@@ -1910,6 +2432,347 @@ mod tests {
     }
 
     #[test]
+    fn plain_export_uses_default_profile_and_explicit_targets_take_precedence() {
+        let directory = std::env::temp_dir().join(format!(
+            "ptouch-cli-profiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = ProfileStore::load(&directory).unwrap();
+        for (alias, host) in [("desk", "default.local"), ("other", "other.local")] {
+            store
+                .add(
+                    PrinterProfile {
+                        alias: alias.into(),
+                        model: "PT-P750W".into(),
+                        connection: Connection::Network { host: host.into() },
+                        quality: Quality::High,
+                        final_cut: false,
+                        allow_experimental: false,
+                        calibrations: Vec::new(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        store.set_default(Some("desk")).unwrap();
+        let mut args = batch_args(&["test", "--output", "label.png"]);
+        assert!(print_needs_profile(&args));
+        let profile = resolve_profile(&mut args.target, false, &directory)
+            .unwrap()
+            .unwrap();
+        apply_profile_preferences(&mut args, &profile, false);
+        assert_eq!(args.target.host.as_deref(), Some("default.local"));
+        assert_eq!(args.target.model.as_deref(), Some("PT-P750W"));
+        assert!(matches!(args.quality, QualityArg::High));
+        assert!(args.chain);
+        let mut args = batch_args(&["--printer", "other"]);
+        resolve_profile(&mut args.target, false, &directory).unwrap();
+        assert_eq!(args.target.host.as_deref(), Some("other.local"));
+        for flags in [
+            vec!["--usb", "1:2"],
+            vec!["--model", "PT-P700"],
+            vec!["--host", "explicit.local", "--model", "PT-P750W"],
+        ] {
+            let mut args = batch_args(&flags);
+            assert!(
+                resolve_profile(&mut args.target, args.usb.is_some(), &directory)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_ne!(args.target.host.as_deref(), Some("default.local"));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exports_resolve_profiles_only_when_printer_geometry_or_an_explicit_alias_is_needed() {
+        for (flags, expected) in [
+            (vec!["test", "--output", "label.png"], true),
+            (
+                vec!["test", "--output", "label.png", "--tape-width", "76"],
+                false,
+            ),
+            (
+                vec!["--layout", "label.ptl", "--output", "label.png"],
+                false,
+            ),
+            (vec!["--layout", "label.ptl", "--list-vars"], false),
+            (
+                vec![
+                    "--layout",
+                    "label.ptl",
+                    "--list-vars",
+                    "--printer",
+                    "missing",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "--layout",
+                    "label.ptl",
+                    "--output",
+                    "label.png",
+                    "--printer",
+                    "desk",
+                ],
+                true,
+            ),
+            (vec!["test"], true),
+        ] {
+            assert_eq!(
+                print_needs_profile(&batch_args(&flags)),
+                expected,
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_network_requires_model_and_selection_is_unambiguous() {
+        assert!(Cli::try_parse_from(["ptouch", "info", "--host", "printer.local"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ptouch", "info", "--printer", "desk", "--usb", "1:2"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ptouch",
+                "info",
+                "--host",
+                "printer.local",
+                "--model",
+                "PT-P750W"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_job_settings_override_profile_preferences() {
+        let profile = PrinterProfile {
+            alias: "desk".into(),
+            model: "PT-P750W".into(),
+            connection: Connection::Network {
+                host: "printer.local".into(),
+            },
+            quality: Quality::High,
+            final_cut: false,
+            allow_experimental: false,
+            calibrations: Vec::new(),
+        };
+        let mut args = batch_args(&[]);
+        apply_profile_preferences(&mut args, &profile, false);
+        assert_eq!(args.quality, QualityArg::High);
+        assert!(args.chain);
+        let mut args = batch_args(&["--quality", "standard", "--final-cut"]);
+        apply_profile_preferences(&mut args, &profile, true);
+        assert_eq!(args.quality, QualityArg::Standard);
+        assert!(!args.chain);
+    }
+
+    fn calibrated_profile(quality: Quality, network: bool) -> PrinterProfile {
+        PrinterProfile {
+            alias: "desk".into(),
+            model: "PT-P750W".into(),
+            connection: if network {
+                Connection::Network {
+                    host: "printer.local".into(),
+                }
+            } else {
+                Connection::Usb { serial: None }
+            },
+            quality,
+            final_cut: true,
+            allow_experimental: false,
+            calibrations: [false, true]
+                .into_iter()
+                .flat_map(|precut| {
+                    [false, true].into_iter().map(move |final_cut| {
+                        ptouch_profiles::CalibrationRule {
+                            quality,
+                            precut,
+                            final_cut,
+                            offset_mm: if final_cut { 1.0 } else { 0.5 }
+                                + if precut { 1.0 } else { 0.0 },
+                        }
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn calibration_matches_each_copy_and_csv_cut_command_at_every_resolution() {
+        for (model, head) in [("PT-P750W", 180), ("PT-9700PC", 360)] {
+            let quality_profile = ptouch_core::quality::QualityProfile::for_model(model, head);
+            for mode in quality_profile.modes {
+                let quality = match mode.quality {
+                    PrintQuality::Standard => Quality::Standard,
+                    PrintQuality::HighRes => Quality::High,
+                    PrintQuality::Draft => Quality::Draft,
+                };
+                for (network, flags) in [
+                    (false, vec![]),
+                    (false, vec!["--cut-each"]),
+                    (false, vec!["--chain"]),
+                    (false, vec!["--precut"]),
+                    (true, vec![]),
+                ] {
+                    let mut args = batch_args(&flags);
+                    args.copies = 3;
+                    apply_profile_preferences(
+                        &mut args,
+                        &calibrated_profile(quality, network),
+                        false,
+                    );
+                    let mut printer = RecordingPrinter {
+                        network,
+                        model: Some(model),
+                        head_dpi: Some(head),
+                        ..Default::default()
+                    };
+                    let mut bitmap = LabelBitmap::new(80, 16);
+                    bitmap.set_pixel(30, 5, true);
+                    emit_batch(
+                        [Ok(bitmap.clone()), Ok(bitmap.clone())].into_iter(),
+                        &args,
+                        128,
+                        Some(&mut printer),
+                    )
+                    .unwrap();
+                    assert_eq!(printer.rasters.len(), 6);
+                    for (index, raster) in printer.rasters.iter().enumerate() {
+                        let expected_cut = !args.chain && (network || args.cut_each || index == 5);
+                        assert_eq!(raster.final_cut, expected_cut);
+                        assert_eq!(raster.precut, network || args.precut);
+                        assert_eq!(raster.resolution, mode.resolution);
+                        let offset = if expected_cut { 1.0 } else { 0.5 }
+                            + if raster.precut { 1.0 } else { 0.0 };
+                        let expected = ptouch_render::calibration::apply_calibration(
+                            &bitmap,
+                            mode.resolution.feed_dpi,
+                            Some(offset),
+                        )
+                        .unwrap();
+                        assert_eq!(raster.lines, raster::bitmap_to_raster_lines(&expected, 128));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_overrides_and_invalid_trims_are_resolved_before_submission() {
+        for flags in [vec![], vec!["--no-calibration"], vec!["--offset-mm", "0"]] {
+            let mut args = batch_args(&flags);
+            let mut profile = calibrated_profile(Quality::Standard, false);
+            for rule in &mut profile.calibrations {
+                rule.offset_mm = -100.0;
+            }
+            apply_profile_preferences(&mut args, &profile, false);
+            let mut printer = RecordingPrinter::default();
+            let mut bitmap = LabelBitmap::new(80, 16);
+            bitmap.set_pixel(1, 2, true);
+            let result = print_to_device(&mut printer, &bitmap, 128, &args, true);
+            if flags.is_empty() {
+                assert!(result.is_err());
+                assert_eq!(printer.print_calls, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    printer.rasters[0].lines,
+                    raster::bitmap_to_raster_lines(&bitmap, 128)
+                );
+            }
+        }
+        for flags in [
+            vec!["--no-calibration", "--offset-mm", "1"],
+            vec!["--no-calibration", "--calibration", "file"],
+            vec!["--offset-mm", "1", "--calibration", "file"],
+        ] {
+            let mut argv = vec!["ptouch", "print"];
+            argv.extend(flags);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn saved_calibration_csv_exports_use_each_rows_last_copy_without_changing_layout() {
+        let dir =
+            std::env::temp_dir().join(format!("ptouch-profile-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profiles = dir.join("profiles");
+        let profile = calibrated_profile(Quality::Standard, false);
+        let mut store = ProfileStore::load(&profiles).unwrap();
+        store.add(profile, None).unwrap();
+        for dpi in [180, 360] {
+            let doc = free_layout_fixture(&dir, dpi);
+            let encoded = doc.to_toml_string().unwrap();
+            let layout = dir.join("source.ptl");
+            let csv = dir.join("data.csv");
+            let output = dir.join("row-{n}.png");
+            std::fs::write(&layout, &encoded).unwrap();
+            std::fs::write(&csv, "port,suffix\nLAN,A\nLAN,A\n").unwrap();
+            let mut args = batch_args(&[
+                "--printer",
+                "desk",
+                "--layout",
+                layout.to_str().unwrap(),
+                "--csv",
+                csv.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--copies",
+                "3",
+            ]);
+            let resolved = resolve_profile(&mut args.target, false, &profiles)
+                .unwrap()
+                .unwrap();
+            apply_profile_preferences(&mut args, &resolved, false);
+            execute_print(&args, &[]).unwrap();
+            let mut filled = doc.clone();
+            filled.apply_values(&BTreeMap::from([
+                ("port".into(), "LAN".into()),
+                ("suffix".into(), "A".into()),
+            ]));
+            let bitmap = render_layout(&filled, if dpi == 180 { 76 } else { 150 }, dpi).unwrap();
+            for (row, offset) in [(1, 0.5), (2, 1.0)] {
+                let expected =
+                    ptouch_render::calibration::apply_calibration(&bitmap, dpi, Some(offset))
+                        .unwrap();
+                let actual = load_export(&dir.join(format!("row-{row}.png")));
+                assert_eq!(
+                    (actual.width(), actual.height(), actual.data()),
+                    (expected.width(), expected.height(), expected.data())
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&layout).unwrap(), encoded);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_and_explicit_cut_batches_cut_every_copy_without_retries() {
+        for network in [false, true] {
+            let mut printer = RecordingPrinter {
+                network,
+                ..Default::default()
+            };
+            let args = if network {
+                batch_args(&["--copies", "3"])
+            } else {
+                batch_args(&["--copies", "3", "--cut-each"])
+            };
+            emit_batch(blank_labels(2), &args, 128, Some(&mut printer)).unwrap();
+            assert_eq!(*printer.commands.borrow(), vec![0x1a; 6]);
+        }
+    }
+
+    #[test]
     fn diagnostic_and_usb_selection_options_are_validated() {
         assert!(matches!(
             Cli::try_parse_from(["ptouch", "doctor", "--json", "--probe"])
@@ -2100,13 +2963,38 @@ mod tests {
     struct RecordingPrinter {
         commands: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
         bluetooth: bool,
+        network: bool,
         print_calls: usize,
         fail_print_at: Option<usize>,
+        model: Option<&'static str>,
+        head_dpi: Option<u16>,
+        rasters: Vec<RecordedRaster>,
+    }
+
+    struct RecordedRaster {
+        lines: Vec<Vec<u8>>,
+        resolution: ptouch_core::PrintResolution,
+        precut: bool,
+        final_cut: bool,
     }
 
     impl PrintDevice for RecordingPrinter {
+        fn is_network(&self) -> bool {
+            self.network
+        }
+        fn resolution(
+            &self,
+            quality: PrintQuality,
+        ) -> Result<ptouch_core::PrintResolution, PtouchError> {
+            Ok(ptouch_core::quality::QualityProfile::for_model(
+                self.model.unwrap_or("PT-P700"),
+                self.dpi(),
+            )
+            .mode(quality)?
+            .resolution)
+        }
         fn dpi(&self) -> u16 {
-            180
+            self.head_dpi.unwrap_or(180)
         }
 
         fn is_bluetooth(&self) -> bool {
@@ -2116,6 +3004,7 @@ mod tests {
         fn print_raster(
             &mut self,
             lines: &[Vec<u8>],
+            resolution: ptouch_core::PrintResolution,
             chain_print: bool,
             precut: bool,
             quality: PrintQuality,
@@ -2130,7 +3019,22 @@ mod tests {
                 precut,
                 quality,
             };
-            let job = ptouch_core::protocol::build_print_job(lines, DeviceFlags::NONE, &opts);
+            let job = ptouch_core::protocol::build_print_job(
+                lines,
+                resolution,
+                DeviceFlags::NONE,
+                ptouch_core::quality::QualityProfile::for_model(
+                    self.model.unwrap_or("PT-P700"),
+                    self.dpi(),
+                ),
+                &opts,
+            )?;
+            self.rasters.push(RecordedRaster {
+                lines: lines.to_vec(),
+                resolution,
+                precut,
+                final_cut: !chain_print,
+            });
             self.commands.borrow_mut().push(job.last().unwrap()[0]);
             Ok(())
         }

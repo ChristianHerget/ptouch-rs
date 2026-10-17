@@ -64,6 +64,10 @@ pub struct UsbDiagnostic {
 /// Windows PnP evidence collected independently of libusb accessibility.
 #[derive(Debug, Serialize)]
 pub struct DriverBinding {
+    /// The USB bus supplied a globally unique instance ID (hardware serial).
+    pub unique_id: bool,
+    /// Failure to read serial identity capabilities, independent of other diagnostics.
+    pub identity_error: Option<String>,
     /// Device instance ID. This can include a serial number.
     pub instance_id: String,
     /// Hardware IDs used by Windows driver matching.

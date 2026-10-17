@@ -12,6 +12,7 @@ const RULER_HEIGHT: f32 = 30.0;
 const RULER_WIDTH: f32 = 52.0;
 const ROTATE_RADIUS: f32 = 6.0;
 const HANDLE_MARGIN: f32 = 24.0;
+const TAPE_DIMENSION_WIDTH: f32 = 100.0;
 
 #[derive(Clone)]
 struct RotationDrag {
@@ -30,6 +31,7 @@ struct ContentDrag {
 #[derive(Clone)]
 struct CanvasDrag {
     before: Option<ptouch_render::document::LabelDocument>,
+    history_before: Option<crate::editor::ContentSnapshot>,
     reorder: Option<ReorderDrag>,
     gap: bool,
     scroll_offset: egui::Vec2,
@@ -56,11 +58,29 @@ struct ReorderDrag {
 }
 
 /// Render and edit at the original raster scale, independent of GPU downsampling.
-pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
+pub fn show_canvas(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+) -> Option<crate::preview::PreviewGeometry> {
+    if !state.is_free_layout() {
+        return super::legacy_canvas::show_canvas(ui, state);
+    }
+    show_free_canvas(ui, state);
+    None
+}
+
+fn show_free_canvas(ui: &mut egui::Ui, state: &mut AppState) {
+    let before = state.content_snapshot();
+    let mut action = None;
+    let mut completed = None;
+    let mut cancelled = false;
     let drag_id = ui.id().with("object_drag");
     let snap_id = ui.id().with("snap_mm");
     let press_id = ui.id().with("canvas_press");
     let menu_id = ui.id().with("canvas_menu_target");
+    let gesture_active = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<CanvasDrag>(drag_id).is_some());
     let previous_hover = state.canvas_hover_target;
     let previous_drag = state.canvas_drag_target;
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -68,10 +88,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             .ctx()
             .data_mut(|data| data.get_temp::<CanvasDrag>(drag_id));
         if let Some(active) = active
-            && let Some(before) = active.before
+            && let Some(before) = active.history_before
         {
-            state.restore_document(before);
-            state.selected_element = Some(active.element);
+            before.restore(state);
+            cancelled = true;
         }
         ui.ctx().data_mut(|data| {
             data.remove::<CanvasDrag>(drag_id);
@@ -83,23 +103,27 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let mut snap = ui
         .ctx()
         .data_mut(|data| data.get_temp::<bool>(snap_id).unwrap_or(true));
-    ui.horizontal(|ui| {
-        if ui.button("Fit").clicked() {
-            state.zoom_fit = true;
-        }
-        if ui.button("1:1").clicked() {
-            state.zoom = 1.0;
-            state.zoom_fit = false;
-        }
-        if ui.button("+").clicked() {
-            state.zoom = (state.zoom * 1.25).min(20.0);
-            state.zoom_fit = false;
+    use crate::preview::{DisplayScale, ZoomMode};
+    let mut step = 1.0;
+    ui.horizontal_wrapped(|ui| {
+        for (label, mode) in [
+            ("Fit", ZoomMode::Fit),
+            ("Actual size", ZoomMode::ActualSize),
+            ("Pixels", ZoomMode::Pixels),
+        ] {
+            if ui
+                .selectable_label(state.view.zoom == mode, label)
+                .clicked()
+            {
+                state.view.select(mode);
+            }
         }
         if ui.button("−").clicked() {
-            state.zoom = (state.zoom / 1.25).max(0.001);
-            state.zoom_fit = false;
+            step /= 1.25;
         }
-        ui.label(format!("Zoom: {:.0}%", state.zoom * 100.0));
+        if ui.button("+").clicked() {
+            step *= 1.25;
+        }
         ui.checkbox(&mut snap, "Snap 0.1 mm");
     });
     ui.ctx().data_mut(|data| data.insert_temp(snap_id, snap));
@@ -128,7 +152,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     ui.separator();
 
     let canvas_size = ui.available_size();
-    let (Some(texture), Some(bitmap)) = (&state.preview_texture, &state.preview_bitmap) else {
+    let Some(preview) = state.preview.as_ref() else {
         ui.ctx().data_mut(|data| {
             data.remove::<CanvasDrag>(drag_id);
             data.remove::<CanvasPress>(press_id);
@@ -137,43 +161,66 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         if previous_hover.is_some() || previous_drag.is_some() {
             ui.ctx().request_repaint();
         }
-        let (rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click());
+        state.editor.surface(&response);
+        let menu = crate::editor::context_menu(&response, state, None);
+        if let Some(action) = menu.action {
+            crate::editor::apply_action(ui.ctx(), state, action);
+        }
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_gray(200));
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Add elements to preview",
+            "Add objects to preview",
             egui::FontId::proportional(18.0),
             egui::Color32::from_gray(100),
         );
         return;
     };
-    let printable_size = egui::vec2(bitmap.width() as f32, bitmap.height() as f32);
-    let physical_mm = if state.tape_width_mm == 4 {
-        3.5
-    } else {
-        f32::from(state.tape_width_mm)
-    };
-    let physical_height =
-        (physical_mm * f32::from(state.target_dpi()) / 25.4).max(printable_size.y);
-    let original_size = egui::vec2(printable_size.x, physical_height);
-    // Selecting an item can widen the properties panel before drag detection.
-    // Keep the press geometry stable until release, including that first frame.
-    if state.zoom_fit
-        && !ui
-            .ctx()
-            .data_mut(|data| data.get_temp::<CanvasPress>(press_id).is_some())
-    {
-        state.zoom = fit_zoom(original_size, canvas_size);
+    let original_size = preview.tape_size(state.tape_width_mm);
+    let feed_pixel_width = preview.feed_pixel_width();
+    let display = DisplayScale::from_context(ui.ctx());
+    let actual = display.actual_head_scale(preview.resolution);
+    let press_active = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<CanvasPress>(press_id).is_some());
+    state.canvas_scale = match state.view.zoom {
+        ZoomMode::Fit if !press_active => fit_zoom(original_size, canvas_size),
+        ZoomMode::Fit => state.canvas_scale,
+        ZoomMode::ActualSize => actual,
+        ZoomMode::Pixels => {
+            f32::from(preview.resolution.head_dpi.max(preview.resolution.feed_dpi))
+                / (f32::from(preview.resolution.head_dpi) * display.pixels_per_point)
+        }
+        ZoomMode::Custom(factor) => actual * factor,
     }
-    let display_size = original_size * state.zoom;
+    .max(f32::EPSILON);
+    if step != 1.0 {
+        state.canvas_scale = (state.canvas_scale * step).clamp(0.0001, 10000.0);
+        state.view.zoom = ZoomMode::Custom(state.canvas_scale / actual);
+    }
+    let display_size = original_size * state.canvas_scale;
+    let tiles: Vec<_> = preview
+        .tiles
+        .iter()
+        .map(|tile| {
+            (
+                tile.texture.id(),
+                egui::vec2(
+                    tile.origin[0] as f32 * feed_pixel_width,
+                    tile.origin[1] as f32,
+                ),
+                tile.texture.size_vec2() * egui::vec2(feed_pixel_width, 1.0),
+            )
+        })
+        .collect();
     let viewport_size = canvas_size - egui::vec2(RULER_WIDTH, RULER_HEIGHT);
     let content_size = egui::vec2(
-        (display_size.x + PADDING * 2.0 + HANDLE_MARGIN).max(viewport_size.x - 12.0),
+        (display_size.x + PADDING * 2.0 + HANDLE_MARGIN + TAPE_DIMENSION_WIDTH)
+            .max(viewport_size.x - 12.0),
         (display_size.y + PADDING * 2.0).max(viewport_size.y - 12.0),
     );
-    let texture_id = texture.id();
     let dpi = state.target_dpi();
     let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
     ui.painter()
@@ -201,28 +248,45 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(200));
             // A stable left/top origin prevents auto-length changes from moving
             // the canvas under the pointer during a drag.
-            let tape_rect =
-                egui::Rect::from_min_size(rect.min + egui::vec2(PADDING, PADDING), display_size);
-            let margin = (physical_height - printable_size.y) * state.zoom / 2.0;
-            let label_rect = egui::Rect::from_min_size(
-                tape_rect.min + egui::vec2(0.0, margin),
-                printable_size * state.zoom,
+            let tape_geometry = crate::preview::TapeGeometry::new(
+                state.preview.as_ref().unwrap(),
+                state.tape_width_mm,
+                rect.min + egui::vec2(PADDING, PADDING),
+                state.canvas_scale,
             );
-            ruler_label = Some((tape_rect, label_rect));
-            painter.rect_filled(tape_rect, 0.0, egui::Color32::from_gray(110));
-            painter.rect_filled(label_rect, 0.0, egui::Color32::WHITE);
-            painter.image(
-                texture_id,
-                label_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            painter.rect_stroke(
-                label_rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(128)),
-                egui::StrokeKind::Outside,
-            );
+            let label_rect = tape_geometry.print;
+            ruler_label = Some((tape_geometry.tape, label_rect));
+            tape_geometry.paint_background(painter);
+            let pixel_scale = state.canvas_scale;
+            for (id, origin, size) in &tiles {
+                let tile_rect = egui::Rect::from_min_size(
+                    label_rect.min + *origin * pixel_scale,
+                    *size * pixel_scale,
+                );
+                if tile_rect.intersects(painter.clip_rect()) {
+                    painter
+                        .with_clip_rect(painter.clip_rect().intersect(label_rect))
+                        .image(
+                            *id,
+                            tile_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                }
+            }
+            state.editor.surface(&response);
+            if response.clicked() || response.secondary_clicked() {
+                response.request_focus();
+            }
+            let panning = ui.input(|i| {
+                i.key_down(egui::Key::Space) && i.pointer.primary_down()
+                    || i.pointer.button_down(egui::PointerButton::Middle)
+            });
+            if response.contains_pointer() && panning {
+                ui.scroll_with_delta(ui.input(|i| i.pointer.delta()));
+            }
+            tape_geometry.paint_outline(painter);
+            draw_tape_dimension(painter, tape_geometry.tape, state.tape_width_mm);
             let geometry: Vec<_> = state
                 .preview_bounds
                 .iter()
@@ -256,7 +320,8 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     _ => None,
                 })
             });
-            if let Some(start) = raw_press
+            if !panning
+                && let Some(start) = raw_press
                 && response.rect.contains(start)
                 && painter.clip_rect().contains(start)
                 && ui.ctx().layer_id_at(start) == Some(ui.layer_id())
@@ -276,6 +341,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     };
                     Some(CanvasDrag {
                         before: Some(state.document()),
+                        history_before: Some(before.clone()),
                         gap: hit.action == CanvasAction::Gap,
                         scroll_offset: viewport_rect.min - rect.min,
                         reorder: if !content_edit && hit.action == CanvasAction::Move {
@@ -301,7 +367,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         left_mm: state
                             .element_rect_mm(index)
                             .map_or(object.frame.x_mm, |r| r.0),
-                        pixels_per_mm: f64::from(dpi) / 25.4 * f64::from(state.zoom),
+                        pixels_per_mm: f64::from(dpi) / 25.4 * f64::from(state.canvas_scale),
                         resize: hit.action == CanvasAction::Resize,
                         pointer_moved: false,
                         flip_h: state.overall_flip_h ^ (content_edit && object.flip_h),
@@ -389,8 +455,35 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         }));
                         ui.close();
                     }
+                    if ui.button("Duplicate").clicked() {
+                        action = Some(crate::editor::EditorAction::Duplicate(target.element));
+                        ui.close();
+                    }
+                    if ui.button("Delete").clicked() {
+                        action = Some(crate::editor::EditorAction::Delete(target.element));
+                        ui.close();
+                    }
                 } else {
-                    ui.weak("No object here");
+                    if ui
+                        .add_enabled(
+                            state.editor.history.undo_name().is_some(),
+                            egui::Button::new("Undo"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(crate::editor::EditorAction::Undo);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            state.editor.history.redo_name().is_some(),
+                            egui::Button::new("Redo"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(crate::editor::EditorAction::Redo);
+                        ui.close();
+                    }
                 }
             });
             let raw_release = ui.input(|i| {
@@ -424,7 +517,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 && let Some(drag) = press.drag
             {
                 state.canvas_drag_target = press.target;
-                state.zoom_fit = false;
+                state.view.zoom = ZoomMode::Custom(state.canvas_scale / actual);
                 ui.ctx().data_mut(|data| data.insert_temp(drag_id, drag));
             }
             let active_press = ui
@@ -507,7 +600,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         state.elements = before.elements.clone();
                         state.selected_element = Some(drag.element);
                         if to != drag.element {
-                            state.reorder_object(drag.element, to);
+                            state.reorder_object_unrecorded(drag.element, to);
                         } else {
                             state.mark_dirty();
                         }
@@ -637,7 +730,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                                 && frame.position == PositionMode::Absolute
                             {
                                 state.status_message =
-                                    "Moved before the previous slot; using absolute position"
+                                    "Moved before the previous frame; using absolute position"
                                         .into();
                             }
                             object.frame = frame;
@@ -714,6 +807,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.ctx().data_mut(|data| data.insert_temp(drag_id, drag));
             }
             if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                completed = ui
+                    .ctx()
+                    .data_mut(|data| data.get_temp::<CanvasDrag>(drag_id))
+                    .and_then(|drag| drag.history_before);
                 ui.ctx().data_mut(|data| {
                     data.remove::<CanvasDrag>(drag_id);
                     data.remove::<CanvasPress>(press_id);
@@ -729,7 +826,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             tape,
             label,
             dpi,
-            state.zoom,
+            state.canvas_scale,
         );
         // The scale and the tape share the same physical band boundaries.
         let y_clip = egui::Rect::from_min_max(
@@ -752,6 +849,15 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     }
     if can_drag {
         keyboard_move(ui, state, dpi);
+    }
+    // Commit only on release. Esc and a drag back to its origin leave redo intact.
+    if let Some(before) = completed {
+        state.record_content(before, "Transform object", None, ui.input(|i| i.time));
+    } else if !gesture_active && state.canvas_drag_target.is_none() && !cancelled {
+        state.record_content(before, "Transform object", None, ui.input(|i| i.time));
+    }
+    if let Some(action) = action {
+        crate::editor::apply_action(ui.ctx(), state, action);
     }
 }
 
@@ -793,24 +899,27 @@ fn editing_geometry(
 ) -> Option<CanvasGeometry> {
     let index = bound.element_index;
     let element = state.elements.get(index)?;
-    let mut slot = screen_bounds(origin, state.zoom, bound);
+    let feed_pixel_width = state
+        .preview
+        .as_ref()
+        .map_or(1.0, |preview| preview.feed_pixel_width());
+    let mut slot = screen_bounds(origin, state.canvas_scale, bound, feed_pixel_width);
     let mut object = state
         .preview_content_bounds
         .iter()
         .find(|g| g.element_index == index)
         .map(|g| {
             g.corners
-                .map(|p| origin + egui::vec2(p[0], p[1]) * state.zoom)
+                .map(|p| origin + egui::vec2(p[0] * feed_pixel_width, p[1]) * state.canvas_scale)
         });
     if let Some(item) = element.as_object()
         && let Some(content) = &item.content_box
         && let Some((x, y, w, h)) = state.element_rect_mm(index)
     {
         let ppm = f64::from(state.target_dpi()) / 25.4;
-        let tape_width = state
-            .preview_bitmap
-            .as_ref()
-            .map_or(0.0, |b| f64::from(b.width()));
+        let tape_width = state.preview.as_ref().map_or(0.0, |preview| {
+            f64::from(preview.bitmap.width()) * f64::from(feed_pixel_width)
+        });
         let screen = |mut x: f64, mut y: f64| {
             x *= ppm;
             y *= ppm;
@@ -820,7 +929,7 @@ fn editing_geometry(
             if state.overall_flip_v {
                 y = f64::from(state.tape_width_px) - y;
             }
-            origin + egui::vec2(x as f32, y as f32) * state.zoom
+            origin + egui::vec2(x as f32, y as f32) * state.canvas_scale
         };
         slot = egui::Rect::from_two_pos(screen(x, y), screen(x + w, y + h));
         let center = [x + w / 2.0, y + h / 2.0];
@@ -1200,6 +1309,7 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
         }
         let drag = CanvasDrag {
             before: None,
+            history_before: None,
             gap: false,
             scroll_offset: egui::Vec2::ZERO,
             reorder: None,
@@ -1234,7 +1344,7 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
 fn fit_zoom(original_size: egui::Vec2, canvas_size: egui::Vec2) -> f32 {
     let available = canvas_size
         - egui::vec2(
-            PADDING * 2.0 + RULER_WIDTH + HANDLE_MARGIN + 12.0,
+            PADDING * 2.0 + RULER_WIDTH + HANDLE_MARGIN + TAPE_DIMENSION_WIDTH + 12.0,
             PADDING * 2.0 + RULER_HEIGHT + 12.0,
         );
     (available.x.max(1.0) / original_size.x)
@@ -1242,10 +1352,15 @@ fn fit_zoom(original_size: egui::Vec2, canvas_size: egui::Vec2) -> f32 {
         .clamp(f32::EPSILON, 10.0)
 }
 
-fn screen_bounds(origin: egui::Pos2, zoom: f32, bound: &ElementBounds) -> egui::Rect {
+fn screen_bounds(
+    origin: egui::Pos2,
+    zoom: f32,
+    bound: &ElementBounds,
+    feed_pixel_width: f32,
+) -> egui::Rect {
     egui::Rect::from_min_size(
-        origin + egui::vec2(bound.x as f32, bound.y as f32) * zoom,
-        egui::vec2(bound.width as f32, bound.height as f32) * zoom,
+        origin + egui::vec2(bound.x as f32 * feed_pixel_width, bound.y as f32) * zoom,
+        egui::vec2(bound.width as f32 * feed_pixel_width, bound.height as f32) * zoom,
     )
 }
 
@@ -1397,6 +1512,25 @@ fn ruler_ticks(
         })
         .collect();
     (step, ticks)
+}
+
+fn draw_tape_dimension(painter: &egui::Painter, tape: egui::Rect, width_mm: u8) {
+    let x = tape.right() + HANDLE_MARGIN + 12.0;
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(65));
+    painter.line_segment(
+        [egui::pos2(x, tape.top()), egui::pos2(x, tape.bottom())],
+        stroke,
+    );
+    for y in [tape.top(), tape.bottom()] {
+        painter.line_segment([egui::pos2(x - 4.0, y), egui::pos2(x + 4.0, y)], stroke);
+    }
+    painter.text(
+        egui::pos2(x + 8.0, tape.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{width_mm} mm tape"),
+        egui::FontId::proportional(12.0),
+        stroke.color,
+    );
 }
 
 fn draw_rulers(
@@ -1733,9 +1867,10 @@ mod tests {
             })
             .unwrap();
         let g = &state.preview_content_bounds[0];
+        let feed_pixel_width = state.preview.as_ref().unwrap().feed_pixel_width();
         let quad = g
             .corners
-            .map(|p| paper.min + egui::vec2(p[0], p[1]) * state.zoom);
+            .map(|p| paper.min + egui::vec2(p[0] * feed_pixel_width, p[1]) * state.canvas_scale);
         let center = quad_center(quad);
         let hover = canvas_event(
             &context,
@@ -1808,8 +1943,7 @@ mod tests {
         assert_eq!(state.elements[0].as_object().unwrap().content_box, content);
         assert!(state.elements[0].as_object().unwrap().frame.x_mm > 5.0);
         state.preview_content_bounds.clear();
-        state.preview_bitmap = None;
-        state.preview_texture = None;
+        state.preview = None;
         canvas_event(&context, &mut state, vec![pointer_button(end, false)]);
         assert_eq!(state.canvas_drag_target, None);
         assert_eq!(state.canvas_hover_target, None);
@@ -1861,7 +1995,9 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ui| show_canvas(ui, &mut state),
+                    |ui| {
+                        show_canvas(ui, &mut state);
+                    },
                 );
                 assert_eq!(state.document().to_toml_string().unwrap(), before);
                 assert!(!state.needs_rerender);
@@ -1880,7 +2016,7 @@ mod tests {
     fn pending_press_keeps_fit_scale_when_properties_panel_changes_width() {
         let context = egui::Context::default();
         let mut state = canvas_fixture(&context, false, 0);
-        state.zoom_fit = true;
+        state.view.select(crate::preview::ZoomMode::Fit);
         let output = canvas_event(&context, &mut state, vec![]);
         let quad = selected_quad(&output);
         let start = quad_center(quad);
@@ -1892,7 +2028,7 @@ mod tests {
                 pointer_button(start, true),
             ],
         );
-        let zoom = state.zoom;
+        let zoom = state.canvas_scale;
         let _ = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1901,9 +2037,11 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| show_canvas(ui, &mut state),
+            |ui| {
+                show_canvas(ui, &mut state);
+            },
         );
-        assert_eq!(state.zoom, zoom);
+        assert_eq!(state.canvas_scale, zoom);
     }
 
     #[test]
@@ -1929,6 +2067,7 @@ mod tests {
     fn drag(frame: TextBox, left_mm: f64) -> CanvasDrag {
         CanvasDrag {
             before: None,
+            history_before: None,
             gap: false,
             scroll_offset: egui::Vec2::ZERO,
             reorder: None,
@@ -1965,7 +2104,9 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ui| show_canvas(ui, state),
+            |ui| {
+                show_canvas(ui, state);
+            },
         );
         output.textures_delta.clear();
         output
@@ -1977,32 +2118,34 @@ mod tests {
                 std::cell::RefCell::new(ptouch_render::text::TextRenderer::new());
         }
         let rendered = RENDERER.with(|renderer| {
-            ptouch_render::document::render_document(
+            ptouch_render::document::render_document_at_resolution(
                 &state.document(),
                 state.tape_width_px,
-                state.target_dpi(),
+                state.preview_resolution().unwrap(),
                 &mut renderer.borrow_mut(),
             )
             .unwrap()
         });
         state.preview_bounds = rendered.bounds;
         state.preview_content_bounds = rendered.content_bounds;
-        state.preview_bitmap = rendered.bitmap;
-        let bitmap = state.preview_bitmap.as_ref().unwrap().to_rgba_image();
-        state.preview_texture = Some(context.load_texture(
-            "gesture_fixture",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [bitmap.width() as usize, bitmap.height() as usize],
-                bitmap.as_raw(),
-            ),
-            Default::default(),
-        ));
+        state.preview = rendered.bitmap.map(|bitmap| {
+            let mut preview = crate::preview::RenderedPreview::new(
+                context,
+                bitmap,
+                state.preview_resolution().unwrap(),
+            );
+            preview.element_spans = vec![None; state.elements.len()];
+            for bound in &state.preview_bounds {
+                preview.element_spans[bound.element_index] = Some(bound.x..bound.x + bound.width);
+            }
+            preview
+        });
     }
 
     #[test]
     fn equal_physical_boxes_share_edit_edges_despite_raster_rounding() {
         use ptouch_render::document::{LabelElement, LabelObject};
-        for dpi in [180, 360] {
+        for (dpi, feed) in [(180, 180), (180, 360), (360, 180), (360, 360), (360, 720)] {
             for mirrors in 0..16 {
                 let context = egui::Context::default();
                 let mut object = LabelObject::text(
@@ -2026,11 +2169,24 @@ mod tests {
                 let mut state = AppState {
                     document_version: 4,
                     design_dpi: dpi,
+                    printer_dpi: dpi,
+                    preview_uses_printer: true,
+                    printer_quality: Some(ptouch_core::quality::QualityProfile::for_model(
+                        if dpi == 180 { "PT-P750W" } else { "PT-9700PC" },
+                        dpi,
+                    )),
+                    print_quality: if feed > dpi {
+                        ptouch_core::PrintQuality::HighRes
+                    } else if feed < dpi {
+                        ptouch_core::PrintQuality::Draft
+                    } else {
+                        ptouch_core::PrintQuality::Standard
+                    },
                     tape_width_px: if dpi == 180 { 76 } else { 150 },
                     elements: vec![LabelElement::Object(object)],
                     overall_flip_h: mirrors & 4 != 0,
                     overall_flip_v: mirrors & 8 != 0,
-                    zoom: 6.4,
+                    canvas_scale: 6.4,
                     ..Default::default()
                 };
                 render_fixture(&context, &mut state);
@@ -2103,8 +2259,11 @@ mod tests {
         object.flip_h = mirrors & 1 != 0;
         object.flip_v = mirrors & 2 != 0;
         let mut state = AppState {
-            zoom_fit: false,
-            zoom: 2.0,
+            view: crate::preview::PreviewView {
+                zoom: crate::preview::ZoomMode::Custom(3.75),
+                ..Default::default()
+            },
+            canvas_scale: 2.0,
             overall_flip_h: mirrors & 4 != 0,
             overall_flip_v: mirrors & 8 != 0,
             elements: vec![LabelElement::Object(object)],
@@ -2453,7 +2612,7 @@ mod tests {
                         let (resized, _) =
                             selected_quad_and_circle(&canvas_event(&context, &mut state, vec![]));
                         assert!(
-                            resized[0].distance(quad[0]) < state.zoom * 1.5,
+                            resized[0].distance(quad[0]) < state.canvas_scale * 1.5,
                             "opposite corner moved: {quad:?} -> {resized:?}"
                         );
                     } else {
@@ -2572,9 +2731,15 @@ mod tests {
             let mut state = canvas_fixture(&context, false, 0);
             state.design_dpi = dpi;
             state.preview_content_bounds.clear();
-            state.preview_bitmap = Some(ptouch_render::bitmap::LabelBitmap::new(200, height));
+            state.preview = Some(crate::preview::RenderedPreview::new(
+                &context,
+                ptouch_render::bitmap::LabelBitmap::new(200, height),
+                ptouch_core::PrintResolution::square(dpi),
+            ));
             let output = canvas_event(&context, &mut state, vec![]);
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.job.text == endpoint)));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "12 mm tape")));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(r) if r.fill == egui::Color32::from_gray(225))));
             let scale = f32::from(dpi) / 25.4 * 2.0;
             let (_, ticks) = ruler_ticks(100.0, 400.0, -75.0, 1000.0, scale, 28.0);
             assert!(!ticks.is_empty());
@@ -2626,8 +2791,11 @@ mod tests {
         use ptouch_render::document::{LabelElement, LabelObject};
         let context = egui::Context::default();
         let mut state = AppState {
-            zoom_fit: false,
-            zoom: 2.0,
+            view: crate::preview::PreviewView {
+                zoom: crate::preview::ZoomMode::Custom(3.75),
+                ..Default::default()
+            },
+            canvas_scale: 2.0,
             elements: vec![LabelElement::Object(LabelObject::text(
                 "A",
                 TextBox {
@@ -2636,7 +2804,11 @@ mod tests {
                 },
             ))],
             selected_element: Some(0),
-            preview_bitmap: Some(ptouch_render::bitmap::LabelBitmap::new(200, 76)),
+            preview: Some(crate::preview::RenderedPreview::new(
+                &context,
+                ptouch_render::bitmap::LabelBitmap::new(200, 76),
+                ptouch_core::PrintResolution::square(180),
+            )),
             preview_bounds: vec![ElementBounds {
                 element_index: 0,
                 x: 35,
@@ -2646,11 +2818,7 @@ mod tests {
             }],
             ..AppState::default()
         };
-        state.preview_texture = Some(context.load_texture(
-            "test_canvas",
-            egui::ColorImage::filled([200, 76], egui::Color32::WHITE),
-            Default::default(),
-        ));
+
         let blank = egui::pos2(500.0, 400.0);
         for events in [
             vec![],
@@ -2686,7 +2854,9 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| show_canvas(ui, &mut state),
+                |ui| {
+                    show_canvas(ui, &mut state);
+                },
             );
             output.textures_delta.clear();
         }
@@ -2749,10 +2919,149 @@ mod tests {
             width: 142,
             height: 100,
         };
-        let rect = screen_bounds(egui::Pos2::ZERO, zoom, &bound);
+        let rect = screen_bounds(egui::Pos2::ZERO, zoom, &bound, 1.0);
         assert!((rect.min.x - 709.0 * zoom).abs() < 0.001);
         let measured_mm = rect.min.x / zoom * 25.4 / 180.0;
         assert!((measured_mm - 100.05).abs() < 0.02);
         assert!(ruler_step(180.0 / 25.4 * zoom) * 180.0 / 25.4 * zoom >= 55.0);
+    }
+    #[test]
+    fn v7_cancelled_and_returned_drags_preserve_redo_at_every_resolution() {
+        use crate::editor::EditorAction;
+        use ptouch_core::{PrintQuality, quality::QualityProfile};
+        use ptouch_render::object_layout::{LayoutOptions, WidthSizing};
+        for (model, head, quality) in [
+            ("PT-P750W", 180, PrintQuality::Standard),
+            ("PT-P750W", 180, PrintQuality::HighRes),
+            ("PT-9500PC", 360, PrintQuality::Standard),
+            ("PT-9500PC", 360, PrintQuality::HighRes),
+            ("PT-9500PC", 360, PrintQuality::Draft),
+        ] {
+            for escape in [false, true] {
+                let context = egui::Context::default();
+                let mut state = canvas_fixture(&context, true, 0);
+                let object = state.elements[0].as_object_mut().unwrap();
+                object.rotation = 0.0;
+                object.content_box.as_mut().unwrap().offset_y_mm = 0.0;
+                object.layout = Some(LayoutOptions {
+                    width: WidthSizing::Fixed,
+                    ..Default::default()
+                });
+                state.printer_connected = true;
+                state.printer_dpi = head;
+                state.tape_width_px = if head == 180 { 76 } else { 150 };
+                state.printer_quality = Some(QualityProfile::for_model(model, head));
+                state.print_quality = quality;
+                state.resolve_layout().unwrap();
+                let before = state.content_snapshot();
+                state.font_margin += 1;
+                state.record_content(before, "Font margin", None, 0.0);
+                let redo = state.document();
+                assert!(state.apply_editor_action(EditorAction::Undo));
+                let original = state.document();
+                render_fixture(&context, &mut state);
+                let output = canvas_event(&context, &mut state, vec![]);
+                let start = quad_center(selected_quad(&output));
+                canvas_event(
+                    &context,
+                    &mut state,
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        pointer_button(start, true),
+                    ],
+                );
+                canvas_event(
+                    &context,
+                    &mut state,
+                    vec![egui::Event::PointerMoved(start + egui::vec2(40.0, 0.0))],
+                );
+                assert_ne!(state.document(), original);
+                assert_eq!(state.editor.history.redo_name(), Some("Font margin"));
+                render_fixture(&context, &mut state);
+                if escape {
+                    canvas_event(
+                        &context,
+                        &mut state,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                } else {
+                    canvas_event(&context, &mut state, vec![egui::Event::PointerMoved(start)]);
+                }
+                canvas_event(&context, &mut state, vec![pointer_button(start, false)]);
+                assert_eq!(state.document(), original);
+                assert!(state.editor.history.undo_name().is_none());
+                assert!(state.apply_editor_action(EditorAction::Redo));
+                assert_eq!(state.document(), redo);
+            }
+        }
+    }
+
+    #[test]
+    fn non_square_canvas_drag_is_one_undo_step_through_release() {
+        use crate::editor::EditorAction;
+        use ptouch_core::{PrintQuality, quality::QualityProfile};
+        for (model, head, quality) in [
+            ("PT-P750W", 180, PrintQuality::HighRes),
+            ("PT-9500PC", 360, PrintQuality::HighRes),
+            ("PT-9500PC", 360, PrintQuality::Draft),
+        ] {
+            let context = egui::Context::default();
+            let mut state = canvas_fixture(&context, true, 0);
+            state.printer_connected = true;
+            state.printer_dpi = head;
+            state.tape_width_px = if head == 180 { 76 } else { 150 };
+            state.printer_quality = Some(QualityProfile::for_model(model, head));
+            state.print_quality = quality;
+            render_fixture(&context, &mut state);
+            let before = state.document().to_toml_string().unwrap();
+            let output = canvas_event(&context, &mut state, vec![]);
+            let start = quad_center(selected_quad(&output));
+            canvas_event(
+                &context,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, true),
+                ],
+            );
+            for dx in [15.0, 30.0] {
+                canvas_event(
+                    &context,
+                    &mut state,
+                    vec![egui::Event::PointerMoved(start + egui::vec2(dx, 0.0))],
+                );
+                render_fixture(&context, &mut state);
+            }
+            // Release at a new position, rather than the last sampled move.
+            let end = start + egui::vec2(40.0, 0.0);
+            canvas_event(
+                &context,
+                &mut state,
+                vec![egui::Event::PointerMoved(end), pointer_button(end, false)],
+            );
+            let after = state.document().to_toml_string().unwrap();
+            assert_ne!(before, after);
+            assert!(state.apply_editor_action(EditorAction::Undo));
+            assert_eq!(state.document().to_toml_string().unwrap(), before);
+            assert!(!state.apply_editor_action(EditorAction::Undo));
+            assert!(state.apply_editor_action(EditorAction::Redo));
+            assert_eq!(state.document().to_toml_string().unwrap(), after);
+            assert!(
+                state.elements[0]
+                    .as_object()
+                    .unwrap()
+                    .content_box
+                    .as_ref()
+                    .unwrap()
+                    .offset_x_mm
+                    > 0.0
+            );
+        }
     }
 }

@@ -5,8 +5,8 @@
 
 use std::sync::mpsc;
 
+use crate::preview::RenderedPreview;
 use ptouch_core::protocol::PrintQuality;
-use ptouch_render::bitmap::LabelBitmap;
 use ptouch_render::document::{
     ContentBox, ContentGeometry, DEFAULT_DOCUMENT_VERSION, ElementBounds, LabelDocument,
     LabelObject, ObjectContent, PositionMode, TextBox,
@@ -30,9 +30,20 @@ pub struct CanvasTarget {
     pub edit: CanvasEditTarget,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CalibrationMode {
+    #[default]
+    Profile,
+    Disabled,
+    Custom,
+}
+
 /// Printer connection selected in the GUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PrinterTarget {
+    Unavailable(String),
+    Profile(ptouch_profiles::PrinterProfile),
+    TemporaryProfile(ptouch_profiles::PrinterProfile),
     Usb,
     UsbAt(ptouch_core::transport::UsbLocation),
     #[cfg(windows)]
@@ -47,8 +58,18 @@ pub enum PrinterTarget {
 }
 
 impl PrinterTarget {
+    pub fn profile(&self) -> Option<&ptouch_profiles::PrinterProfile> {
+        match self {
+            Self::Profile(p) | Self::TemporaryProfile(p) => Some(p),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
+            Self::Unavailable(_) => "Profile configuration error".into(),
+            Self::Profile(p) => format!("{} ({})", p.alias, p.model),
+            Self::TemporaryProfile(p) => format!("{} ({}, temporary)", p.alias, p.model),
             Self::Usb => "USB (automatic)".to_string(),
             Self::UsbAt(location) => format!("USB {location}"),
             #[cfg(windows)]
@@ -65,9 +86,18 @@ impl PrinterTarget {
         }
     }
 
+    pub fn is_network(&self) -> bool {
+        self.profile()
+            .is_some_and(|p| matches!(p.connection, ptouch_profiles::Connection::Network { .. }))
+    }
+
     pub fn is_bluetooth(&self) -> bool {
         match self {
-            Self::Usb | Self::UsbAt(_) => false,
+            Self::Unavailable(_)
+            | Self::Profile(_)
+            | Self::TemporaryProfile(_)
+            | Self::Usb
+            | Self::UsbAt(_) => false,
             #[cfg(windows)]
             Self::UsbPrint { .. } => false,
             #[cfg(any(target_os = "macos", test))]
@@ -76,31 +106,49 @@ impl PrinterTarget {
     }
 }
 
+/// A selection revision makes delayed responses stale even after A → B → A.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrinterSelection {
+    pub target: PrinterTarget,
+    pub generation: u64,
+}
+impl std::ops::Deref for PrinterSelection {
+    type Target = PrinterTarget;
+    fn deref(&self) -> &PrinterTarget {
+        &self.target
+    }
+}
+
 /// Commands sent from the UI thread to the printer worker.
 pub enum PrinterCommand {
     /// Find paired Bluetooth printers supported by this application.
     DiscoverBluetooth,
+    DiscoverUsbProfiles,
     /// Poll for a connected printer (query status only, no init).
-    Poll(PrinterTarget),
+    Poll(PrinterSelection),
     /// Print raster data.
     Print {
         raster_lines: Vec<Vec<u8>>,
+        resolution: ptouch_core::PrintResolution,
+        expected_media: (u8, u8),
+        job_timeout_secs: u32,
         chain_print: bool,
         auto_cut: bool,
+        precut: bool,
         quality: PrintQuality,
-        target: PrinterTarget,
+        target: PrinterSelection,
         cancellation: ptouch_core::CancellationToken,
     },
     /// Feed tape forward and cut.
     FeedAndCut {
-        target: PrinterTarget,
+        target: PrinterSelection,
         cancellation: ptouch_core::CancellationToken,
     },
 }
 
 /// A worker response and the printer it belongs to. Discovery is global.
 pub struct PrinterEvent {
-    pub target: Option<PrinterTarget>,
+    pub target: Option<PrinterSelection>,
     pub response: PrinterResponse,
 }
 
@@ -110,6 +158,7 @@ pub enum PrinterResponse {
     BluetoothDevices(Vec<PrinterTarget>),
     /// Detected USB locations for explicit selection.
     UsbDevices(Vec<PrinterTarget>),
+    UsbProfiles(Result<Vec<ptouch_core::usb_profiles::UsbCandidate>, String>),
     /// A printer was found and its status queried.
     Connected {
         model_name: String,
@@ -117,13 +166,15 @@ pub enum PrinterResponse {
         media_type: String,
         max_px: u16,
         dpi: u16,
-        quality_modes: bool,
+        media_code: u8,
+        band_left: Option<u16>,
         tape_width_px: u16,
     },
     /// No printer found or previously connected printer lost.
     ConnectionError(String),
     /// Print job completed successfully.
     PrintDone,
+    SubmittedUnconfirmed,
     /// Feed and cut completed successfully.
     FeedAndCutDone,
     /// An operation failed.
@@ -132,8 +183,15 @@ pub enum PrinterResponse {
 
 /// Central application state shared across all panels.
 pub struct AppState {
-    pub history: crate::history::DocumentHistory,
-    pub edit_revision: u64,
+    /// Editing-only startup: no worker or printer connection attempts.
+    pub offline: bool,
+    pub editor: crate::editor::Editor,
+    pub symbol_picker: crate::symbols::SymbolPicker,
+    pub profiles: crate::profile_ui::ProfilesUi,
+    pub printer_model_id: String,
+    pub media_code: u8,
+    pub job_timeout_secs: u32,
+    pub band_left: Option<u16>,
     /// Preserve an opened legacy format until the user explicitly converts it.
     pub document_version: u32,
     /// List of label elements in composition order.
@@ -142,7 +200,7 @@ pub struct AppState {
     pub selected_element: Option<usize>,
     /// Isolate unfinished widget drafts across selections and structural edits.
     pub selection_revision: u64,
-    /// Invalidate per-index rich editor histories on structural changes.
+    /// Isolate per-index rich editor sessions across structural changes.
     pub editor_generation: u64,
     /// Current tape width in millimeters.
     pub tape_width_mm: u8,
@@ -162,10 +220,8 @@ pub struct AppState {
     pub overall_flip_v: bool,
     /// Cached list of available system font family names.
     pub available_fonts: Vec<String>,
-    /// The rendered preview bitmap (1-bit).
-    pub preview_bitmap: Option<LabelBitmap>,
-    /// The preview texture uploaded to the GPU.
-    pub preview_texture: Option<egui::TextureHandle>,
+    /// Print pixels, their resolution, and display textures from one render.
+    pub preview: Option<RenderedPreview>,
     /// Bounds in original print pixels, independent of preview downsampling.
     pub preview_bounds: Vec<ElementBounds>,
     /// Oriented object geometry in original print pixels, after all mirrors.
@@ -176,10 +232,11 @@ pub struct AppState {
     pub preview_diagnostics: Vec<String>,
     /// Flag indicating the preview needs to be re-rendered.
     pub needs_rerender: bool,
-    /// Current zoom level (1.0 = 100%).
-    pub zoom: f32,
-    /// Whether zoom should auto-fit to the canvas.
-    pub zoom_fit: bool,
+    pub view: crate::preview::PreviewView,
+    /// Head-pixel display scale of the latest free-layout canvas.
+    pub canvas_scale: f32,
+    /// Invalidates drag payloads and cached element coordinates after edits.
+    pub document_revision: u64,
     /// Printer connection status message.
     pub printer_status: Option<String>,
     /// Detected printer model name.
@@ -190,17 +247,17 @@ pub struct AppState {
     pub rotation_input: String,
     /// Buffer for font search/filter in properties panel.
     pub font_search: String,
-    /// Calibration is opt-in for each session and never part of a layout.
-    pub calibration_enabled: bool,
+    /// Temporary job override; measured defaults live in printer profiles.
+    pub calibration_mode: CalibrationMode,
     pub calibration: ptouch_render::calibration::PrintCalibration,
-    pub calibration_profiles:
-        std::collections::BTreeMap<String, ptouch_render::calibration::PrintCalibration>,
     /// Auto-cut after printing. When false, chain print mode (no cut).
     pub auto_cut: bool,
+    pub precut: bool,
     /// Whether a printer is currently connected (detected by background poll).
     pub printer_connected: bool,
     /// Target selected for polling and printing.
     pub printer_target: PrinterTarget,
+    pub(crate) selection_generation: u64,
     /// Paired PT-P300BT targets discovered on macOS.
     pub bluetooth_targets: Vec<PrinterTarget>,
     /// Whether a printer operation (print, feed & cut) is in progress.
@@ -216,7 +273,7 @@ pub struct AppState {
     /// transient USB glitch.
     pub printer_dpi: u16,
     /// Whether the last connected printer supports print quality modes.
-    pub printer_quality_modes: bool,
+    pub printer_quality: Option<ptouch_core::quality::QualityProfile>,
     /// Selected print quality for the next print job.
     pub print_quality: PrintQuality,
     /// Channel sender for commands to the printer worker thread.
@@ -226,8 +283,14 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            history: Default::default(),
-            edit_revision: 0,
+            offline: false,
+            editor: crate::editor::Editor::default(),
+            symbol_picker: crate::symbols::SymbolPicker::default(),
+            profiles: crate::profile_ui::ProfilesUi::default(),
+            printer_model_id: String::new(),
+            media_code: 0,
+            job_timeout_secs: 600,
+            band_left: None,
             document_version: DEFAULT_DOCUMENT_VERSION,
             elements: Vec::new(),
             selected_element: None,
@@ -242,8 +305,7 @@ impl Default for AppState {
             overall_flip_h: false,
             overall_flip_v: false,
             available_fonts: Vec::new(),
-            preview_bitmap: None,
-            preview_texture: None,
+            preview: None,
             preview_bounds: Vec::new(),
             preview_content_bounds: Vec::new(),
             canvas_edit_target: CanvasEditTarget::default(),
@@ -251,22 +313,24 @@ impl Default for AppState {
             canvas_drag_target: None,
             preview_diagnostics: Vec::new(),
             needs_rerender: true,
-            zoom: 1.0,
-            zoom_fit: true,
+            view: crate::preview::PreviewView::default(),
+            canvas_scale: 1.0,
+            document_revision: 0,
             printer_status: None,
             printer_model: None,
             status_message: "Ready".to_string(),
             rotation_input: String::new(),
             font_search: String::new(),
-            calibration_enabled: false,
+            calibration_mode: CalibrationMode::Profile,
             calibration: ptouch_render::calibration::PrintCalibration {
                 name: "Custom printer".into(),
                 offset_mm: 0.0,
             },
-            calibration_profiles: Default::default(),
             auto_cut: true,
+            precut: true,
             printer_connected: false,
             printer_target: PrinterTarget::Usb,
+            selection_generation: 0,
             bluetooth_targets: Vec::new(),
             operation_in_progress: false,
             cancellation: None,
@@ -274,7 +338,7 @@ impl Default for AppState {
             connecting: false,
             printer_max_px: 0,
             printer_dpi: 180,
-            printer_quality_modes: false,
+            printer_quality: None,
             print_quality: PrintQuality::Standard,
             printer_cmd_tx: None,
         }
@@ -345,7 +409,7 @@ impl AppState {
         free(a) && free(b)
     }
 
-    pub fn swap_positions(&mut self, a: usize, b: usize) -> bool {
+    pub(crate) fn swap_positions_unrecorded(&mut self, a: usize, b: usize) -> bool {
         if !self.can_swap_positions(a, b) {
             self.status_message = "Use sequence reordering for these objects".into();
             return false;
@@ -383,7 +447,7 @@ impl AppState {
             })
     }
 
-    pub fn swap_content(&mut self, a: usize, b: usize) -> bool {
+    pub(crate) fn swap_content_unrecorded(&mut self, a: usize, b: usize) -> bool {
         if !self.can_swap_content(a, b) {
             self.status_message = "Use fixed allocations before swapping template content".into();
             return false;
@@ -420,7 +484,7 @@ impl AppState {
 
     /// Keep the chain anchor at its physical position while content order changes.
     /// Free objects retain coordinates; crossing an anchor never changes bindings.
-    pub fn reorder_object(&mut self, from: usize, to: usize) -> bool {
+    pub(crate) fn reorder_object_unrecorded(&mut self, from: usize, to: usize) -> bool {
         if from == to || from >= self.elements.len() || to >= self.elements.len() {
             return false;
         }
@@ -552,6 +616,48 @@ impl AppState {
         Ok(adjusted_x.abs() > 1e-9 || adjusted_y.abs() > 1e-9)
     }
 
+    pub fn selection(&self) -> PrinterSelection {
+        PrinterSelection {
+            target: self.printer_target.clone(),
+            generation: self.selection_generation,
+        }
+    }
+
+    pub fn select_target(&mut self, target: PrinterTarget) {
+        self.calibration_mode = CalibrationMode::Profile;
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.printer_target = target;
+        self.apply_target_preferences();
+        self.printer_connected = false;
+        self.printer_model = None;
+        self.printer_model_id.clear();
+        self.printer_quality = None;
+        self.band_left = None;
+        self.connecting =
+            !self.offline && !matches!(self.printer_target, PrinterTarget::Unavailable(_));
+        self.printer_status = Some(match &self.printer_target {
+            PrinterTarget::Unavailable(reason) => reason.clone(),
+            _ if self.offline => "Offline mode".into(),
+            _ => "Connecting…".into(),
+        });
+        self.mark_dirty();
+        if let Some(tx) = &self.printer_cmd_tx {
+            let _ = tx.send(PrinterCommand::Poll(self.selection()));
+        }
+    }
+
+    pub fn apply_target_preferences(&mut self) {
+        self.auto_cut = !self.printer_target.is_bluetooth();
+        self.print_quality = PrintQuality::Standard;
+        if let Some(p) = self.printer_target.profile() {
+            self.auto_cut = p.final_cut;
+            self.print_quality = match p.quality {
+                ptouch_profiles::Quality::Standard => PrintQuality::Standard,
+                ptouch_profiles::Quality::High => PrintQuality::HighRes,
+                ptouch_profiles::Quality::Draft => PrintQuality::Draft,
+            };
+        }
+    }
     pub fn selected_canvas_target(&self) -> Option<CanvasTarget> {
         self.selected_element
             .filter(|index| *index < self.elements.len())
@@ -584,7 +690,7 @@ impl AppState {
         if self.selected_canvas_target() != target {
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
-        self.selected_element = target.map(|target| target.element);
+        self.select_element(target.map(|target| target.element));
         if let Some(target) = target {
             self.canvas_edit_target = target.edit;
         }
@@ -657,7 +763,7 @@ impl AppState {
             }
         };
         let action = if !self.is_free_layout() {
-            " Legacy layout: convert to free layout before dragging."
+            " Legacy layout: drag to reorder; convert to free layout to position objects."
         } else if self.overall_flip_h {
             " Turn off label horizontal mirroring to drag."
         } else if phase == "Candidate" {
@@ -758,8 +864,8 @@ impl AppState {
                     .find(|bound| bound.element_index == i)
                     .map(|bound| {
                         let x = if self.overall_flip_h {
-                            self.preview_bitmap.as_ref().map_or(bound.x, |bitmap| {
-                                bitmap.width().saturating_sub(bound.x + bound.width)
+                            self.preview.as_ref().map_or(bound.x, |preview| {
+                                preview.bitmap.width().saturating_sub(bound.x + bound.width)
                             })
                         } else {
                             bound.x
@@ -769,11 +875,15 @@ impl AppState {
                         } else {
                             bound.y
                         };
-                        let mm = 25.4 / f64::from(self.target_dpi());
+                        let resolution = self
+                            .preview_resolution()
+                            .unwrap_or(ptouch_core::PrintResolution::square(self.target_dpi()));
+                        let mm = 25.4 / f64::from(resolution.head_dpi);
+                        let feed_mm = 25.4 / f64::from(resolution.feed_dpi);
                         (
-                            f64::from(x) * mm,
+                            f64::from(x) * feed_mm,
                             f64::from(y) * mm,
-                            f64::from(bound.width) * mm,
+                            f64::from(bound.width) * feed_mm,
                             f64::from(bound.height) * mm,
                         )
                     })
@@ -807,7 +917,7 @@ impl AppState {
         }
     }
 
-    fn add_element(&mut self, mut element: LabelElement) {
+    pub(crate) fn add_element_unrecorded(&mut self, mut element: LabelElement) {
         use ptouch_render::object_layout::{Placement, WidthSizing};
         let insertion = self.selected_element.filter(|i| {
             self.elements
@@ -877,7 +987,7 @@ impl AppState {
     /// Insert sequence copies after the source, reusing their gap. Free copies
     /// append after the furthest right edge and at the end of the element list,
     /// preserving existing coordinates and implicit relative bindings.
-    pub fn duplicate_element(&mut self, index: usize) -> bool {
+    pub(crate) fn duplicate_element_unrecorded(&mut self, index: usize) -> bool {
         let sequence = !self.slot_followers(index).is_empty()
             || self.flow_chain(index).is_some()
             || self
@@ -946,14 +1056,9 @@ impl AppState {
         true
     }
 
-    pub fn duplicate_selected(&mut self) -> bool {
-        self.selected_element
-            .is_some_and(|index| self.duplicate_element(index))
-    }
-
     /// Removing a sequence's first object transfers its anchor to the next
     /// object, rather than binding that object to a preceding independent row.
-    pub fn delete_element(&mut self, index: usize) -> bool {
+    pub(crate) fn delete_element_unrecorded(&mut self, index: usize) -> bool {
         let Some(element) = self.elements.get(index) else {
             return false;
         };
@@ -1073,6 +1178,7 @@ impl AppState {
     /// Conversion is explicit: opening or saving an older label never changes
     /// its flow layout. The shared renderer resolves positions for all callers.
     pub fn convert_to_free_layout(&mut self) -> ptouch_render::Result<()> {
+        let before = self.content_snapshot();
         let mut document = self.document();
         document.convert_to_free_layout(
             self.tape_width_px,
@@ -1081,7 +1187,7 @@ impl AppState {
         )?;
         self.document_version = document.version;
         self.elements = document.elements;
-        self.mark_dirty();
+        self.record_content(before, "Convert to free layout", None, 0.0);
         Ok(())
     }
 
@@ -1106,63 +1212,229 @@ impl AppState {
 
     /// Mark the preview as needing re-render.
     pub fn mark_dirty(&mut self) {
-        self.edit_revision = self.edit_revision.wrapping_add(1);
         self.needs_rerender = true;
+        self.document_revision = self.document_revision.wrapping_add(1);
     }
 
-    pub fn history_step(&mut self, redo: bool) {
-        if let Some(snapshot) = self.history.step(redo) {
-            self.restore_document(snapshot.document);
-            self.selected_element = snapshot.selection;
-            self.status_message = if redo { "Redo" } else { "Undo" }.into();
-        }
+    fn add_element(&mut self, element: LabelElement) {
+        self.apply_editor_action(crate::editor::EditorAction::Add(element));
     }
 
-    pub fn restore_document(&mut self, doc: LabelDocument) {
-        let same_content = self.elements.len() == doc.elements.len()
-            && self.elements.iter().zip(&doc.elements).all(|(a, b)| {
-                match (a.as_object(), b.as_object()) {
-                    (Some(a), Some(b)) => a.content == b.content,
-                    _ => false,
-                }
-            });
-        let generation = self.editor_generation;
-        self.document_version = doc.version;
-        self.elements = doc.elements;
-        self.tape_width_mm = doc.tape_width_mm;
-        self.design_dpi = doc.dpi;
-        self.font_name = doc.font_name;
-        self.font_margin = doc.font_margin;
-        self.overall_flip_h = doc.flip_h;
-        self.overall_flip_v = doc.flip_v;
-        self.update_tape_pixels();
-        self.validate_selection();
-        if same_content {
-            self.editor_generation = generation;
-        }
-        self.canvas_hover_target = None;
-        self.canvas_drag_target = None;
-        self.mark_dirty();
+    #[cfg(test)]
+    pub fn duplicate_element(&mut self, index: usize) -> bool {
+        self.apply_editor_action(crate::editor::EditorAction::Duplicate(index))
     }
 
-    /// Ensure the selected element index is valid.
+    #[cfg(test)]
+    pub fn delete_element(&mut self, index: usize) -> bool {
+        self.apply_editor_action(crate::editor::EditorAction::Delete(index))
+    }
+
+    #[cfg(test)]
+    pub fn reorder_object(&mut self, from: usize, to: usize) -> bool {
+        self.apply_editor_action(crate::editor::EditorAction::Move {
+            from,
+            before: if to > from { to + 1 } else { to },
+        })
+    }
+
+    #[cfg(test)]
+    pub fn swap_positions(&mut self, a: usize, b: usize) -> bool {
+        self.apply_editor_action(crate::editor::EditorAction::SwapPositions(a, b))
+    }
+
+    #[cfg(test)]
+    pub fn swap_content(&mut self, a: usize, b: usize) -> bool {
+        self.apply_editor_action(crate::editor::EditorAction::SwapContent(a, b))
+    }
+
     pub fn validate_selection(&mut self) {
         self.editor_generation = self.editor_generation.wrapping_add(1);
-        self.selection_revision = self.selection_revision.wrapping_add(1);
-        if let Some(idx) = self.selected_element
-            && idx >= self.elements.len()
+        self.select_element(
+            self.selected_element
+                .map(|i| i.min(self.elements.len().saturating_sub(1))),
+        );
+    }
+
+    /// Measure automatic layout in design dots before taking a history snapshot.
+    /// Failed measurements leave the document untouched and invalidate output in the preview pass.
+    pub(crate) fn resolve_layout(&mut self) -> ptouch_render::Result<()> {
+        if !self
+            .elements
+            .iter()
+            .filter_map(LabelElement::as_object)
+            .any(|o| o.layout.is_some())
         {
-            self.selected_element = if self.elements.is_empty() {
-                None
-            } else {
-                Some(self.elements.len() - 1)
-            };
+            return Ok(());
         }
+        let mut doc = self.document();
+        let renderer = self
+            .editor
+            .layout_renderer
+            .get_or_insert_with(TextRenderer::new);
+        ptouch_render::object_layout::resolve(&mut doc, renderer)?;
+        self.elements = doc.elements;
+        self.document_version = doc.version;
+        Ok(())
+    }
+
+    /// Keep the editable angle buffer in sync when selection changes surfaces.
+    pub fn select_element(&mut self, selection: Option<usize>) {
+        if self.selected_element != selection {
+            self.selection_revision = self.selection_revision.wrapping_add(1);
+            self.editor.history.finish_group();
+            self.editor.clear_text_cursor();
+            self.editor.rich_text = None;
+        }
+        self.selected_element = selection.filter(|&index| index < self.elements.len());
+        self.rotation_input = match self.selected_element.map(|index| &self.elements[index]) {
+            Some(
+                LabelElement::Text { rotation, .. }
+                | LabelElement::Image { rotation, .. }
+                | LabelElement::Object(LabelObject { rotation, .. }),
+            ) => rotation.to_string(),
+            _ => String::new(),
+        };
+    }
+
+    pub fn element_drag(&self, ctx: &egui::Context) -> Option<crate::preview::ElementDrag> {
+        let drag = *egui::DragAndDrop::payload::<crate::preview::ElementDrag>(ctx)?;
+        if drag.revision != self.document_revision || drag.index >= self.elements.len() {
+            egui::DragAndDrop::clear_payload(ctx);
+            return None;
+        }
+        Some(drag)
+    }
+
+    pub fn set_print_quality(&mut self, quality: PrintQuality) {
+        if self.print_quality != quality {
+            self.calibration_mode = CalibrationMode::Profile;
+            self.print_quality = quality;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn calibration_offset(&self) -> Option<f64> {
+        match self.calibration_mode {
+            CalibrationMode::Disabled => None,
+            CalibrationMode::Custom => Some(self.calibration.offset_mm),
+            CalibrationMode::Profile => self.printer_target.profile().and_then(|profile| {
+                profile.calibration_offset(
+                    match self.print_quality {
+                        PrintQuality::Standard => ptouch_profiles::Quality::Standard,
+                        PrintQuality::HighRes => ptouch_profiles::Quality::High,
+                        PrintQuality::Draft => ptouch_profiles::Quality::Draft,
+                    },
+                    self.precut && !self.printer_target.is_bluetooth(),
+                    self.auto_cut && !self.printer_target.is_bluetooth(),
+                )
+            }),
+        }
+    }
+
+    pub fn preview_resolution(&self) -> ptouch_core::Result<ptouch_core::PrintResolution> {
+        match self.printer_quality {
+            Some(profile) if self.printer_connected || self.preview_uses_printer => {
+                Ok(profile.mode(self.print_quality)?.resolution)
+            }
+            _ => Ok(ptouch_core::PrintResolution::square(self.target_dpi())),
+        }
+    }
+
+    /// Never print or export a bitmap belonging to an earlier selection.
+    pub fn output_preview(&self) -> Option<&RenderedPreview> {
+        self.preview.as_ref().filter(|preview| {
+            !self.needs_rerender && self.preview_resolution().ok() == Some(preview.resolution)
+        })
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    fn widths(state: &AppState) -> Vec<u32> {
+        state
+            .elements
+            .iter()
+            .map(|element| match element {
+                LabelElement::Padding { pixels } => *pixels,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moves_use_original_list_boundaries_and_retain_selection() {
+        let mut state = AppState {
+            elements: [10, 20, 30, 40]
+                .into_iter()
+                .map(|pixels| LabelElement::Padding { pixels })
+                .collect(),
+            ..Default::default()
+        };
+        state.apply_editor_action(crate::editor::EditorAction::Move { from: 0, before: 4 });
+        assert_eq!(widths(&state), [20, 30, 40, 10]);
+        assert_eq!(state.selected_element, Some(3));
+        assert_eq!(state.document_revision, 1);
+        state.apply_editor_action(crate::editor::EditorAction::Move { from: 3, before: 0 });
+        assert_eq!(widths(&state), [10, 20, 30, 40]);
+        assert_eq!(state.selected_element, Some(0));
+        state.apply_editor_action(crate::editor::EditorAction::Move { from: 1, before: 3 });
+        assert_eq!(widths(&state), [10, 30, 20, 40]);
+        assert_eq!(state.selected_element, Some(2));
+        let revision = state.document_revision;
+        for (from, before) in [(2, 2), (2, 3), (4, 0), (0, 5)] {
+            state.apply_editor_action(crate::editor::EditorAction::Move { from, before });
+        }
+        assert_eq!(state.document_revision, revision);
+        assert_eq!(widths(&state), [10, 30, 20, 40]);
+    }
+
+    #[test]
+    fn selection_updates_properties_without_invalidating_print_pixels() {
+        let mut state = AppState {
+            elements: vec![LabelElement::Text {
+                text_box: None,
+                content: "Angle".into(),
+                font_size: None,
+                align: ptouch_render::text::TextAlign::Left,
+                rotation: 37.5,
+                flip_h: false,
+                flip_v: false,
+            }],
+            ..Default::default()
+        };
+        state.select_element(Some(0));
+        assert_eq!(state.rotation_input, "37.5");
+        assert_eq!(state.document_revision, 0);
+        state.select_element(None);
+        assert!(state.rotation_input.is_empty());
+    }
+
+    #[test]
+    fn editing_invalidates_drag_payloads() {
+        let ctx = egui::Context::default();
+        let mut state = AppState {
+            elements: vec![LabelElement::CutMark],
+            ..Default::default()
+        };
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            crate::preview::ElementDrag {
+                index: 0,
+                revision: state.document_revision,
+            },
+        );
+        assert!(state.element_drag(&ctx).is_some());
+        state.mark_dirty();
+        assert!(state.element_drag(&ctx).is_none());
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
     }
 }
 
 /// Both v2 text boxes and newer objects define physical template slots.
-fn slot_frame(element: &LabelElement) -> Option<&TextBox> {
+pub(crate) fn slot_frame(element: &LabelElement) -> Option<&TextBox> {
     match element {
         LabelElement::Object(object) => Some(&object.frame),
         LabelElement::Text { text_box, .. } => text_box.as_ref(),
@@ -1190,6 +1462,39 @@ fn content_box_for_frame(frame: &TextBox) -> ContentBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_frames_use_ink_sized_defaults_without_stretching_wide_images() {
+        for (dpi, pixels) in [(180, 32), (180, 76), (360, 150)] {
+            let mut state = AppState {
+                design_dpi: dpi,
+                tape_width_px: pixels,
+                ..AppState::default()
+            };
+            state.add_text();
+            let text = state.elements[0].as_object().unwrap();
+            assert_eq!(text.frame.height_mm, state.printable_height_mm() * 0.8);
+            let source = image::GrayImage::from_pixel(2000, 100, image::Luma([0]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            source
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            assert!(state.add_image_bytes(None, bytes.into_inner()));
+            let image = state.elements[1].as_object().unwrap();
+            assert_eq!(image.frame.height_mm, 2.0);
+            assert_eq!(image.frame.y_mm, (state.printable_height_mm() - 2.0) / 2.0);
+            let content = image.content_box.as_ref().unwrap().clone();
+            assert!((content.width_mm / content.height_mm - 20.0).abs() < 1e-9);
+            assert_eq!(content.width_mm, 40.0);
+            let frame = image.frame.clone();
+            state.tape_width_mm = 24;
+            state.update_tape_pixels();
+            // Changing media affects the preview, never existing frame geometry.
+            let after = state.elements[1].as_object().unwrap();
+            assert_eq!(after.content_box.as_ref().unwrap(), &content);
+            assert_eq!(after.frame, frame);
+        }
+    }
 
     #[test]
     fn selecting_and_hovering_targets_never_pin_or_change_the_saved_layout() {
@@ -1398,7 +1703,11 @@ mod tests {
             canvas_edit_target: CanvasEditTarget::Slot,
             ..Default::default()
         };
-        assert!(state.duplicate_selected());
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                state.selected_element.unwrap()
+            ))
+        );
         assert_eq!(state.selected_element, Some(1));
         assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
         for (i, x) in [5.0, 17.8, 30.6, 100.0].into_iter().enumerate() {
@@ -1407,7 +1716,7 @@ mod tests {
         assert!(state.duplicate_element(2));
         assert!((state.element_rect_mm(3).unwrap().0 - 43.4).abs() < 1e-10);
         assert_eq!(state.element_rect_mm(4).unwrap().0, 100.0);
-        assert!(!state.duplicate_element(999));
+        assert!(!state.apply_editor_action(crate::editor::EditorAction::Duplicate(999)));
     }
 
     #[test]
@@ -1452,14 +1761,8 @@ mod tests {
                 ..Default::default()
             };
             let initial = state.document();
-            state
-                .history
-                .observe(initial.clone(), Some(0), false, false, 0.0);
             assert!(state.delete_element(0));
             let deleted = state.document();
-            state
-                .history
-                .observe(deleted.clone(), Some(1), false, false, 1.0);
 
             assert!(state.duplicate_element(1));
             assert_eq!(state.selected_element, Some(4));
@@ -1475,16 +1778,13 @@ mod tests {
             let duplicated = state.document();
             assert_eq!(duplicated.version, version);
             LabelDocument::from_toml_str(&duplicated.to_toml_string().unwrap()).unwrap();
-            state
-                .history
-                .observe(duplicated.clone(), Some(4), false, false, 2.0);
 
-            state.history_step(false);
+            state.apply_editor_action(crate::editor::EditorAction::Undo);
             assert_eq!(state.document(), deleted);
-            state.history_step(false);
+            state.apply_editor_action(crate::editor::EditorAction::Undo);
             assert_eq!(state.document(), initial);
-            state.history_step(true);
-            state.history_step(true);
+            state.apply_editor_action(crate::editor::EditorAction::Redo);
+            state.apply_editor_action(crate::editor::EditorAction::Redo);
             assert_eq!(state.document(), duplicated);
             assert!(state.reorder_object(4, 1));
             assert_eq!(state.elements[1], expected_copy);
@@ -1606,7 +1906,7 @@ mod tests {
 
     #[test]
     fn duplicate_sequence_supports_legacy_boxes_and_free_anchors() {
-        use ptouch_render::object_layout::{LayoutOptions, Placement};
+        use ptouch_render::object_layout::{LayoutOptions, Placement, WidthSizing};
 
         for version in [2, 7] {
             let mut elements = vec![
@@ -1645,7 +1945,10 @@ mod tests {
             } else {
                 let first = elements[0].as_object_mut().unwrap();
                 first.content_box = Some(content_box_for_frame(&first.frame));
-                first.layout = Some(LayoutOptions::default());
+                first.layout = Some(LayoutOptions {
+                    width: WidthSizing::Fixed,
+                    ..Default::default()
+                });
             }
             let mut state = AppState {
                 document_version: version,
@@ -1722,7 +2025,11 @@ mod tests {
                 selected_element: Some(0),
                 ..Default::default()
             };
-            assert!(state.duplicate_selected());
+            assert!(
+                state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                    state.selected_element.unwrap()
+                ))
+            );
             let saved = state.document().to_toml_string().unwrap();
             let restored = LabelDocument::from_toml_str(&saved).unwrap();
             let copy = restored.elements[1].as_object().unwrap();
@@ -1794,7 +2101,11 @@ mod tests {
                     selected_element: Some(index),
                     ..Default::default()
                 };
-                assert!(state.duplicate_selected());
+                assert!(
+                    state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                        state.selected_element.unwrap()
+                    ))
+                );
                 let restored =
                     LabelDocument::from_toml_str(&state.document().to_toml_string().unwrap())
                         .unwrap();
@@ -1821,7 +2132,11 @@ mod tests {
             *line_spacing = 0.9;
         }
         assert_eq!(state.document().version, 5);
-        assert!(state.duplicate_selected());
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Duplicate(
+                state.selected_element.unwrap()
+            ))
+        );
         let saved = state.document().to_toml_string().unwrap();
         let restored = LabelDocument::from_toml_str(&saved).unwrap();
         assert_eq!(restored.version, 5);

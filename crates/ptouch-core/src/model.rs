@@ -40,6 +40,10 @@ impl From<&DeviceInfo> for ModelProfile {
 }
 
 impl ModelProfile {
+    pub(crate) fn quality(self) -> crate::quality::QualityProfile {
+        crate::quality::QualityProfile::for_model(self.name, self.dpi)
+    }
+
     #[cfg(any(test, all(feature = "bluetooth", target_os = "macos")))]
     pub(crate) const P300BT: Self = Self {
         dialect: Dialect::P300Bt,

@@ -1,6 +1,6 @@
 # ptouch-rs
 
-Rust tool for Brother P-Touch USB label printers. CLI and GUI.
+Rust tool for Brother P-Touch USB and network label printers. CLI and GUI.
 Optional native macOS Bluetooth support is available in `ptouch-core` for the PT-P300BT.
 
 ![Object editor with left-aligned elements](https://github.com/user-attachments/assets/4eaf447a-dde8-49d8-8cca-db98dc75228e)
@@ -15,8 +15,11 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 - Save and reload designs as self-contained `.ptl` layout files (images
   embedded), then print them from the GUI or CLI
 - Template layouts with `{{name}}` placeholders and batch-print from a CSV
+- Portable printer profiles in one directory, split across any number of TOML files
+- Network printing with model-specific capabilities and media checks
+- PT-P750W standard 180×180 and high resolution 180×360 modes
 - Chain print and multi-copy support
-- Print quality modes on 360 dpi models (high resolution 360x720, draft 360x180)
+- PT-9500PC/PT-9700PC quality modes (360×720 high resolution, 360×180 draft)
 - GUI with live preview, zoom, and drag-and-drop element reordering
 - Export to image (PNG, JPEG, BMP, GIF, TIFF, WebP) without a printer connected
 - Feed and cut tape without printing
@@ -29,6 +32,42 @@ PT-P700, PT-P750W, PT-D410, PT-D450, PT-D460BT, PT-D600, PT-D610BT,
 PT-P710BT, PT-E310BT, PT-E560BT and more.
 
 Tape widths: 3.5mm, 6mm, 9mm, 12mm, 18mm, 24mm, 36mm.
+
+## Network printing and portable printer profiles
+
+Both apps use the same profile directory. On Linux the default is
+`~/.config/ptouch-rs/printers` (under `$XDG_CONFIG_HOME` when set).
+On macOS and Windows it is under the platform's user configuration directory.
+Pass `--profiles-dir DIRECTORY` to either app to use a portable folder.
+
+```sh
+# Direct connection: no saved profile needed
+ptouch info --model PT-P750W --host 192.168.20.150
+ptouch print --model PT-P750W --host 192.168.20.150 --quality high "Label"
+
+# Save the connection and choose it by alias
+ptouch printers add desk --model PT-P750W --host labelprinter.local
+ptouch printers default desk
+ptouch info --printer desk
+ptouch print --printer desk --quality high "Label"
+ptouch printers list
+ptouch printers validate
+ptouch gui
+```
+
+Explicit connection flags override the saved default. Explicit print quality
+and `--final-cut`/`--chain` override profile preferences. Without a default or
+explicit target, USB automatic selection still works. `--usb BUS:ADDRESS` is
+available for a one-time USB selection; portable USB profiles use a model and
+an optional serial number. Multiple matching USB devices are rejected.
+
+In the GUI, use **Manage printers…** to add/edit connections, choose the
+profile directory, set a default, or connect without saving. Saves update the
+printer's original file, preserving comments and other entries. Reload after
+external edits; stale edits are refused.
+
+See [printer profiles and network behavior](docs/printer-profiles.md) for the
+schema, capability matrix, cut options, completion semantics, and limitations.
 
 ## Building
 
@@ -96,15 +135,20 @@ and print through the normal preview workflow. Bluetooth operations run outside
 the interface process so connecting and printing do not block window updates.
 
 Library users can also open `ptouch_core::BluetoothDevice`, call `init`, prepare
-16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
+16-byte raster lines using bottom-to-top dot order, then call
+`print_raster(&lines, PrintResolution::square(180))` and
 `close`. Native objects stay on the main thread and cannot be sent or shared
 across threads. These synchronous session calls are suitable for the example;
-the GUI needs a separate event-driven service before Bluetooth selection is
-added. Close assumes exclusive ownership and also disconnects the printer's
+the GUI runs these calls in a separate process. Close assumes exclusive
+ownership and also disconnects the printer's
 baseband connection. Apple's baseband close is synchronous. If an async write
 never completes, one transfer buffer is conservatively retained to avoid freeing
 memory still potentially used by Bluetooth; this only occurs on a failed
 connection, which is then closed.
+
+All Rust raster APIs now take explicit input DPI. See the
+[raster API migration](docs/raster-api.md) for mode metadata and rendering at
+the selected head × feed resolution.
 
 ## Prebuilt Packages
 
@@ -142,8 +186,9 @@ runs CLI startup and GUI rendering checks. These checks do not exercise a printe
 The Linux ARM64 packages use Debian `arm64` and RPM `aarch64` metadata.
 Nix checks cover both Linux architectures.
 
-`ptouch-gui --smoke-test` renders three frames and exits without starting the
-printer worker. This mode requires a working display and OpenGL context.
+`ptouch-gui --smoke-test` renders seven frames across legacy and free layouts,
+including the symbol picker, then exits without starting the printer worker.
+This mode requires a working display and OpenGL context.
 
 ## GUI
 
@@ -151,17 +196,57 @@ printer worker. This mode requires a working display and OpenGL context.
 ptouch-gui
 ```
 
-Use `ptouch-gui --offline` to edit and export without opening or polling USB or
-Bluetooth devices. The preview uses the layout's saved design DPI.
+Use `ptouch-gui --offline` to edit and export without opening or polling printer
+connections. Combine it with `--profiles-dir DIRECTORY` to select a profile collection.
+The offline preview uses the layout's saved design DPI.
 
-- Live label preview with zoom
-- Add/edit/reorder text, images, cut marks, padding
+- Label preview with Fit, approximate Actual size, and sharp Pixels presets
+- Millimeter rulers, direct object selection, and explicit Adjust layout controls
+- Free positioning or fixed/automatic sequence allocations; drag list handles to reorder
+- Legacy labels retain canvas drag-to-reorder and dimension guides
+- Duplicate or delete objects through row action menus or right-click menus
+- Undo/redo in the top toolbar for content, formatting, object transforms, and explicit layout conversion
+- Add Text, Add Image, Add Symbol, and Cut Mark directly below the Objects list
+- Pan free layouts with Space+drag, middle-drag, or scroll; legacy labels also allow dragging empty canvas
+- Add/edit text, images, cut marks, and legacy padding
 - Free-angle text rotation with auto font sizing
 - Mirror the whole label or a single element (horizontal/vertical)
 - Tape width selection
 - Save/Open layout (`.ptl`) with images embedded for portability
 - Print to connected printer or export to image file
 - Feed and cut tape without printing
+
+With the preview or element list focused, use Ctrl/Cmd+D to duplicate, Delete
+or Backspace to delete, and Alt+Up/Down to reorder. Undo with Ctrl/Cmd+Z and redo
+with Ctrl/Cmd+Shift+Z (also Ctrl+Y on Windows/Linux). History retains up to 100
+edits for the current layout and resets when another layout is opened. Printer
+and tape settings remain outside content history. Saved design DPI is undoable.
+
+### Symbols
+
+Use **Add Symbol** to browse 7,188 black-and-white symbols from
+[Material Design Icons 7.4.47](https://pictogrammers.com/library/mdi/). Choose a
+category or search by name, alias, or category. Select a symbol to inspect its
+print preview, then press **Add**. Each symbol is a separate object with the
+same frame, movement, sizing, rotation, and mirroring controls as an image.
+
+Use **Change Symbol…** in image or symbol properties to replace the artwork
+while retaining its frame, content dimensions and offsets, rotation, and
+mirroring. Add and Replace support undo/redo. Cancel and Escape leave the
+label unchanged.
+
+The catalogue is bundled with the GUI and works offline. Saved `.ptl` files
+embed the SVG artwork, name, author, source, and license; reopening, exporting,
+and printing require neither the catalogue nor a symbol font. The layout
+format stays unchanged. Symbol rendering preserves black shapes, including
+dense filled artwork, without automatic inversion or dithering.
+
+The catalogue excludes deprecated icons and brand/logo artwork. Its 15 label
+categories combine upstream tags with supplemental rules for common technical
+symbols; unmatched icons appear in **Other**. Regenerate the pinned catalogue
+with `python3 scripts/import-symbols.py`, or verify it without writing files
+with `python3 scripts/import-symbols.py --check`. The importer verifies the
+archive and license checksums. Ordinary builds do not run it or download assets.
 
 ## CLI Usage
 
@@ -254,7 +339,7 @@ appended to the list and placed after the label's rightmost object. Sequence
 copies are inserted after the source and reflow the following objects.
 
 The X and Y millimeter rulers remain visible while scrolling and use the original
-print geometry even when the preview texture is reduced. The Y ruler covers the
+print geometry. Long previews use tiled textures to retain every printer dot. The Y ruler covers the
 full nominal tape width: light bands are printable and dark edges are not. Their
 boundaries align on the tape and ruler. Edge placement is schematic when the
 printer's exact vertical head offset is unknown; property coordinates still use
@@ -330,8 +415,10 @@ insertion button; legacy layouts retain it.
 
 Legacy unboxed text, padding, image sizes, and font margins keep their existing
 pixel units. Fixed text frame font sizes use points (1/72 inch).
-Offline export uses the saved `dpi`; printing uses the device DPI to preserve
-millimeter positions. The GUI saves a separate design DPI and shows the current
+Offline CLI layout export uses the saved `dpi`; printing uses the selected
+head/feed resolution to preserve millimeter positions. Connected GUI previews
+and image exports use the selected quality; exports use square pixels while
+preserving physical proportions. The GUI saves a separate design DPI and shows the current
 preview DPI. A printer disconnect keeps the last printer preview until **Use
 design DPI** is selected. `--tape-width` changes the exported printable height in
 pixels, not the layout DPI or its millimeter coordinates.
@@ -375,28 +462,41 @@ bold = true
 Inline styles need v6; explicit layout policies additionally require v7.
 Documents without either feature retain the original rendering path.
 
-### Optional print-position calibration
+### Print-position calibration
 
-Open **Print Options → Position calibration** to apply a correction in millimeters.
-Positive values add leading blank space; negative values remove existing leading
-blank space and are rejected if they would cut off printed content. Correction
-is rounded to the output DPI and moves all label content together. It cannot
-remove a printer's mechanical feed margin.
+Open **Manage printers → Position corrections** to save measured offsets for a
+printer's quality, leading-cut, and final-cut settings. Matching corrections
+apply automatically. No match uses no correction. These rules travel with the
+printer profile; see [profile format and examples](docs/printer-profiles.md#position-corrections).
 
-Calibration starts disabled and resets when choosing another connection. Save
-named profiles for individual printers and cut modes; **Default** disables the
-correction. **Export profile** writes a TOML file for CLI use, and **Export
-corrected image** previews the applied correction without printing. Layout files
-and the ordinary design export retain their original coordinates.
+**Print Options → Position calibration** shows the active correction. Choose
+**No correction** to disable it or **Custom correction** for a temporary offset.
+Temporary overrides reset when the printer, quality, or cut settings change.
+Individual corrections can be imported or exported as upstream-compatible TOML
+files. **Export corrected image** in the toolbar shows the applied correction;
+the canvas, layout files, and ordinary **Export Image** keep design coordinates.
+
+Positive offsets add leading blank space. Negative offsets remove leading blank
+space and fail if they would discard ink. The correction is rounded at the
+output's feed DPI and cannot remove the printer's mechanical feed margin.
 
 ```sh
-ptouch print --layout ports.ptl --calibration desk-printer.toml
+# Automatically use a matching rule from the saved printer
+ptouch print --printer desk --layout ports.ptl
+# Override the printer's rules for this job
+ptouch print --printer desk --layout ports.ptl --no-calibration
+ptouch print --layout ports.ptl --calibration desk-correction.toml
 ptouch print --layout ports.ptl --offset-mm 1.5 --output corrected.png
 ```
 
-Omitting both options preserves the existing print behavior, including device
-margin commands. A direct offset and a profile are mutually exclusive. CLI
-exports, copies and CSV rows use the same correction at their output DPI.
+`--no-calibration`, `--offset-mm`, and `--calibration` are mutually exclusive;
+each overrides the saved printer's rules. Without a matching rule or explicit
+correction, printing retains its existing pixels and device margin commands.
+Each copy and CSV label matches its actual cut commands, so chained labels can
+use a different correction from the last label. Streaming jobs stop before
+submitting a label whose correction fails; earlier labels may already have
+printed. CLI exports use their output DPI and retain one image per CSV row,
+representing that row's last copy.
 
 ### Layout templates and batch printing
 
@@ -714,11 +814,14 @@ Per-directory licensing (each source file carries an SPDX header):
 
 | Path | License | Notes |
 |------|---------|-------|
-| `crates/ptouch-core/` | GPL-3.0-or-later | Device table, flags, status protocol, command construction. Derived from ptouch-print. |
+| `crates/ptouch-core/` (except `printer_model.rs`) | GPL-3.0-or-later | Device table, flags, status protocol, command construction. Derived from ptouch-print. |
 | `crates/ptouch-render/src/raster.rs` | GPL-3.0-or-later | Raster bit-packing. Derived from ptouch-print. |
 | `crates/ptouch-render/` (other files) | MIT | Bitmap, text, image loading, composition. Original work. |
+| `crates/ptouch-core/src/printer_model.rs` | MIT | Independently written capability selection. |
+| `crates/ptouch-profiles/` | MIT | Independent portable configuration storage. |
 | `crates/ptouch-cli/` | MIT | Original work. |
 | `crates/ptouch-gui/` | MIT | Original work. |
+| `crates/ptouch-gui/assets/symbols/mdi.json` | Apache-2.0 artwork | MDI symbols; see the bundled licenses and [NOTICE](NOTICE). |
 
 The MIT-licensed files are reusable on their own under the MIT license (see
 [LICENSE-MIT](LICENSE-MIT)). Any program that links `ptouch-core`, including the

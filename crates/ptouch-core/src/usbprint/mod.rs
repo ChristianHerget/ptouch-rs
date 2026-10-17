@@ -444,6 +444,8 @@ mod tests {
     use super::*;
     fn binding(id: &str, service: &str) -> crate::diagnostics::DriverBinding {
         crate::diagnostics::DriverBinding {
+            unique_id: false,
+            identity_error: None,
             instance_id: id.into(),
             hardware_ids: vec!["USB\\VID_04F9&PID_20AF".into()],
             service: Some(service.into()),
