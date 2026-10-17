@@ -387,9 +387,12 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
 
                 ui.add_sized(
                     [row_width, ui.spacing().interact_size.y],
-                    egui::Button::selectable(selected.is_some_and(|t| t.element == idx), &label)
-                        .truncate()
-                        .sense(egui::Sense::click_and_drag()),
+                    egui::Button::selectable(
+                        selected.is_some_and(|t| t.element == idx),
+                        (&label, egui::Atom::grow()),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click_and_drag()),
                 )
                 .on_hover_text(format!(
                     "{label}\n{}",
