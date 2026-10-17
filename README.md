@@ -249,7 +249,9 @@ Ctrl+Z undoes and Ctrl+Shift+Z or Ctrl+Y redoes (Cmd on macOS). Text, formatting
 geometry and ordering participate in document history. Hold Shift while rotating
 to snap to 15° increments. The optional 0.1 mm snap and arrow keys provide fine
 position adjustments; Shift moves 1 mm. Use **Duplicate**, its context menu entry,
-or Ctrl+D/Cmd+D to copy an object with its settings.
+or Ctrl+D/Cmd+D to copy an object with its settings. Free-positioned copies are
+appended to the list and placed after the label's rightmost object. Sequence
+copies are inserted after the source and reflow the following objects.
 
 The X and Y millimeter rulers remain visible while scrolling and use the original
 print geometry even when the preview texture is reduced. The Y ruler covers the

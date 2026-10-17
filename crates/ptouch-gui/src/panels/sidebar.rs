@@ -477,7 +477,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         let has_selection = state.selected_element.is_some();
         if ui
             .add_enabled(has_selection, egui::Button::new("Duplicate"))
-            .on_hover_text("Copy after this element, keeping its settings (Ctrl+D / Cmd+D)")
+            .on_hover_text(
+                "Copy with its settings: after the source in a sequence, or at the end for free positioning (Ctrl+D / Cmd+D)",
+            )
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -489,6 +491,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 has_selection && state.selected_element.unwrap_or(0) > 0,
                 egui::Button::new("Up"),
             )
+            .on_hover_text("Reorder a sequence; free objects keep their X/Y coordinates")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -504,6 +507,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                         .unwrap_or(false),
                 egui::Button::new("Down"),
             )
+            .on_hover_text("Reorder a sequence; free objects keep their X/Y coordinates")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -543,11 +547,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ElementAction::MoveTo(from, to) => move_element(state, from, to),
             ElementAction::Delete(idx) => {
-                state.elements.remove(idx);
-                state.canvas_hover_target = None;
-                state.canvas_drag_target = None;
-                state.validate_selection();
-                state.mark_dirty();
+                state.delete_element(idx);
             }
         }
     }

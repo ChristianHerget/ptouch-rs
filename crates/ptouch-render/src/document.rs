@@ -606,8 +606,10 @@ impl LabelElement {
                 content: ObjectContent::Text { content, .. },
                 ..
             }) => {
-                let preview: String = content.chars().take(20).collect();
-                if content.chars().count() > 20 {
+                let single_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut chars = single_line.chars();
+                let preview: String = chars.by_ref().take(20).collect();
+                if chars.next().is_some() {
                     format!("Text: {}...", preview)
                 } else {
                     format!("Text: {}", preview)
@@ -879,6 +881,17 @@ fn rotation_aware_font_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_names_identify_objects_on_one_line() {
+        let object =
+            LabelElement::Object(LabelObject::text("K\nAlarm-\r\nanlage", TextBox::default()));
+        assert_eq!(object.display_name(), "Text: K Alarm- anlage");
+        let unicode =
+            LabelElement::Object(LabelObject::text("端口 ".repeat(10), TextBox::default()));
+        assert!(!unicode.display_name().contains('\n'));
+        assert!(unicode.display_name().ends_with("..."));
+    }
 
     /// Encode a solid black image of the given size as PNG bytes.
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {

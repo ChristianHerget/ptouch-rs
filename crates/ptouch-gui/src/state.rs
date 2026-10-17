@@ -874,11 +874,12 @@ impl AppState {
         self.mark_dirty();
     }
 
-    /// Copy after the source. Relative copies reuse their gap; absolute copies
-    /// start 3 mm after the source's right edge, like Add Text.
-    /// Existing absolute anchors and object-local geometry are untouched.
+    /// Insert sequence copies after the source, reusing their gap. Free copies
+    /// append after the furthest right edge and at the end of the element list,
+    /// preserving existing coordinates and implicit relative bindings.
     pub fn duplicate_element(&mut self, index: usize) -> bool {
-        let sequence = self.flow_chain(index).is_some()
+        let sequence = !self.slot_followers(index).is_empty()
+            || self.flow_chain(index).is_some()
             || self
                 .elements
                 .get(index)
@@ -888,6 +889,8 @@ impl AppState {
         let Some(mut copy) = self.elements.get(index).cloned() else {
             return false;
         };
+        let mut insertion = index + 1;
+        let mut free_copy = false;
         let frame = match &mut copy {
             LabelElement::Object(object) => Some(&mut object.frame),
             LabelElement::Text { text_box, .. } => text_box.as_mut(),
@@ -896,20 +899,29 @@ impl AppState {
         if let Some(frame) = frame
             && frame.position == PositionMode::Absolute
         {
-            let Some((x, _, width, _)) = self.element_rect_mm(index) else {
-                return false;
-            };
             if sequence {
                 frame.position = PositionMode::Relative;
                 frame.gap_mm = self
                     .elements
                     .get(index + 1)
-                    .and_then(|e| e.as_object())
-                    .filter(|o| o.frame.position == PositionMode::Relative)
-                    .map_or(3.0, |o| o.frame.gap_mm);
+                    .and_then(slot_frame)
+                    .filter(|f| f.position == PositionMode::Relative)
+                    .map_or(3.0, |f| f.gap_mm);
             } else {
-                frame.x_mm = x + width + 3.0;
+                frame.x_mm = self
+                    .default_object_frame(frame.width_mm, frame.height_mm)
+                    .x_mm;
+                insertion = self.elements.len();
+                free_copy = true;
             }
+        }
+        if sequence
+            && let Some(object) = copy.as_object_mut()
+            && let Some(policy) = &mut object.layout
+            && policy.placement == ptouch_render::object_layout::Placement::Free
+        {
+            policy.placement = ptouch_render::object_layout::Placement::Flow;
+            policy.width = ptouch_render::object_layout::WidthSizing::Fixed;
         }
         let edit = if self.selected_element == Some(index) {
             self.canvas_edit_target
@@ -917,13 +929,19 @@ impl AppState {
             CanvasEditTarget::Content
         };
         self.editor_generation = self.editor_generation.wrapping_add(1);
-        self.elements.insert(index + 1, copy);
+        self.elements.insert(insertion, copy);
         self.select_canvas_target(Some(CanvasTarget {
-            element: index + 1,
+            element: insertion,
             edit,
         }));
         self.canvas_hover_target = None;
         self.canvas_drag_target = None;
+        self.status_message = if free_copy {
+            "Duplicated at end of label"
+        } else {
+            "Duplicated after source"
+        }
+        .into();
         self.mark_dirty();
         true
     }
@@ -931,6 +949,41 @@ impl AppState {
     pub fn duplicate_selected(&mut self) -> bool {
         self.selected_element
             .is_some_and(|index| self.duplicate_element(index))
+    }
+
+    /// Removing a sequence's first object transfers its anchor to the next
+    /// object, rather than binding that object to a preceding independent row.
+    pub fn delete_element(&mut self, index: usize) -> bool {
+        let Some(element) = self.elements.get(index) else {
+            return false;
+        };
+        let anchor = slot_frame(element)
+            .filter(|frame| {
+                frame.position == PositionMode::Absolute
+                    || index == 0
+                    || slot_frame(&self.elements[index - 1]).is_none()
+            })
+            .cloned();
+        self.elements.remove(index);
+        if let Some(anchor) = anchor
+            && let Some(next) = self.elements.get_mut(index).and_then(slot_frame_mut)
+            && next.position == PositionMode::Relative
+        {
+            next.position = anchor.position;
+            next.x_mm = anchor.x_mm;
+            next.gap_mm = anchor.gap_mm;
+        }
+        if let Some(selected) = &mut self.selected_element
+            && *selected > index
+        {
+            *selected -= 1;
+        }
+        self.canvas_hover_target = None;
+        self.canvas_drag_target = None;
+        self.validate_selection();
+        self.status_message = "Deleted object".into();
+        self.mark_dirty();
+        true
     }
 
     pub fn add_text(&mut self) {
@@ -1113,6 +1166,14 @@ fn slot_frame(element: &LabelElement) -> Option<&TextBox> {
     match element {
         LabelElement::Object(object) => Some(&object.frame),
         LabelElement::Text { text_box, .. } => text_box.as_ref(),
+        _ => None,
+    }
+}
+
+fn slot_frame_mut(element: &mut LabelElement) -> Option<&mut TextBox> {
+    match element {
+        LabelElement::Object(object) => Some(&mut object.frame),
+        LabelElement::Text { text_box, .. } => text_box.as_mut(),
         _ => None,
     }
 }
@@ -1347,6 +1408,272 @@ mod tests {
         assert!((state.element_rect_mm(3).unwrap().0 - 43.4).abs() < 1e-10);
         assert_eq!(state.element_rect_mm(4).unwrap().0, 100.0);
         assert!(!state.duplicate_element(999));
+    }
+
+    #[test]
+    fn delete_then_duplicate_free_row_appends_without_overlaps_and_undoes() {
+        use ptouch_render::object_layout::{LayoutOptions, WidthSizing};
+
+        for version in [2, 6, 7] {
+            let mut state = AppState {
+                document_version: version,
+                elements: (0..5)
+                    .map(|i| {
+                        let frame = TextBox {
+                            x_mm: f64::from(i) * 17.5,
+                            width_mm: 14.5,
+                            height_mm: 10.0,
+                            ..Default::default()
+                        };
+                        let content = format!("PORT {i}\nDEVICE {i}");
+                        if version == 2 {
+                            LabelElement::Text {
+                                content,
+                                font_size: None,
+                                align: TextAlign::Center,
+                                rotation: 0.0,
+                                flip_h: false,
+                                flip_v: false,
+                                text_box: Some(frame),
+                            }
+                        } else {
+                            let mut object = LabelObject::text(content, frame);
+                            if version == 7 {
+                                object.content_box = Some(content_box_for_frame(&object.frame));
+                                object.layout = Some(LayoutOptions {
+                                    width: WidthSizing::Fixed,
+                                    ..Default::default()
+                                });
+                            }
+                            LabelElement::Object(object)
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let initial = state.document();
+            state
+                .history
+                .observe(initial.clone(), Some(0), false, false, 0.0);
+            assert!(state.delete_element(0));
+            let deleted = state.document();
+            state
+                .history
+                .observe(deleted.clone(), Some(1), false, false, 1.0);
+
+            assert!(state.duplicate_element(1));
+            assert_eq!(state.selected_element, Some(4));
+            assert_eq!(&state.elements[..4], deleted.elements.as_slice());
+            assert_eq!(state.element_rect_mm(4).unwrap().0, 87.5);
+            let mut expected_copy = deleted.elements[1].clone();
+            match &mut expected_copy {
+                LabelElement::Text { text_box, .. } => text_box.as_mut().unwrap().x_mm = 87.5,
+                LabelElement::Object(object) => object.frame.x_mm = 87.5,
+                _ => unreachable!(),
+            }
+            assert_eq!(state.elements[4], expected_copy);
+            let duplicated = state.document();
+            assert_eq!(duplicated.version, version);
+            LabelDocument::from_toml_str(&duplicated.to_toml_string().unwrap()).unwrap();
+            state
+                .history
+                .observe(duplicated.clone(), Some(4), false, false, 2.0);
+
+            state.history_step(false);
+            assert_eq!(state.document(), deleted);
+            state.history_step(false);
+            assert_eq!(state.document(), initial);
+            state.history_step(true);
+            state.history_step(true);
+            assert_eq!(state.document(), duplicated);
+            assert!(state.reorder_object(4, 1));
+            assert_eq!(state.elements[1], expected_copy);
+            assert_eq!(state.element_rect_mm(1).unwrap().0, 87.5);
+        }
+    }
+
+    #[test]
+    fn deleting_sequence_anchor_preserves_its_origin_and_next_row() {
+        for version in [2, 6, 7] {
+            for relative_anchor in [false, true] {
+                let mut elements: Vec<_> = (0..5)
+                    .map(|i| {
+                        LabelElement::Object(LabelObject::text(
+                            format!("PORT {i}"),
+                            TextBox {
+                                position: if i == 1 || i == 2 || i == 0 && relative_anchor {
+                                    PositionMode::Relative
+                                } else {
+                                    PositionMode::Absolute
+                                },
+                                x_mm: if i == 0 {
+                                    5.0
+                                } else {
+                                    100.0 + f64::from(i) * 20.0
+                                },
+                                gap_mm: if i == 0 { 5.0 } else { 2.8 },
+                                ..Default::default()
+                            },
+                        ))
+                    })
+                    .collect();
+                if version == 2 {
+                    for element in &mut elements {
+                        let object = element.as_object().unwrap();
+                        *element = LabelElement::Text {
+                            content: "PORT".into(),
+                            font_size: None,
+                            align: TextAlign::Center,
+                            rotation: 0.0,
+                            flip_h: false,
+                            flip_v: false,
+                            text_box: Some(object.frame.clone()),
+                        };
+                    }
+                }
+                let mut state = AppState {
+                    document_version: version,
+                    elements,
+                    selected_element: Some(2),
+                    ..Default::default()
+                };
+                let first_x = state.element_rect_mm(0).unwrap().0;
+                let independent = state.elements[3..].to_vec();
+                assert!(!state.delete_element(999));
+                assert!(state.delete_element(0));
+                assert_eq!(state.selected_element, Some(1));
+                assert_eq!(state.element_rect_mm(0).unwrap().0, first_x);
+                assert!((state.element_rect_mm(1).unwrap().0 - (first_x + 12.8)).abs() < 1e-9);
+                assert_eq!(&state.elements[2..], independent.as_slice());
+                assert_eq!(state.document().version, version);
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_sequence_after_an_independent_object_keeps_the_anchor() {
+        let mut state = AppState {
+            elements: vec![
+                LabelElement::Object(LabelObject::text("FREE", TextBox::default())),
+                LabelElement::Object(LabelObject::text(
+                    "A",
+                    TextBox {
+                        x_mm: 100.0,
+                        ..Default::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 2.8,
+                        ..Default::default()
+                    },
+                )),
+            ],
+            ..Default::default()
+        };
+        assert!(state.delete_element(1));
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 100.0);
+        assert!(state.duplicate_element(1));
+        // The remaining v3 object is now independent and duplicates at the end.
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 113.0);
+    }
+
+    #[test]
+    fn free_copy_does_not_reanchor_following_legacy_elements() {
+        let mut state = AppState {
+            document_version: 3,
+            elements: vec![
+                LabelElement::Object(LabelObject::text("A", TextBox::default())),
+                LabelElement::Padding { pixels: 20 },
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        x_mm: 50.0,
+                        ..Default::default()
+                    },
+                )),
+            ],
+            ..Default::default()
+        };
+        let before = state.elements.clone();
+        assert!(state.duplicate_element(0));
+        assert_eq!(&state.elements[..3], before.as_slice());
+        assert_eq!(state.selected_element, Some(3));
+        assert_eq!(state.element_rect_mm(3).unwrap().0, 63.0);
+    }
+
+    #[test]
+    fn duplicate_sequence_supports_legacy_boxes_and_free_anchors() {
+        use ptouch_render::object_layout::{LayoutOptions, Placement};
+
+        for version in [2, 7] {
+            let mut elements = vec![
+                LabelElement::Object(LabelObject::text(
+                    "A",
+                    TextBox {
+                        x_mm: 5.0,
+                        ..Default::default()
+                    },
+                )),
+                LabelElement::Object(LabelObject::text(
+                    "B",
+                    TextBox {
+                        position: PositionMode::Relative,
+                        gap_mm: 2.8,
+                        ..Default::default()
+                    },
+                )),
+            ];
+            if version == 2 {
+                for element in &mut elements {
+                    let object = element.as_object().unwrap();
+                    let ObjectContent::Text { content, .. } = &object.content else {
+                        unreachable!()
+                    };
+                    *element = LabelElement::Text {
+                        content: content.clone(),
+                        font_size: None,
+                        align: TextAlign::Center,
+                        rotation: 0.0,
+                        flip_h: false,
+                        flip_v: false,
+                        text_box: Some(object.frame.clone()),
+                    };
+                }
+            } else {
+                let first = elements[0].as_object_mut().unwrap();
+                first.content_box = Some(content_box_for_frame(&first.frame));
+                first.layout = Some(LayoutOptions::default());
+            }
+            let mut state = AppState {
+                document_version: version,
+                elements,
+                ..Default::default()
+            };
+            assert!(state.duplicate_element(0));
+            for (i, x) in [5.0, 17.8, 30.6].into_iter().enumerate() {
+                assert!((state.element_rect_mm(i).unwrap().0 - x).abs() < 1e-9);
+            }
+            if version == 7 {
+                assert_eq!(
+                    state.elements[1]
+                        .as_object()
+                        .unwrap()
+                        .layout
+                        .as_ref()
+                        .unwrap()
+                        .placement,
+                    Placement::Flow
+                );
+            }
+            let saved = state.document().to_toml_string().unwrap();
+            assert_eq!(
+                LabelDocument::from_toml_str(&saved).unwrap().version,
+                version
+            );
+        }
     }
 
     #[test]
