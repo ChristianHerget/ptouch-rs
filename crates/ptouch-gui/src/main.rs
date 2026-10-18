@@ -10,6 +10,7 @@
 // explicit stdin/stdout pipes from its parent and does not need a console.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod alignment;
 mod app;
 mod history;
 mod panels;

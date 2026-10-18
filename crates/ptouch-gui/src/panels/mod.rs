@@ -4,6 +4,7 @@
 //! UI panel modules for the P-Touch GUI.
 
 pub mod canvas;
+pub mod info;
 pub mod properties;
 pub mod sidebar;
 pub mod status_bar;

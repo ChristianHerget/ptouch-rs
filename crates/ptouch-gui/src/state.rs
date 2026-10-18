@@ -134,6 +134,8 @@ pub use crate::scene_edit::LayerMove;
 
 /// Central application state shared across all panels.
 pub struct AppState {
+    /// UI-only help state, excluded from document history and serialization.
+    pub info_open: bool,
     /// Layers changes overlap; layout order retains sequence placement.
     pub layers_view: bool,
     pub history: crate::history::DocumentHistory,
@@ -232,6 +234,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            info_open: false,
             layers_view: false,
             history: Default::default(),
             scene_measurement_renderer: None,
@@ -333,6 +336,15 @@ impl AppState {
         ptouch_render::sequence::members(&self.elements, index)
     }
 
+    /// Attachments do not occupy space in the physical layout sequence.
+    pub fn previous_layout_index(&self, index: usize) -> Option<usize> {
+        (0..index).rev().find(|i| {
+            !self.elements[*i]
+                .as_object()
+                .is_some_and(|o| o.scene.as_ref().is_some_and(|s| s.anchor.is_some()))
+        })
+    }
+
     /// Commit positioning changes together with any affected sequence links.
     pub fn apply_object_edit(&mut self, index: usize, object: LabelObject) -> Result<(), String> {
         let scene_candidate = object.scene.is_some()
@@ -385,11 +397,11 @@ impl AppState {
             object.frame.position = PositionMode::Absolute;
         } else if became_flow {
             sequence::materialize(&mut elements).map_err(|e| e.to_string())?;
-            let previous = index.checked_sub(1);
+            let previous = self.previous_layout_index(index);
             let target = previous
                 .and_then(|i| elements[i].as_object()?.sequence)
                 .or_else(|| {
-                    if index == 0 {
+                    if previous.is_none() {
                         elements[index].as_object()?.sequence
                     } else {
                         None
@@ -446,8 +458,8 @@ impl AppState {
                 }
                 object.sequence = Some(id);
             } else {
-                let previous = index
-                    .checked_sub(1)
+                let previous = self
+                    .previous_layout_index(index)
                     .ok_or("The first sequence member needs an absolute origin")?;
                 let id = match elements[previous].as_object().and_then(|o| o.sequence) {
                     Some(id) => id,

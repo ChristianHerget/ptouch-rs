@@ -32,6 +32,7 @@ pub enum ToolbarAction {
     Export,
     Save,
     Open,
+    Info,
 }
 
 /// Render the toolbar without consuming a document that still has pending edits.
@@ -130,12 +131,16 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &AppState) -> Option<ToolbarAction
         if ui.button("Open Layout").clicked() {
             action = Some(ToolbarAction::Open);
         }
+        if ui.button("Info").clicked() {
+            action = Some(ToolbarAction::Info);
+        }
     });
     action
 }
 
 pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
     match action {
+        ToolbarAction::Info => state.info_open = true,
         ToolbarAction::Undo => state.history_step(false),
         ToolbarAction::Redo => state.history_step(true),
         ToolbarAction::Convert => match state.convert_to_free_layout() {
@@ -379,6 +384,20 @@ fn do_export_image(state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn info_is_ui_state_without_document_or_history_changes() {
+        let mut state = crate::state::AppState::default();
+        let document = state.document();
+        let revision = state.edit_revision;
+        super::execute_action(&mut state, super::ToolbarAction::Info);
+        assert!(state.info_open);
+        assert_eq!(state.document(), document);
+        assert_eq!(state.edit_revision, revision);
+        assert!(!state.history.can_undo());
+        assert!(!state.history.can_redo());
+        assert!(state.printer_cmd_tx.is_none());
+    }
+
     use super::*;
     use crate::state::PrinterTarget;
     use ptouch_render::text::TextRenderer;

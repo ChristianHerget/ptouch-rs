@@ -1,0 +1,148 @@
+# Centred 0.3 mm lines in fixed 2.8 mm allocations.
+# Gap before is zero; allocation width supplies all spacing.
+version = 11
+tape_width_mm = 12
+dpi = 180
+font_name = "DejaVu Sans"
+font_margin = 0
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+
+[elements.frame]
+width_mm = 14.4
+height_mm = 10.0
+position = "absolute"
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 13.8
+height_mm = 7.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "PORT 01\nNETWORK"
+align = "center"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 90.0
+
+[elements.frame]
+width_mm = 2.8
+height_mm = 10.0
+position = "relative"
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 8.0
+height_mm = 0.3
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "line"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+
+[elements.frame]
+width_mm = 14.5
+height_mm = 10.0
+position = "relative"
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 13.8
+height_mm = 7.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "PORT 02\nCONTROL"
+align = "center"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 90.0
+
+[elements.frame]
+width_mm = 2.8
+height_mm = 10.0
+position = "relative"
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 8.0
+height_mm = 0.3
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "line"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+
+[elements.frame]
+width_mm = 14.5
+height_mm = 10.0
+position = "relative"
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 13.8
+height_mm = 7.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "PORT 03\nPOWER"
+align = "center"

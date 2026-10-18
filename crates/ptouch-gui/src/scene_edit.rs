@@ -839,10 +839,81 @@ impl AppState {
         )
     }
 
-    pub fn reorder_scene_element(&mut self, from: usize, to: usize) -> bool {
+    /// Present attachments beneath their host without changing stored layers
+    /// or rewriting an untouched document's element order.
+    pub fn layout_order(&self) -> Vec<usize> {
+        let mut children = std::collections::BTreeMap::<u64, Vec<usize>>::new();
+        for (index, element) in self.elements.iter().enumerate() {
+            if let Some(anchor) = element.as_object().and_then(anchor_of) {
+                children.entry(anchor.target).or_default().push(index);
+            }
+        }
+        let mut result = Vec::with_capacity(self.elements.len());
+        for (index, element) in self.elements.iter().enumerate() {
+            if is_attached(element) {
+                continue;
+            }
+            result.push(index);
+            if let Some(id) = element
+                .as_object()
+                .and_then(|o| o.scene.as_ref())
+                .map(|s| s.id)
+                && let Some(attached) = children.remove(&id)
+            {
+                result.extend(attached);
+            }
+        }
+        // Invalid or unfinished scene metadata must not hide a list row.
+        for attached in children.into_values() {
+            result.extend(attached);
+        }
+        result
+    }
+
+    /// Up/Down addresses physical layout peers, never an attached child row.
+    pub fn layout_neighbor(&self, index: usize, down: bool) -> Option<usize> {
+        if is_attached(self.elements.get(index)?) {
+            return None;
+        }
+        if down {
+            (index + 1..self.elements.len()).find(|i| !is_attached(&self.elements[*i]))
+        } else {
+            self.previous_layout_index(index)
+        }
+    }
+
+    pub fn layout_host(&self, index: usize) -> Option<usize> {
+        let element = self.elements.get(index)?;
+        match element.as_object().and_then(anchor_of) {
+            None => Some(index),
+            Some(anchor) => self.elements.iter().position(|element| {
+                element
+                    .as_object()
+                    .and_then(|o| o.scene.as_ref())
+                    .is_some_and(|s| s.id == anchor.target)
+            }),
+        }
+    }
+
+    pub fn reorder_scene_element(&mut self, from: usize, mut to: usize) -> bool {
         if from == to || from >= self.elements.len() || to >= self.elements.len() {
             return false;
         }
+        let moving_host = !is_attached(&self.elements[from]);
+        if moving_host {
+            let Some(host) = self.layout_host(to) else {
+                return false;
+            };
+            to = host;
+            if from == to {
+                return false;
+            }
+        }
+        let selected_id = scene_id(&self.elements, from);
+        let crosses_sequence = self
+            .flow_chain(from)
+            .zip(self.flow_chain(to))
+            .is_some_and(|(a, b)| a != b);
         let before = SceneSnapshot::take(self);
         if let Err(error) = sequence::materialize(&mut self.elements) {
             return self.fail_scene_transaction(before, error.to_string());
@@ -854,10 +925,33 @@ impl AppState {
             let error = self.status_message.clone();
             return self.fail_scene_transaction(before, error);
         }
+        if moving_host {
+            let order = self.layout_order();
+            let mut elements: Vec<_> = std::mem::take(&mut self.elements)
+                .into_iter()
+                .map(Some)
+                .collect();
+            self.elements = order
+                .into_iter()
+                .map(|i| elements[i].take().unwrap())
+                .collect();
+        }
+        let selected = selected_id.and_then(|id| {
+            self.elements.iter().position(|element| {
+                element
+                    .as_object()
+                    .and_then(|o| o.scene.as_ref())
+                    .is_some_and(|s| s.id == id)
+            })
+        });
         self.finish_scene_transaction(
             before,
-            Some(to),
-            "Layout order changed; layer order preserved",
+            selected,
+            if crosses_sequence {
+                "Moved to another sequence; fixed starts keep their X. Use After previous to join sequences."
+            } else {
+                "Host and attachments reordered; layer order preserved"
+            },
         )
     }
 }
@@ -912,6 +1006,105 @@ mod tests {
 
     fn worlds(state: &AppState) -> Vec<TextBox> {
         scene::world_frames(&state.elements).unwrap()
+    }
+
+    fn ids(state: &AppState) -> Vec<u64> {
+        (0..state.elements.len())
+            .map(|i| scene_id(&state.elements, i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn host_reorder_moves_nonadjacent_children_as_a_block_and_child_drop_targets_host() {
+        let mut state = fixture();
+        assert!(state.add_overlay_text(0));
+        assert!(state.add_overlay_text(0));
+        let paint: Vec<_> = scene::paint_order(&state.elements)
+            .into_iter()
+            .map(|i| scene_id(&state.elements, i).unwrap())
+            .collect();
+        assert_eq!(state.layout_order(), vec![0, 3, 4, 1, 2]);
+        assert_eq!(state.layout_neighbor(0, true), Some(1));
+        assert_eq!(state.layout_neighbor(3, true), None);
+        assert!(state.reorder_scene_element(0, 1));
+        assert_eq!(ids(&state), vec![2, 1, 4, 5, 3]);
+        assert_eq!(state.selected_element, Some(1));
+        assert_close(worlds(&state)[0].x_mm, 2.0);
+        assert_close(worlds(&state)[1].x_mm, 15.0);
+        // Dropping the first host on a child of the second host addresses
+        // that host and moves its whole block, without changing stacking.
+        assert!(state.reorder_scene_element(0, 2));
+        assert_eq!(ids(&state), vec![1, 4, 5, 2, 3]);
+        assert_close(worlds(&state)[0].x_mm, 2.0);
+        assert_eq!(
+            scene::paint_order(&state.elements)
+                .into_iter()
+                .map(|i| scene_id(&state.elements, i).unwrap())
+                .collect::<Vec<_>>(),
+            paint
+        );
+    }
+
+    #[test]
+    fn crossing_sequences_keeps_both_origins_and_attached_children_with_the_host() {
+        let mut state = fixture();
+        let second = state.elements[2].as_object_mut().unwrap();
+        second.sequence = Some(8);
+        second.frame.position = PositionMode::Absolute;
+        second.frame.x_mm = 52.5;
+        assert!(state.add_overlay_text(0));
+        assert!(state.reorder_scene_element(0, 2));
+        assert_eq!(ids(&state), vec![2, 3, 1, 4]);
+        let frames = worlds(&state);
+        assert_close(frames[0].x_mm, 2.0);
+        assert_close(frames[1].x_mm, 52.5);
+        assert_close(frames[2].x_mm, 65.5);
+        assert_eq!(state.elements[2].as_object().unwrap().sequence, Some(8));
+        assert_eq!(
+            anchor_of(state.elements[3].as_object().unwrap())
+                .unwrap()
+                .target,
+            1
+        );
+        assert!(state.status_message.contains("fixed starts"));
+    }
+
+    #[test]
+    fn joining_after_an_attached_row_uses_the_host_without_editing_the_child() {
+        let mut state = fixture();
+        let second = state.elements[2].as_object_mut().unwrap();
+        second.sequence = Some(8);
+        second.frame.position = PositionMode::Absolute;
+        second.frame.x_mm = 52.5;
+        assert!(state.add_overlay_text(1));
+        let child = state.elements.pop().unwrap();
+        state.elements.insert(2, child.clone());
+        assert_eq!(state.previous_layout_index(3), Some(1));
+        let mut object = state.elements[3].as_object().unwrap().clone();
+        object.frame.position = PositionMode::Relative;
+        object.frame.gap_mm = 2.8;
+        state.apply_object_edit(3, object).unwrap();
+        assert_eq!(state.elements[2], child);
+        assert_eq!(state.elements[3].as_object().unwrap().sequence, Some(7));
+        assert_close(worlds(&state)[3].x_mm, 27.8);
+    }
+
+    #[test]
+    fn rejected_block_reorder_restores_document_selection_and_revisions() {
+        let mut state = fixture();
+        assert!(state.add_overlay_text(1));
+        let mut anchor = anchor_of(state.elements[3].as_object().unwrap())
+            .unwrap()
+            .clone();
+        anchor.offset_x_mm = -8.0;
+        assert!(state.set_overlay_anchor(3, anchor));
+        let before = state.document();
+        let selection = state.selected_element;
+        let revision = state.edit_revision;
+        assert!(!state.reorder_scene_element(1, 0));
+        assert_eq!(state.document(), before);
+        assert_eq!(state.selected_element, selection);
+        assert_eq!(state.edit_revision, revision);
     }
 
     fn assert_close(left: f64, right: f64) {

@@ -468,7 +468,12 @@ fn show_text_box(
         .and_then(|chain| chain.into_iter().take_while(|i| *i < selected).last());
     let previous_right = linked_previous
         .and_then(|i| state.element_rect_mm(i))
-        .or_else(|| (0..selected).rev().find_map(|i| state.element_rect_mm(i)))
+        .or_else(|| {
+            (0..selected)
+                .rev()
+                .filter(|i| state.layout_host(*i) == Some(*i))
+                .find_map(|i| state.element_rect_mm(i))
+        })
         .map_or(0.0, |(x, _, w, _)| x + w);
     ui.horizontal(|ui| {
         for (mode, label) in [
@@ -493,7 +498,7 @@ fn show_text_box(
         .num_columns(2)
         .show(ui, |ui| {
             for (label, value, maximum) in [
-                ("Width", &mut bounds.width_mm, 10_000.0),
+                ("Allocation width", &mut bounds.width_mm, 10_000.0),
                 ("Height", &mut bounds.height_mm, printable_height),
             ] {
                 ui.label(label);
@@ -524,7 +529,7 @@ fn show_text_box(
             }
             let (label, value) = match bounds.position {
                 PositionMode::Absolute => ("X", &mut bounds.x_mm),
-                PositionMode::Relative => ("Gap", &mut bounds.gap_mm),
+                PositionMode::Relative => ("Gap before", &mut bounds.gap_mm),
             };
             ui.label(label);
             changed |= ui
@@ -560,7 +565,7 @@ fn show_text_box(
     ui.small("Origin: printable top-left, not the cut edge. Rotation keeps this frame fixed.");
     if bounds.position == PositionMode::Relative {
         ui.small(
-            "Gap follows the previous object's right edge. Reordering changes its predecessor.",
+            "Gap before is empty space after the previous allocation. Allocation width includes the content and its inner whitespace.",
         );
     }
     changed
@@ -654,9 +659,9 @@ fn show_layout_properties(
             AppState::use_flow_allocation(object, height);
             object.layout.as_mut().unwrap().placement = Placement::Flow;
             object.layout.as_mut().unwrap().width = WidthSizing::Fixed;
-            if index > 0 {
+            if let Some(previous) = state.previous_layout_index(index) {
                 let previous_right = state
-                    .element_rect_mm(index - 1)
+                    .element_rect_mm(previous)
                     .map_or(0.0, |(x, _, w, _)| x + w);
                 object.frame.position = PositionMode::Relative;
                 object.frame.gap_mm = (current_x - previous_right).max(0.0);
@@ -683,7 +688,7 @@ fn show_layout_properties(
         .as_ref()
         .map_or(WidthSizing::Fixed, |p| p.width);
     ui.horizontal(|ui| {
-        ui.label("Width:");
+        ui.label("Allocation sizing:");
         for (sizing, label) in [
             (WidthSizing::Fixed, "Fixed"),
             (WidthSizing::Content, "Auto width"),
@@ -728,6 +733,33 @@ fn show_layout_properties(
         policy.width = WidthSizing::Fixed;
     }
     changed | edited
+}
+
+fn show_allocation_alignment(
+    ui: &mut egui::Ui,
+    object: &mut LabelObject,
+    resolved: &ContentBox,
+) -> bool {
+    let mut changed = false;
+    ui.label("Align within allocation");
+    for (horizontal, labels) in [
+        (true, ["Left", "Center", "Right"]),
+        (false, ["Top", "Middle", "Bottom"]),
+    ] {
+        ui.horizontal(|ui| {
+            for (fraction, label) in [0.0, 0.5, 1.0].into_iter().zip(labels) {
+                if ui.button(label).clicked() {
+                    changed |= crate::alignment::align_content(
+                        object,
+                        resolved,
+                        horizontal.then_some(fraction),
+                        (!horizontal).then_some(fraction),
+                    );
+                }
+            }
+        });
+    }
+    changed
 }
 
 fn show_content_box(
@@ -880,6 +912,9 @@ fn show_content_box(
     } else {
         "Content transforms keep the layout allocation fixed."
     });
+    if !free {
+        changed |= show_allocation_alignment(ui, object, resolved);
+    }
     if ui
         .button("Fit inside")
         .on_hover_text("Fit proportionally to the available area; text uses automatic font size")
@@ -976,7 +1011,12 @@ fn show_object_properties(
     let mut changed = match state.canvas_edit_target {
         CanvasEditTarget::Content => {
             let mut changed = show_content_box(ui, object, &resolved, state);
-            changed |= show_vertical_alignment(ui, &mut object.frame.vertical_align);
+            if !matches!(
+                object.content,
+                ObjectContent::Line { .. } | ObjectContent::Shape { .. }
+            ) {
+                changed |= show_vertical_alignment(ui, &mut object.frame.vertical_align);
+            }
             changed
         }
         CanvasEditTarget::Slot => {

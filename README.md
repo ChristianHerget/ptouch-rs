@@ -159,6 +159,7 @@ ptouch-gui
 
 Use `ptouch-gui --offline` to edit and export without opening or polling USB or
 Bluetooth devices. The preview uses the layout's saved design DPI.
+**Info** shows the running version and a short editing guide.
 
 - Live label preview with zoom
 - Add/edit/reorder text, images, cut marks, padding
@@ -246,7 +247,21 @@ links. Switching to **Free positioning** unlinks only that object and leaves
 its neighbours in place. These edits use layout format v11, which stores a
 `sequence` identifier on linked objects; older layouts retain their original
 format until a sequence edit needs the new links.
+Attached objects appear beneath their host and move with it in **Layout order**.
+Moving across independent sequences keeps their fixed starts. For a continuous
+strip, select the next sequence's first object, use **Adjust layout… → After
+previous**, and set **Gap before**. Attached rows do not count as predecessors.
 Untouched older layouts combine black pixels at overlaps; white remains transparent.
+
+**Allocation width** reserves the object's full space in a sequence. **Gap before**
+adds empty space outside that allocation. Use **Align within allocation** to align
+the content without moving or resizing the allocation; alignment follows the tape
+axes even for rotated or mirrored objects.
+
+For a separator centred in a 2.8 mm spacer, set its **Allocation width** to
+**2.8 mm** and **Gap before** to **0 mm**, then choose horizontal **Center**.
+The line stays 0.3 mm thick. Setting Gap before to 2.8 mm instead puts all that
+space before the line. See [the separator example](examples/patch-panel-separators.ptl).
 
 New layouts keep content inside the printable area. Fixed sequence allocations
 also constrain their content unless **Keep content inside allocation** is turned

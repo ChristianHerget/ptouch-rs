@@ -360,7 +360,8 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     let mut selection = None;
     let selected = state.selected_canvas_target();
 
-    for (idx, element) in state.elements.iter().enumerate() {
+    for (row, idx) in state.layout_order().into_iter().enumerate() {
+        let element = &state.elements[idx];
         let object_target = CanvasTarget {
             element: idx,
             edit: CanvasEditTarget::Content,
@@ -375,6 +376,13 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 .as_ref()
                 .is_some_and(|scene| scene.anchor.is_some())
         });
+        if !attached
+            && let Some(object) = element.as_object()
+            && object.sequence.is_some()
+            && object.frame.position == ptouch_render::document::PositionMode::Absolute
+        {
+            ui.small(format!("Sequence start · X {:.2} mm", object.frame.x_mm));
+        }
         let has_slot = !attached
             && matches!(
                 element,
@@ -392,7 +400,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         }) || !state.slot_followers(idx).is_empty();
         let label = format!(
             "{}. {} {}{}",
-            idx + 1,
+            row + 1,
             if flow { "↔" } else { "•" },
             element.display_name(),
             if element
@@ -406,6 +414,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         );
         let response = ui
             .horizontal(|ui| {
+                if attached {
+                    ui.add_space(12.0);
+                }
                 let row_width = ui.available_width().max(20.0);
 
                 ui.add_sized(
@@ -419,7 +430,9 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 )
                 .on_hover_text(format!(
                     "{label}\n{}",
-                    if flow {
+                    if attached {
+                        "Attached: moves with its host. Use Layers to change drawing order."
+                    } else if flow {
                         "In sequence: reordering changes physical placement."
                     } else {
                         "Free position: reordering preserves X/Y coordinates."
@@ -471,14 +484,21 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.close();
             }
         });
-        response.dnd_set_drag_payload(ElementDrag(idx));
-        if let Some(source) = response.dnd_hover_payload::<ElementDrag>() {
+        if !attached {
+            response.dnd_set_drag_payload(ElementDrag(idx));
+        }
+        if let Some(source) = response.dnd_hover_payload::<ElementDrag>()
+            && state.layout_host(idx) != Some(source.0)
+        {
             let y = if source.0 < idx {
                 response.rect.bottom()
             } else {
                 response.rect.top()
             };
-            let hint = match (state.flow_chain(source.0), state.flow_chain(idx)) {
+            let hint = match (
+                state.flow_chain(source.0),
+                state.layout_host(idx).and_then(|i| state.flow_chain(i)),
+            ) {
                 (Some(from), Some(to)) if from != to => "Move into sequence",
                 (Some(_), _) => "Reorder sequence",
                 _ => "List order · keep position",
@@ -530,10 +550,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
 
         if ui
             .add_enabled(
-                has_selection && state.selected_element.unwrap_or(0) > 0,
+                state.selected_element.and_then(|i| state.layout_neighbor(i, false)).is_some(),
                 egui::Button::new("Up"),
             )
-            .on_hover_text("Reorder a sequence; free objects keep their X/Y coordinates")
+            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -542,14 +562,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
 
         if ui
             .add_enabled(
-                has_selection
-                    && state
-                        .selected_element
-                        .map(|i| i + 1 < state.elements.len())
-                        .unwrap_or(false),
+                state.selected_element.and_then(|i| state.layout_neighbor(i, true)).is_some(),
                 egui::Button::new("Down"),
             )
-            .on_hover_text("Reorder a sequence; free objects keep their X/Y coordinates")
+            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -578,13 +594,13 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 state.duplicate_element(idx);
             }
             ElementAction::MoveUp(idx) => {
-                if idx > 0 {
-                    move_element(state, idx, idx - 1);
+                if let Some(previous) = state.layout_neighbor(idx, false) {
+                    move_element(state, idx, previous);
                 }
             }
             ElementAction::MoveDown(idx) => {
-                if idx + 1 < state.elements.len() {
-                    move_element(state, idx, idx + 1);
+                if let Some(next) = state.layout_neighbor(idx, true) {
+                    move_element(state, idx, next);
                 }
             }
             ElementAction::MoveTo(from, to) => move_element(state, from, to),
