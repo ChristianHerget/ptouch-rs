@@ -325,6 +325,17 @@ impl AppState {
             && (placement(before) != Some(Placement::Free) || self.flow_chain(index).is_some());
         let became_flow = placement(&object) == Some(Placement::Flow)
             && placement(before) != Some(Placement::Flow);
+        let changes_anchor =
+            before.sequence.is_some() && before.frame.position != object.frame.position;
+        if !became_free && !became_flow && !changes_anchor {
+            if object.sequence != before.sequence {
+                return Err("Use sequence reordering to change membership".into());
+            }
+            // Ordinary pointer frames must not clone every embedded image.
+            self.elements[index] = LabelElement::Object(object);
+            self.mark_dirty();
+            return Ok(());
+        }
         let mut elements = self.elements.clone();
         if became_free {
             sequence::detach(&mut elements, index).map_err(|e| e.to_string())?;
