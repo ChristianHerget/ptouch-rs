@@ -65,7 +65,10 @@ impl PtouchApp {
         self.state.needs_rerender = false;
 
         let mut resolved = self.state.document();
-        if let Err(error) = ptouch_render::object_layout::resolve(&mut resolved, &mut self.renderer)
+        if let Err(error) = resolved
+            .decode_image_caches()
+            .and_then(|_| ptouch_render::object_layout::resolve(&mut resolved, &mut self.renderer))
+            .and_then(|_| ptouch_render::scene::resolve(&mut resolved))
         {
             self.state.status_message = format!("Render error: {error}");
         } else {

@@ -73,8 +73,20 @@ pub fn validate(elements: &[LabelElement], version: u32) -> Result<()> {
 }
 
 /// Explicit members can have independent objects between them in the list.
+fn attached(element: &LabelElement) -> bool {
+    element.as_object().is_some_and(|object| {
+        object
+            .scene
+            .as_ref()
+            .is_some_and(|scene| scene.anchor.is_some())
+    })
+}
+
 pub fn members(elements: &[LabelElement], index: usize) -> Option<Vec<usize>> {
     let object = elements.get(index)?.as_object()?;
+    if attached(&elements[index]) {
+        return None;
+    }
     if let Some(id) = object.sequence {
         return Some(
             elements
@@ -84,31 +96,36 @@ pub fn members(elements: &[LabelElement], index: usize) -> Option<Vec<usize>> {
                 .collect(),
         );
     }
-    let mut start = index;
+    let active: Vec<_> = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (!attached(e)).then_some(i))
+        .collect();
+    let mut start = active.iter().position(|i| *i == index)?;
     while start > 0
-        && elements[start].as_object()?.frame.position == PositionMode::Relative
-        && elements[start - 1]
+        && elements[active[start]].as_object()?.frame.position == PositionMode::Relative
+        && elements[active[start - 1]]
             .as_object()
             .is_some_and(|o| o.sequence.is_none())
     {
         start -= 1;
     }
     let mut end = start;
-    while elements
+    while active
         .get(end + 1)
-        .and_then(LabelElement::as_object)
+        .and_then(|i| elements[*i].as_object())
         .is_some_and(|o| o.sequence.is_none() && o.frame.position == PositionMode::Relative)
     {
         end += 1;
     }
-    let first = elements[start].as_object()?;
+    let first = elements[active[start]].as_object()?;
     (end > start
         || first.frame.position == PositionMode::Relative
         || first
             .layout
             .as_ref()
             .is_some_and(|p| p.placement == Placement::Flow))
-    .then(|| (start..=end).collect())
+    .then(|| active[start..=end].to_vec())
 }
 
 /// Preserve exact physical origins while recording previously implicit links.
@@ -123,7 +140,11 @@ pub fn materialize(elements: &mut [LabelElement]) -> Result<()> {
         .iter()
         .map(|e| {
             let o = e.as_object().unwrap();
-            cursor.place(&o.frame, o.sequence)
+            if attached(e) {
+                Ok(o.frame.x_mm)
+            } else {
+                cursor.place(&o.frame, o.sequence)
+            }
         })
         .collect::<Result<_>>()?;
     let mut next = elements
@@ -247,7 +268,11 @@ pub fn detach(elements: &mut [LabelElement], index: usize) -> Result<()> {
         .iter()
         .map(|e| {
             let o = e.as_object().unwrap();
-            cursor.place(&o.frame, o.sequence)
+            if attached(e) {
+                Ok(o.frame.x_mm)
+            } else {
+                cursor.place(&o.frame, o.sequence)
+            }
         })
         .collect::<Result<_>>()?;
     let member = chain.iter().position(|i| *i == index).unwrap();

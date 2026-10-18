@@ -21,6 +21,9 @@ pub enum ToolbarAction {
     AddText,
     AddImage,
     AddLine,
+    AddRectangle,
+    AddEllipse,
+    AddCircle,
     CutMark,
     Padding,
     Print,
@@ -73,6 +76,20 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &AppState) -> Option<ToolbarAction
         {
             action = Some(ToolbarAction::AddLine);
         }
+        ui.add_enabled_ui(state.is_free_layout(), |ui| {
+            ui.menu_button("Add Shape", |ui| {
+                for (label, command) in [
+                    ("Rectangle", ToolbarAction::AddRectangle),
+                    ("Ellipse", ToolbarAction::AddEllipse),
+                    ("Circle", ToolbarAction::AddCircle),
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(command);
+                        ui.close();
+                    }
+                }
+            });
+        });
         if !state.is_free_layout() && ui.button("Padding").clicked() {
             action = Some(ToolbarAction::Padding);
         }
@@ -131,6 +148,15 @@ pub fn execute_action(state: &mut AppState, action: ToolbarAction) {
         },
         ToolbarAction::AddText => state.add_text(),
         ToolbarAction::AddLine => state.add_line(),
+        ToolbarAction::AddRectangle => {
+            state.add_shape(ptouch_render::shape::ShapeKind::Rectangle, false);
+        }
+        ToolbarAction::AddEllipse => {
+            state.add_shape(ptouch_render::shape::ShapeKind::Ellipse, false);
+        }
+        ToolbarAction::AddCircle => {
+            state.add_shape(ptouch_render::shape::ShapeKind::Ellipse, true);
+        }
         ToolbarAction::AddImage => {
             if let Some(path) = crate::widgets::image_file_dialog().pick_file() {
                 match std::fs::read(&path) {

@@ -114,6 +114,97 @@ pub fn load_image_from_reader<R: Read>(
     Ok(convert_to_bitmap(img, options))
 }
 
+/// Load an image with its source transparency preserved as binary coverage.
+///
+/// Alpha values below 128 are transparent; opaque white covers earlier ink.
+/// Unlike the legacy bitmap loader, this opt-in path never auto-inverts dark
+/// images. It uses the requested binarization while excluding hidden RGB from
+/// the grayscale image, so transparent black cannot change the visible icon.
+pub fn load_layer_from_reader<R: Read>(
+    reader: R,
+    options: &ImageLoadOptions,
+) -> Result<crate::surface::RasterLayer> {
+    const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(crate::RenderError::DimensionMismatch(
+            "image source is too large".into(),
+        ));
+    }
+    let image = if let Ok(format) = image::guess_format(&bytes) {
+        // Keep recognized raster errors, as in the legacy dispatch.
+        decode_layer_raster(&bytes, Some(format))?
+    } else if bytes.starts_with(&[0x1f, 0x8b]) {
+        let svg = decompress_layer_svgz(&bytes, MAX_INPUT_BYTES)?;
+        render_svg_data_with_alpha(&svg, options.target_height, true)?
+    } else if bytes
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(&bytes)
+        .trim_ascii_start()
+        .starts_with(b"<")
+    {
+        render_svg_data_with_alpha(&bytes, options.target_height, true)?
+    } else {
+        decode_layer_raster(&bytes, None)?
+    };
+    convert_to_layer(image, options)
+}
+
+fn decompress_layer_svgz(bytes: &[u8], max_bytes: u64) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut decoded)
+        .map_err(|error| crate::RenderError::Text(format!("SVG parse error: {error}")))?;
+    if decoded.len() as u64 > max_bytes {
+        return Err(crate::RenderError::DimensionMismatch(
+            "SVGZ source expands beyond the image source limit".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn check_layer_size(width: u32, height: u32) -> Result<()> {
+    if width == 0
+        || height == 0
+        || width > 1_000_000
+        || height > 1_000_000
+        || u64::from(width) * u64::from(height) > 16_777_216
+    {
+        return Err(crate::RenderError::DimensionMismatch(
+            "image raster is too large".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_layer_raster(bytes: &[u8], format: Option<image::ImageFormat>) -> Result<DynamicImage> {
+    use image::ImageDecoder;
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    if let Some(format) = format {
+        reader.set_format(format);
+    } else {
+        reader = reader.with_guessed_format()?;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1_000_000);
+    limits.max_image_height = Some(1_000_000);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    // Reject oversized rasters before allocating their decoded pixel buffer.
+    check_layer_size(width, height)?;
+    if decoder.total_bytes() > 128 * 1024 * 1024 {
+        return Err(crate::RenderError::DimensionMismatch(
+            "decoded image is too large".into(),
+        ));
+    }
+    Ok(DynamicImage::from_decoder(decoder)?)
+}
+
 /// Load a PNG image from a file path (backward-compatible wrapper).
 pub fn load_png(path: &Path) -> Result<LabelBitmap> {
     load_image(path, &ImageLoadOptions::default())
@@ -140,6 +231,14 @@ fn load_svg_file(path: &Path, target_height: Option<u32>) -> Result<DynamicImage
 
 /// Render SVG data bytes to a `DynamicImage`.
 fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicImage> {
+    render_svg_data_with_alpha(data, target_height, false)
+}
+
+fn render_svg_data_with_alpha(
+    data: &[u8],
+    target_height: Option<u32>,
+    preserve_alpha: bool,
+) -> Result<DynamicImage> {
     use resvg::tiny_skia;
     use resvg::usvg;
 
@@ -151,8 +250,16 @@ fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicIma
     let fontdb = std::sync::Arc::make_mut(&mut opt.fontdb);
     fontdb.load_system_fonts();
 
-    let tree = usvg::Tree::from_data(data, &opt)
-        .map_err(|e| crate::RenderError::Text(format!("SVG parse error: {}", e)))?;
+    let tree = if preserve_alpha {
+        // The alpha entry point already expanded SVGZ within its byte budget.
+        // Parsing text directly prevents nested gzip from bypassing that cap.
+        let text = std::str::from_utf8(data)
+            .map_err(|error| crate::RenderError::Text(format!("SVG parse error: {error}")))?;
+        usvg::Tree::from_str(text, &opt)
+    } else {
+        usvg::Tree::from_data(data, &opt)
+    }
+    .map_err(|e| crate::RenderError::Text(format!("SVG parse error: {}", e)))?;
 
     let svg_size = tree.size();
     // Preserve fractional SVG viewports when calculating the scale. Truncating
@@ -183,14 +290,24 @@ fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicIma
         crate::RenderError::Text(format!("Failed to create {}x{} pixmap for SVG", w, h))
     })?;
 
-    // Fill with white background (label printers print on white tape).
+    // The old path keeps its exact white-matte behavior. Alpha mode starts on
+    // the pixmap's transparent background and preserves its source coverage.
     let mut pixmap = pixmap;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    if !preserve_alpha {
+        pixmap.fill(tiny_skia::Color::WHITE);
+    }
 
     let transform = tiny_skia::Transform::from_scale(scale as f32, scale as f32);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
-    let rgba = image::RgbaImage::from_raw(w, h, pixmap.take()).ok_or_else(|| {
+    let pixels = if preserve_alpha {
+        // tiny-skia stores premultiplied RGBA, unlike DynamicImage. Without
+        // demultiplication a partly transparent white stroke becomes dark.
+        pixmap.take_demultiplied()
+    } else {
+        pixmap.take()
+    };
+    let rgba = image::RgbaImage::from_raw(w, h, pixels).ok_or_else(|| {
         crate::RenderError::Text("Failed to convert SVG pixmap to image".to_string())
     })?;
 
@@ -200,6 +317,61 @@ fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicIma
 // ---------------------------------------------------------------------------
 // Conversion pipeline
 // ---------------------------------------------------------------------------
+
+fn convert_to_layer(
+    img: DynamicImage,
+    options: &ImageLoadOptions,
+) -> Result<crate::surface::RasterLayer> {
+    check_layer_size(img.width(), img.height())?;
+    let mut pixels = img.into_luma_alpha8();
+    if let Some(target_height) = options.target_height
+        && target_height > 0
+        && target_height != pixels.height()
+    {
+        let width = (f64::from(pixels.width()) * f64::from(target_height)
+            / f64::from(pixels.height()))
+        .round()
+        .max(1.0);
+        if width > f64::from(u32::MAX) {
+            return Err(crate::RenderError::DimensionMismatch(
+                "image raster is too large".into(),
+            ));
+        }
+        check_layer_size(width as u32, target_height)?;
+        // Resize the source color and coverage together. Nearest sampling
+        // avoids mixing arbitrary hidden RGB into a visible icon edge.
+        pixels = image::imageops::resize(&pixels, width as u32, target_height, FilterType::Nearest);
+    }
+    let (width, height) = pixels.dimensions();
+    let mut gray = GrayImage::new(width, height);
+    let mut coverage = LabelBitmap::new(width, height);
+    for (x, y, pixel) in pixels.enumerate_pixels() {
+        let visible = pixel.0[1] >= 128;
+        gray.put_pixel(x, y, image::Luma([if visible { pixel.0[0] } else { 255 }]));
+        if visible {
+            coverage.set_pixel(x, y, true);
+        }
+    }
+    let mode = match options.binarize {
+        BinarizeMode::Auto => detect_binarize_mode(&gray),
+        other => other,
+    };
+    let mut ink = match mode {
+        BinarizeMode::Dither | BinarizeMode::Auto => floyd_steinberg_dither(&gray, false),
+        BinarizeMode::Threshold => threshold_binarize(&gray, otsu_threshold(&gray), false),
+    };
+    for y in 0..height {
+        for x in 0..width {
+            if !coverage.get_pixel(x, y) {
+                ink.set_pixel(x, y, false);
+            }
+        }
+    }
+    Ok(crate::surface::RasterLayer {
+        ink,
+        coverage: Some(coverage),
+    })
+}
 
 /// Convert a `DynamicImage` to a 1-bit `LabelBitmap`.
 ///
@@ -450,6 +622,224 @@ mod tests {
         base64::engine::general_purpose::STANDARD
             .decode("H4sIAAAAAAAC/0XMSw7CMAyE4atYc4DalK5QnLtAKUlEeKi1cLk96absRvo/TVg+idZHfS6KbPY+Mbt758fuNSfuRYSbAHm5Wlb0AspTSdkUB0EM8zQarYoB9G15h8PftXkrtSou9TzewTFsl/EH0/DhBHoAAAA=")
             .unwrap()
+    }
+
+    fn rgba_png(pixels: image::RgbaImage) -> Vec<u8> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        png.into_inner()
+    }
+
+    #[test]
+    fn alpha_layer_distinguishes_hidden_rgb_opaque_white_and_binary_opacity() {
+        let pixels = [
+            [0, 0, 0, 0],
+            [255, 255, 255, 0],
+            [255, 255, 255, 255],
+            [0, 0, 0, 127],
+            [0, 0, 0, 128],
+            [255, 255, 255, 128],
+            [0, 0, 0, 255],
+        ];
+        let png = rgba_png(image::RgbaImage::from_fn(7, 1, |x, _| {
+            image::Rgba(pixels[x as usize])
+        }));
+        for binarize in [
+            BinarizeMode::Auto,
+            BinarizeMode::Threshold,
+            BinarizeMode::Dither,
+        ] {
+            let layer = load_layer_from_reader(
+                png.as_slice(),
+                &ImageLoadOptions {
+                    binarize,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let coverage = layer.coverage.unwrap();
+            for (x, (covered, ink)) in [
+                (false, false),
+                (false, false),
+                (true, false),
+                (false, false),
+                (true, true),
+                (true, false),
+                (true, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    coverage.get_pixel(x as u32, 0),
+                    covered,
+                    "{binarize:?} x={x}"
+                );
+                assert_eq!(layer.ink.get_pixel(x as u32, 0), ink, "{binarize:?} x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_layer_ignores_hidden_rgb_and_never_auto_inverts_black_icons() {
+        let black = rgba_png(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        let layer = load_layer_from_reader(black.as_slice(), &ImageLoadOptions::default()).unwrap();
+        assert!(layer.ink.get_pixel(1, 1));
+        assert!(layer.coverage.unwrap().get_pixel(1, 1));
+
+        for binarize in [
+            BinarizeMode::Auto,
+            BinarizeMode::Threshold,
+            BinarizeMode::Dither,
+        ] {
+            let options = ImageLoadOptions {
+                binarize,
+                target_height: Some(20),
+                ..Default::default()
+            };
+            let render = |hidden| {
+                let image = image::RgbaImage::from_fn(9, 5, |x, y| {
+                    if x < 4 {
+                        image::Rgba([hidden, hidden, hidden, 0])
+                    } else {
+                        let luma = (x * 21 + y * 13) as u8;
+                        image::Rgba([luma, luma, luma, 255])
+                    }
+                });
+                load_layer_from_reader(rgba_png(image).as_slice(), &options).unwrap()
+            };
+            let black = render(0);
+            let white = render(255);
+            assert_eq!((black.ink.width(), black.ink.height()), (36, 20));
+            assert_eq!(black.ink.data(), white.ink.data(), "{binarize:?}");
+            assert_eq!(
+                black.coverage.unwrap().data(),
+                white.coverage.unwrap().data()
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_svg_and_svgz_preserve_transparent_pixels_and_demultiply_white() {
+        let options = ImageLoadOptions::default();
+        for bytes in [SVG.to_vec(), svgz()] {
+            let layer = load_layer_from_reader(bytes.as_slice(), &options).unwrap();
+            let coverage = layer.coverage.unwrap();
+            assert!(!coverage.get_pixel(0, 0));
+            assert!(!layer.ink.get_pixel(0, 0));
+            assert!(coverage.get_pixel(5, 3));
+            assert!(layer.ink.get_pixel(5, 3));
+        }
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="2"><rect width="2" height="2" fill="white" opacity="0.5"/><rect x="2" width="2" height="2" fill="black" opacity="0.5"/><rect x="4" width="2" height="2" fill="black" opacity="0.49"/></svg>"#;
+        for binarize in [
+            BinarizeMode::Auto,
+            BinarizeMode::Threshold,
+            BinarizeMode::Dither,
+        ] {
+            let layer = load_layer_from_reader(
+                svg.as_slice(),
+                &ImageLoadOptions {
+                    binarize,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let coverage = layer.coverage.unwrap();
+            assert!(coverage.get_pixel(0, 0));
+            assert!(
+                !layer.ink.get_pixel(0, 0),
+                "white must be demultiplied: {binarize:?}"
+            );
+            assert!(coverage.get_pixel(2, 0));
+            assert!(layer.ink.get_pixel(2, 0));
+            assert!(!coverage.get_pixel(4, 0));
+            assert!(!coverage.get_pixel(6, 0));
+        }
+    }
+
+    #[test]
+    fn alpha_svgz_expansion_is_bounded_and_nested_gzip_is_not_reparsed() {
+        use std::io::Write;
+
+        let gzip = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        };
+        let compressed = gzip(&[b' '; 1024]);
+        assert!(compressed.len() < 128);
+        assert!(matches!(
+            decompress_layer_svgz(&compressed, 128),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        assert_eq!(
+            decompress_layer_svgz(&compressed, 1024).unwrap().len(),
+            1024
+        );
+        assert!(matches!(
+            load_layer_from_reader(gzip(&gzip(SVG)).as_slice(), &ImageLoadOptions::default()),
+            Err(crate::RenderError::Text(message)) if message.starts_with("SVG parse error:")
+        ));
+    }
+
+    #[test]
+    fn alpha_loader_keeps_decoder_errors_and_checks_source_and_scaled_raster_sizes() {
+        let options = ImageLoadOptions::default();
+        assert!(matches!(
+            load_layer_from_reader(b"\x89PNG\r\n\x1a\n<svg>".as_slice(), &options),
+            Err(crate::RenderError::Image(_))
+        ));
+        for data in [b"<svg".as_slice(), b"<not-svg/>", &[0x1f, 0x8b, 0]] {
+            assert!(matches!(
+                load_layer_from_reader(data, &options),
+                Err(crate::RenderError::Text(message)) if message.starts_with("SVG parse error:")
+            ));
+        }
+        let huge_svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="50000" height="50000"/>"#;
+        assert!(matches!(
+            load_layer_from_reader(huge_svg.as_slice(), &options),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        assert!(matches!(
+            load_layer_from_reader(b"P5\n20000 20000\n255\n".as_slice(), &options),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        assert!(matches!(
+            load_layer_from_reader(
+                SVG,
+                &ImageLoadOptions {
+                    target_height: Some(u32::MAX),
+                    ..Default::default()
+                }
+            ),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        let png = rgba_png(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        assert!(matches!(
+            load_layer_from_reader(
+                png.as_slice(),
+                &ImageLoadOptions {
+                    target_height: Some(u32::MAX),
+                    ..Default::default()
+                }
+            ),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
+        assert!(matches!(
+            load_layer_from_reader(std::io::repeat(0).take(64 * 1024 * 1024 + 1), &options),
+            Err(crate::RenderError::DimensionMismatch(_))
+        ));
     }
 
     #[test]

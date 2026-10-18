@@ -130,9 +130,15 @@ pub enum PrinterResponse {
     Error(String),
 }
 
+pub use crate::scene_edit::LayerMove;
+
 /// Central application state shared across all panels.
 pub struct AppState {
+    /// Layers changes overlap; layout order retains sequence placement.
+    pub layers_view: bool,
     pub history: crate::history::DocumentHistory,
+    /// Reuse font shaping caches while validating content-sized scene edits.
+    pub(crate) scene_measurement_renderer: Option<TextRenderer>,
     pub edit_revision: u64,
     /// Preserve an opened legacy format until the user explicitly converts it.
     pub document_version: u32,
@@ -226,7 +232,9 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            layers_view: false,
             history: Default::default(),
+            scene_measurement_renderer: None,
             edit_revision: 0,
             document_version: DEFAULT_DOCUMENT_VERSION,
             elements: Vec::new(),
@@ -282,6 +290,23 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn uses_scene(&self) -> bool {
+        self.elements
+            .iter()
+            .filter_map(LabelElement::as_object)
+            .any(|object| {
+                object.scene.is_some()
+                    || matches!(
+                        object.content,
+                        ObjectContent::Shape { .. }
+                            | ObjectContent::Image {
+                                preserve_alpha: true,
+                                ..
+                            }
+                    )
+            })
+    }
+
     pub fn use_flow_allocation(object: &mut LabelObject, height: f64) {
         use ptouch_render::object_layout::{Placement, WidthSizing};
         if object
@@ -309,7 +334,24 @@ impl AppState {
     }
 
     /// Commit positioning changes together with any affected sequence links.
-    pub fn apply_object_edit(
+    pub fn apply_object_edit(&mut self, index: usize, object: LabelObject) -> Result<(), String> {
+        let scene_candidate = object.scene.is_some()
+            || matches!(
+                object.content,
+                ObjectContent::Shape { .. }
+                    | ObjectContent::Image {
+                        preserve_alpha: true,
+                        ..
+                    }
+            );
+        if self.uses_scene() || scene_candidate {
+            self.apply_scene_object_edit(index, object)
+        } else {
+            self.apply_object_edit_base(index, object)
+        }
+    }
+
+    pub(crate) fn apply_object_edit_base(
         &mut self,
         index: usize,
         mut object: LabelObject,
@@ -449,12 +491,29 @@ impl AppState {
             self.flow_chain(i).is_none()
                 && self.elements[i].as_object().is_some_and(|o| {
                     o.frame.position == PositionMode::Absolute
+                        && !o.scene.as_ref().is_some_and(|scene| scene.anchor.is_some())
                         && o.layout.as_ref().is_none_or(|p| {
                             p.placement == ptouch_render::object_layout::Placement::Free
                         })
                 })
         };
         free(a) && free(b)
+    }
+
+    /// Scene swaps commit only after all affected hosts and children fit. No
+    /// revision/selection state is changed before this transactional check.
+    fn validate_scene_swap(&mut self, before: Option<Vec<LabelElement>>) -> bool {
+        let Some(before) = before else { return true };
+        let result = ptouch_render::scene::enable(&mut self.elements)
+            .map_err(|error| error.to_string())
+            .and_then(|_| self.validate_scene_geometry());
+        if let Err(error) = result {
+            self.elements = before;
+            self.status_message = error;
+            return false;
+        }
+        self.document_version = self.document_version.max(12);
+        true
     }
 
     pub fn swap_positions(&mut self, a: usize, b: usize) -> bool {
@@ -470,10 +529,14 @@ impl AppState {
             self.status_message = "Swapped positions would exceed the printable height".into();
             return false;
         }
+        let before = self.uses_scene().then(|| self.elements.clone());
         for (index, x, y) in [(a, second.x_mm, second.y_mm), (b, first.x_mm, first.y_mm)] {
             let frame = &mut self.elements[index].as_object_mut().unwrap().frame;
             frame.x_mm = x;
             frame.y_mm = y;
+        }
+        if !self.validate_scene_swap(before) {
+            return false;
         }
         self.validate_selection();
         self.mark_dirty();
@@ -524,8 +587,12 @@ impl AppState {
             self.status_message = message.into();
             return false;
         }
+        let before = self.uses_scene().then(|| self.elements.clone());
         self.elements[a] = LabelElement::Object(first);
         self.elements[b] = LabelElement::Object(second);
+        if !self.validate_scene_swap(before) {
+            return false;
+        }
         self.validate_selection();
         self.mark_dirty();
         true
@@ -534,6 +601,14 @@ impl AppState {
     /// Keep the chain anchor at its physical position while content order changes.
     /// Free objects retain coordinates; sequence moves can adopt a destination chain.
     pub fn reorder_object(&mut self, from: usize, to: usize) -> bool {
+        if self.uses_scene() {
+            self.reorder_scene_element(from, to)
+        } else {
+            self.reorder_object_base(from, to)
+        }
+    }
+
+    pub(crate) fn reorder_object_base(&mut self, from: usize, to: usize) -> bool {
         if from == to || from >= self.elements.len() || to >= self.elements.len() {
             return false;
         }
@@ -696,7 +771,17 @@ impl AppState {
     /// Selecting a target is UI state only: never detach auto-fit content,
     /// upgrade the file format, or request a different rendered bitmap.
     pub fn select_canvas_target(&mut self, target: Option<CanvasTarget>) {
-        let target = target.filter(|target| target.element < self.elements.len());
+        let target = target
+            .filter(|target| target.element < self.elements.len())
+            .map(|mut target| {
+                if self.elements[target.element]
+                    .as_object()
+                    .is_some_and(|o| o.scene.as_ref().is_some_and(|s| s.anchor.is_some()))
+                {
+                    target.edit = CanvasEditTarget::Content;
+                }
+                target
+            });
         if self.selected_canvas_target() != target {
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
@@ -878,6 +963,11 @@ impl AppState {
     /// Resolve a model rectangle before whole-label mirroring. Millimeter
     /// frames do not depend on the previous preview or raster rounding.
     pub fn element_rect_mm(&self, index: usize) -> Option<(f64, f64, f64, f64)> {
+        if self.uses_scene() {
+            let frames = ptouch_render::scene::world_frames(&self.elements).ok()?;
+            let frame = frames.get(index)?;
+            return Some((frame.x_mm, frame.y_mm, frame.width_mm, frame.height_mm));
+        }
         let mut cursor = 0.0;
         let mut sequence_cursor = ptouch_render::sequence::LayoutCursor::default();
         for (i, element) in self.elements.iter().enumerate().take(index + 1) {
@@ -1001,10 +1091,18 @@ impl AppState {
         if let Some(object) = element.as_object_mut() {
             ptouch_render::object_layout::update_allocation(object);
         }
-        self.editor_generation = self.editor_generation.wrapping_add(1);
-        self.document_version = self.document_version.max(element.minimum_version());
+        let minimum_version = element.minimum_version();
         let index = insertion.map_or(self.elements.len(), |i| i + 1);
         self.elements.insert(index, element);
+        if self.uses_scene()
+            && let Err(error) = ptouch_render::scene::enable(&mut self.elements)
+        {
+            self.elements.remove(index);
+            self.status_message = error.to_string();
+            return;
+        }
+        self.editor_generation = self.editor_generation.wrapping_add(1);
+        self.document_version = self.document_version.max(minimum_version);
         self.select_canvas_target(Some(CanvasTarget {
             element: index,
             edit: CanvasEditTarget::Content,
@@ -1016,6 +1114,14 @@ impl AppState {
     /// append after the furthest right edge and at the end of the element list,
     /// preserving existing coordinates and implicit relative bindings.
     pub fn duplicate_element(&mut self, index: usize) -> bool {
+        if self.uses_scene() {
+            self.duplicate_scene_element(index)
+        } else {
+            self.duplicate_element_base(index)
+        }
+    }
+
+    pub(crate) fn duplicate_element_base(&mut self, index: usize) -> bool {
         let sequence = !self.slot_followers(index).is_empty()
             || self.flow_chain(index).is_some()
             || self
@@ -1097,6 +1203,14 @@ impl AppState {
     /// Removing a sequence's first object transfers its anchor to the next
     /// object, rather than binding that object to a preceding independent row.
     pub fn delete_element(&mut self, index: usize) -> bool {
+        if self.uses_scene() {
+            self.delete_scene_element(index)
+        } else {
+            self.delete_element_base(index)
+        }
+    }
+
+    pub(crate) fn delete_element_base(&mut self, index: usize) -> bool {
         let Some(element) = self.elements.get(index) else {
             return false;
         };
@@ -1181,11 +1295,27 @@ impl AppState {
 
     pub fn add_image_bytes(&mut self, path: Option<std::path::PathBuf>, bytes: Vec<u8>) -> bool {
         let element = if self.is_free_layout() {
-            let mut object = LabelObject::image_from_bytes(
-                path,
-                bytes,
+            let layer = match ptouch_render::image_loader::load_layer_from_reader(
+                std::io::Cursor::new(&bytes),
+                &Default::default(),
+            ) {
+                Ok(layer) => layer,
+                Err(error) => {
+                    self.status_message = error.to_string();
+                    return false;
+                }
+            };
+            let mut object = LabelObject::text(
+                "",
                 self.default_object_frame(10.0, self.printable_height_mm()),
             );
+            object.content = ObjectContent::Image {
+                path,
+                image_data: bytes,
+                bitmap: Some(layer.ink),
+                preserve_alpha: true,
+                coverage: layer.coverage.map(Box::new),
+            };
             let ObjectContent::Image {
                 bitmap: Some(bitmap),
                 ..
@@ -1222,6 +1352,7 @@ impl AppState {
         let mut frame = self.default_object_frame(length, thickness);
         frame.y_mm = (self.printable_height_mm() - thickness).max(0.0) / 2.0;
         self.add_element(LabelElement::Object(LabelObject {
+            scene: None,
             sequence: None,
             border: None,
             content_box: Some(content_box_for_frame(&frame)),
@@ -1243,6 +1374,7 @@ impl AppState {
         let element = if self.is_free_layout() {
             let frame = self.default_object_frame(1.27, self.printable_height_mm());
             LabelElement::Object(LabelObject {
+                scene: None,
                 sequence: None,
                 border: None,
                 content_box: Some(content_box_for_frame(&frame)),
@@ -2194,6 +2326,7 @@ mod tests {
             ObjectContent::Padding,
         ] {
             let object = LabelObject {
+                scene: None,
                 sequence: None,
                 border: None,
                 layout: None,
@@ -2620,5 +2753,250 @@ mod tests {
         assert!(
             matches!(&state.elements[0].as_object().unwrap().content,ObjectContent::Text{content,..} if content=="B")
         );
+    }
+    #[test]
+    fn scene_rectangles_ignore_attached_rows_even_before_preview_resolution() {
+        use ptouch_render::scene::{self, Anchor};
+        let mut host = small_free("host", 5.0, 1.0);
+        let mut next = small_free("next", 0.0, 1.0);
+        for element in [&mut host, &mut next] {
+            let object = element.as_object_mut().unwrap();
+            object.layout = None;
+            object.frame.width_mm = 10.0;
+        }
+        next.as_object_mut().unwrap().frame.position = PositionMode::Relative;
+        next.as_object_mut().unwrap().frame.gap_mm = 3.0;
+        let mut state = AppState {
+            document_version: 12,
+            elements: vec![host, small_free("child", 500.0, 50.0), next],
+            ..Default::default()
+        };
+        scene::enable(&mut state.elements).unwrap();
+        state.elements[1]
+            .as_object_mut()
+            .unwrap()
+            .scene
+            .as_mut()
+            .unwrap()
+            .anchor = Some(Anchor {
+            target: 1,
+            horizontal: 1.0,
+            vertical: 0.0,
+            offset_x_mm: -1.0,
+            offset_y_mm: 0.0,
+        });
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 18.0);
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 10.0);
+        // Host-after-child order and stale raster/cache geometry are irrelevant.
+        let child = state.elements.remove(1);
+        state.elements.insert(0, child);
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 10.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 18.0);
+        assert!(state.element_rect_mm(99).is_none());
+    }
+
+    #[test]
+    fn scene_position_swaps_validate_host_children_atomically_and_undo_together() {
+        use ptouch_render::scene::{self, Anchor};
+        let mut state = AppState {
+            document_version: 12,
+            elements: vec![
+                small_free("host", 10.0, 1.0),
+                small_free("other", 0.0, 1.0),
+                small_free("child", 8.0, 1.0),
+            ],
+            selected_element: Some(0),
+            edit_revision: 10,
+            selection_revision: 7,
+            editor_generation: 9,
+            needs_rerender: false,
+            ..Default::default()
+        };
+        scene::enable(&mut state.elements).unwrap();
+        state.elements[2]
+            .as_object_mut()
+            .unwrap()
+            .scene
+            .as_mut()
+            .unwrap()
+            .anchor = Some(Anchor {
+            target: 1,
+            horizontal: 0.0,
+            vertical: 0.0,
+            offset_x_mm: -2.0,
+            offset_y_mm: 0.0,
+        });
+        let before = state.document();
+        assert!(!state.can_swap_positions(0, 2));
+        assert!(!state.can_swap_positions(1, 2));
+        assert!(!state.swap_positions(0, 1));
+        assert_eq!(state.document(), before);
+        assert_eq!(state.selected_element, Some(0));
+        assert_eq!(state.edit_revision, 10);
+        assert_eq!(state.selection_revision, 7);
+        assert_eq!(state.editor_generation, 9);
+        assert!(!state.needs_rerender);
+
+        state.elements[2]
+            .as_object_mut()
+            .unwrap()
+            .scene
+            .as_mut()
+            .unwrap()
+            .anchor
+            .as_mut()
+            .unwrap()
+            .offset_x_mm = 1.0;
+        let before = state.document();
+        let metadata: Vec<_> = state
+            .elements
+            .iter()
+            .map(|element| element.as_object().unwrap().scene.clone())
+            .collect();
+        state
+            .history
+            .observe(before.clone(), Some(0), false, false, 0.0);
+        assert!(state.swap_positions(0, 1));
+        let world = scene::world_frames(&state.elements).unwrap();
+        assert_eq!(world[0].x_mm, 0.0);
+        assert_eq!(world[1].x_mm, 10.0);
+        assert_eq!(world[2].x_mm, 1.0);
+        assert_eq!(
+            state
+                .elements
+                .iter()
+                .map(|element| element.as_object().unwrap().scene.clone())
+                .collect::<Vec<_>>(),
+            metadata
+        );
+        let after = state.document();
+        state
+            .history
+            .observe(after.clone(), Some(0), false, false, 1.0);
+        state.history_step(false);
+        assert_eq!(state.document(), before);
+        state.history_step(true);
+        assert_eq!(state.document(), after);
+    }
+
+    #[test]
+    fn scene_content_swaps_keep_alpha_caches_with_source_and_identity_with_allocation() {
+        use ptouch_render::{
+            object_layout::Placement,
+            scene::{self, Anchor},
+        };
+        let mut state = AppState {
+            document_version: 12,
+            elements: vec![
+                small_free("text", 2.0, 1.0),
+                small_free("image", 12.0, 1.0),
+                small_free("child", 2.0, 1.0),
+            ],
+            ..Default::default()
+        };
+        let image = state.elements[1].as_object_mut().unwrap();
+        image.content = ObjectContent::Image {
+            path: None,
+            image_data: br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="2" height="2" fill="white"/><rect x="2" width="2" height="2" fill="black"/></svg>"#.to_vec(),
+            bitmap: None,
+            preserve_alpha: true,
+            coverage: None,
+        };
+        for element in &mut state.elements[..2] {
+            element
+                .as_object_mut()
+                .unwrap()
+                .layout
+                .as_mut()
+                .unwrap()
+                .placement = Placement::Flow;
+        }
+        scene::enable(&mut state.elements).unwrap();
+        state.elements[2]
+            .as_object_mut()
+            .unwrap()
+            .scene
+            .as_mut()
+            .unwrap()
+            .anchor = Some(Anchor {
+            target: 1,
+            horizontal: 0.0,
+            vertical: 0.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        let mut decoded = state.document();
+        decoded.decode_image_caches().unwrap();
+        state.elements = decoded.elements;
+        let image_content = state.elements[1].as_object().unwrap().content.clone();
+        assert!(matches!(
+            &image_content,
+            ObjectContent::Image {
+                preserve_alpha: true,
+                bitmap: Some(_),
+                coverage: Some(_),
+                ..
+            }
+        ));
+        let metadata: Vec<_> = state
+            .elements
+            .iter()
+            .map(|element| element.as_object().unwrap().scene.clone())
+            .collect();
+        let positions = scene::world_frames(&state.elements).unwrap();
+        assert!(state.swap_content(0, 1));
+        assert_eq!(
+            state.elements[0].as_object().unwrap().content,
+            image_content
+        );
+        assert!(matches!(&state.elements[1].as_object().unwrap().content,
+            ObjectContent::Text { content, .. } if content == "text"));
+        assert_eq!(scene::world_frames(&state.elements).unwrap(), positions);
+        assert_eq!(
+            state
+                .elements
+                .iter()
+                .map(|element| element.as_object().unwrap().scene.clone())
+                .collect::<Vec<_>>(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn rejected_scene_content_swap_keeps_complete_document_and_ui_revisions() {
+        use ptouch_render::{object_layout::Placement, scene};
+        let mut state = AppState {
+            document_version: 12,
+            elements: vec![
+                small_free("tight", 0.0, 1.0),
+                small_free("overflow", 12.0, 1.0),
+            ],
+            selected_element: Some(1),
+            edit_revision: 4,
+            selection_revision: 5,
+            editor_generation: 6,
+            needs_rerender: false,
+            ..Default::default()
+        };
+        for element in &mut state.elements {
+            let object = element.as_object_mut().unwrap();
+            object.layout.as_mut().unwrap().placement = Placement::Flow;
+            object.frame.width_mm = 8.0;
+            object.frame.height_mm = 8.0;
+        }
+        let overflow = state.elements[1].as_object_mut().unwrap();
+        overflow.layout.as_mut().unwrap().constrain = false;
+        overflow.content_box.as_mut().unwrap().width_mm = 6.0;
+        overflow.content_box.as_mut().unwrap().height_mm = 6.0;
+        overflow.rotation = 45.0;
+        scene::enable(&mut state.elements).unwrap();
+        let before = state.document();
+        assert!(!state.swap_content(0, 1));
+        assert_eq!(state.document(), before);
+        assert_eq!(state.selected_element, Some(1));
+        assert_eq!(state.edit_revision, 4);
+        assert_eq!(state.selection_revision, 5);
+        assert_eq!(state.editor_generation, 6);
+        assert!(!state.needs_rerender);
     }
 }

@@ -9,7 +9,7 @@ Optional native macOS Bluetooth support is available in `ptouch-core` for the PT
 
 - Print text labels with custom font, size, alignment and rotation
 - Print images (PNG, JPEG, GIF, BMP, TIFF, WebP, SVG, and more)
-- Compose multi-element labels (text + image + cut mark + padding)
+- Compose text, images, printed lines and shapes with independent drawing layers
 - Position fixed text boxes in millimeters, with absolute coordinates or gaps
   after the previous box; preview with a millimeter ruler
 - Save and reload designs as self-contained `.ptl` layout files (images
@@ -248,8 +248,7 @@ links. Switching to **Free positioning** unlinks only that object and leaves
 its neighbours in place. These edits use layout format v11, which stores a
 `sequence` identifier on linked objects; older layouts retain their original
 format until a sequence edit needs the new links.
-Black pixels combine at overlaps; white pixels do not erase other objects.
-List order determines which overlapping object is selected first.
+Untouched older layouts combine black pixels at overlaps; white remains transparent.
 
 New layouts keep content inside the printable area. Fixed sequence allocations
 also constrain their content unless **Keep content inside allocation** is turned
@@ -308,8 +307,8 @@ zero or excessive dimensions, and allocations beyond the printable tape height a
 errors; object center offsets may be negative. Bounds are rounded from absolute
 physical positions, so repeated ports do not accumulate pixel-rounding drift.
 
-New GUI object layouts use format version 7. The optional
-`[elements.layout]` table stores positioning, width sizing and containment:
+Layouts use the lowest format version required by their features. The optional
+`[elements.layout]` table, introduced in v7, stores positioning, width sizing and containment:
 
 ```toml
 [elements.layout]
@@ -325,7 +324,7 @@ the saved design DPI, keeping physical flow spacing independent of output DPI.
 Free objects use frame X/Y, zero content offsets and zero allocation padding. The same
 policies drive preview, templates, CLI export and printing.
 
-Versions 1–6 retain their rendering and version when saved without new features.
+Versions 1–11 retain their rendering and version when saved without new features.
 Independent content needs v4, custom line spacing v5, inline styles v6, and layout
 policies v7; older builds reject unsupported versions. Objects without a
 `content_box` keep their original fitting behaviour. Their first content move,
@@ -349,6 +348,40 @@ millimeter positions. The GUI saves a separate design DPI and shows the current
 preview DPI. A printer disconnect keeps the last printer preview until **Use
 design DPI** is selected. `--tape-width` changes the exported printable height in
 pixels, not the layout DPI or its millimeter coordinates.
+
+### Shapes, layers and overlays
+
+**Add Shape** creates a rectangle, ellipse or circle preset with the same move,
+resize, rotate and mirror controls as text and images. Set its stroke width and
+pattern, then choose **None**, **Ink** or **Tape** fill. Tape covers lower layers
+with unprinted tape; None keeps the interior transparent.
+
+**Layout order** changes sequence placement. **Layers** lists objects front to
+back and changes only drawing order. Drag its rows or use **Front**, **Forward**,
+**Backward** and **Back**. Select covered objects from Layers or the canvas's
+**Select layer** context menu.
+
+Under **Attachment**, **Add overlay** adds text, an image or a shape linked to
+the selected layout box. **Attach to…** links an existing object, preserving its
+position and removing it from its sequence. It follows that box through moves,
+resizing and sequence reordering; its own size and rotation stay independent.
+Attachments have one level. **Detach** keeps the current position. Changing an
+anchor preserves position; **Align to anchor** clears its millimeter offsets.
+Duplicating a host includes its overlays. Deleting it detaches them in place.
+
+New free-layout images respect source transparency. **Use image transparency**
+controls this for existing images: transparent pixels reveal lower layers and
+opaque white covers them. Partial alpha becomes binary coverage. Source images
+remain embedded in the layout.
+
+These features require format **v12**, shared by preview, templates, CLI export
+and printing. Shape content stores rectangle/ellipse geometry (circle uses equal
+dimensions), physical strokes and `none`/`ink`/`paper` fill. Images store
+`preserve_alpha`. Optional `[elements.scene]` metadata assigns every object a
+stable `id` and a `layer`; larger layers paint later. Its optional `anchor` names
+a host ID, alignment fractions and millimeter offsets. Sequence links remain
+separate from drawing order. Untouched v1–v11 files keep their version and pixels;
+older applications reject v12 instead of discarding its features.
 
 ### Printed lines
 

@@ -8,3 +8,5 @@ pub mod properties;
 pub mod sidebar;
 pub mod status_bar;
 pub mod toolbar;
+
+pub mod scene_tools;

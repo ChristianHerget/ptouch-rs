@@ -3135,6 +3135,7 @@ version = "0.12.1"
 dependencies = [
  "base64",
  "cosmic-text",
+ "flate2",
  "image",
  "log",
  "ptouch-core",

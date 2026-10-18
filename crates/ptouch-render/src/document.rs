@@ -28,13 +28,17 @@ pub use crate::layout::{
 };
 
 /// Newest supported on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 11;
+pub const DOCUMENT_VERSION: u32 = 12;
 /// Empty layouts start at v4; content features raise the version when needed.
 pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
 /// Default design resolution for layouts saved before the dpi field existed.
 fn default_dpi() -> u16 {
     180
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A complete label design: global settings plus an ordered element list.
@@ -88,6 +92,7 @@ impl LabelDocument {
             object.validate_features(doc.version)?;
         }
         crate::sequence::validate(&doc.elements, doc.version)?;
+        crate::scene::validate(&doc.elements, doc.version)?;
         Ok(toml::to_string(&doc)?)
     }
 
@@ -152,6 +157,7 @@ impl LabelDocument {
             }
         }
         crate::sequence::validate(&doc.elements, doc.version)?;
+        crate::scene::validate(&doc.elements, doc.version)?;
         doc.decode_image_caches()?;
         Ok(doc)
     }
@@ -181,6 +187,28 @@ impl LabelDocument {
     /// layout fails loudly rather than rendering blank.
     pub fn decode_image_caches(&mut self) -> Result<()> {
         for element in &mut self.elements {
+            if let Some(LabelObject {
+                content:
+                    ObjectContent::Image {
+                        image_data,
+                        bitmap,
+                        preserve_alpha: true,
+                        coverage,
+                        ..
+                    },
+                ..
+            }) = element.as_object_mut()
+            {
+                if coverage.is_none() {
+                    let layer = image_loader::load_layer_from_reader(
+                        Cursor::new(image_data.as_slice()),
+                        &ImageLoadOptions::default(),
+                    )?;
+                    *bitmap = Some(layer.ink);
+                    *coverage = layer.coverage.map(Box::new);
+                }
+                continue;
+            }
             if let Some((image_data, bitmap)) = element.image_data_and_cache_mut()
                 && bitmap.is_none()
                 && !image_data.is_empty()
@@ -402,6 +430,9 @@ pub enum LabelElement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabelObject {
+    /// Persistent painting identity/order and optional frame attachment (v12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Box<crate::scene::SceneOptions>>,
     /// Stable sequence membership (v11); independent objects may interleave.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
@@ -451,11 +482,19 @@ pub enum ObjectContent {
         image_data: Vec<u8>,
         #[serde(skip)]
         bitmap: Option<LabelBitmap>,
+        /// Transparent pixels pass through; opaque paper pixels can cover ink.
+        #[serde(default, skip_serializing_if = "is_false")]
+        preserve_alpha: bool,
+        #[serde(skip)]
+        coverage: Option<Box<LabelBitmap>>,
     },
     /// Printed horizontal stroke. Its content-box height is its physical width.
     Line {
         #[serde(default)]
         pattern: crate::stroke::StrokePattern,
+    },
+    Shape {
+        style: crate::shape::ShapeStyle,
     },
     CutMark,
     /// An empty physical frame which still occupies its full width.
@@ -463,7 +502,31 @@ pub enum ObjectContent {
 }
 
 impl LabelObject {
-    pub(crate) fn validate_features(&self, version: u32) -> Result<()> {
+    /// Validate content features against the saved document format.
+    pub fn validate_features(&self, version: u32) -> Result<()> {
+        if (self.scene.is_some()
+            || matches!(
+                self.content,
+                ObjectContent::Shape { .. }
+                    | ObjectContent::Image {
+                        preserve_alpha: true,
+                        ..
+                    }
+            ))
+            && version < 12
+        {
+            return Err(RenderError::Layout(
+                "shapes, layers and image transparency require layout version 12".into(),
+            ));
+        }
+        if let ObjectContent::Shape { style } = &self.content {
+            if self.content_box.is_none() {
+                return Err(RenderError::Layout(
+                    "shapes require independent content geometry".into(),
+                ));
+            }
+            style.validate()?;
+        }
         if let Some(border) = &self.border {
             if version < 10 {
                 return Err(RenderError::Layout(
@@ -501,6 +564,7 @@ impl LabelObject {
 
     pub fn text(content: impl Into<String>, frame: TextBox) -> Self {
         Self {
+            scene: None,
             sequence: None,
             border: None,
             frame,
@@ -526,6 +590,7 @@ impl LabelObject {
         )
         .ok();
         Self {
+            scene: None,
             sequence: None,
             border: None,
             frame,
@@ -538,6 +603,8 @@ impl LabelObject {
                 path,
                 image_data,
                 bitmap,
+                preserve_alpha: false,
+                coverage: None,
             },
         }
     }
@@ -549,6 +616,18 @@ impl LabelElement {
         match self {
             Self::Object(object) => {
                 let mut required = if object.sequence.is_some() { 11 } else { 3 };
+                if object.scene.is_some()
+                    || matches!(
+                        object.content,
+                        ObjectContent::Shape { .. }
+                            | ObjectContent::Image {
+                                preserve_alpha: true,
+                                ..
+                            }
+                    )
+                {
+                    required = 12;
+                }
                 if object.border.is_some() {
                     required = required.max(10);
                 }
@@ -691,6 +770,13 @@ impl LabelElement {
                 content: ObjectContent::Line { .. },
                 ..
             }) => "Printed line".into(),
+            LabelElement::Object(LabelObject {
+                content: ObjectContent::Shape { style },
+                ..
+            }) => match style.kind {
+                crate::shape::ShapeKind::Rectangle => "Rectangle".into(),
+                crate::shape::ShapeKind::Ellipse => "Ellipse".into(),
+            },
             LabelElement::CutMark
             | LabelElement::Object(LabelObject {
                 content: ObjectContent::CutMark,
@@ -1050,6 +1136,7 @@ mod tests {
                     frame.clone(),
                 )),
                 LabelElement::Object(LabelObject {
+                    scene: None,
                     sequence: None,
                     border: None,
                     frame: frame.clone(),
@@ -1061,6 +1148,7 @@ mod tests {
                     content: ObjectContent::CutMark,
                 }),
                 LabelElement::Object(LabelObject {
+                    scene: None,
                     sequence: None,
                     border: None,
                     frame: frame.clone(),

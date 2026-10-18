@@ -15,6 +15,7 @@ mod history;
 mod panels;
 mod printer_worker;
 mod rich_text_editor;
+mod scene_edit;
 mod state;
 mod widgets;
 

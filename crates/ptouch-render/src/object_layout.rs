@@ -86,7 +86,8 @@ pub fn validate(object: &LabelObject, version: u32) -> Result<()> {
     Ok(())
 }
 
-fn check_allocation(object: &LabelObject) -> Result<()> {
+/// Check that contained content fits its declared allocation.
+pub fn check_allocation(object: &LabelObject) -> Result<()> {
     let Some(policy) = &object.layout else {
         return Ok(());
     };
@@ -117,136 +118,152 @@ pub fn resolve(doc: &mut LabelDocument, renderer: &mut TextRenderer) -> Result<(
         .iter_mut()
         .filter_map(LabelElement::as_object_mut)
     {
-        validate(object, doc.version)?;
-        object.validate_features(doc.version)?;
-        let Some(policy) = &object.layout else {
-            continue;
-        };
-        if policy.width != WidthSizing::Content {
-            update_allocation(object);
-            check_allocation(object)?;
-            continue;
-        }
-        let content = object.content_box.as_mut().ok_or_else(|| {
-            RenderError::Layout("content sizing requires independent content geometry".into())
-        })?;
-        content.validate()?;
-        if let ObjectContent::Text {
-            content: text,
-            font_size,
-            align,
-            line_spacing,
-            styles,
-        } = &object.content
-            && !text.trim().is_empty()
-        {
-            let ppm = f64::from(doc.dpi) / 25.4;
-            let inset = object
-                .border
-                .as_ref()
-                .map(|b| b.inset_pixels(doc.dpi))
-                .transpose()?
-                .unwrap_or(0);
-            let target_h = content.height_mm * ppm - 2.0 * f64::from(inset);
-            if font_size.is_none() && target_h < 1.0 {
-                return Err(RenderError::Layout("border and spacing leave no room for text; enlarge the object or reduce the border".into()));
-            }
-            let normalized: Vec<_> = if font_size.is_none() && !styles.is_empty() {
-                crate::styled_text::style_regions(text, styles)
-                    .into_iter()
-                    .map(|(range, mut style)| {
-                        style.font_size = Some(style.font_size.unwrap_or(12.0));
-                        crate::styled_text::StyleSpan {
-                            start: range.start,
-                            end: range.end,
-                            style,
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let base_size = if normalized.is_empty() {
-                font_size.unwrap_or(12.0)
-            } else {
-                normalized
-                    .iter()
-                    .filter_map(|s| s.style.font_size)
-                    .fold(0.1_f32, f32::max)
-            };
-            let render_styles = if normalized.is_empty() {
-                styles
-            } else {
-                &normalized
-            };
-            let mut render = |size| {
-                renderer.render_unbounded_styled(
-                    text,
-                    &doc.font_name,
-                    size,
-                    *align,
-                    *line_spacing,
-                    render_styles,
-                    base_size,
-                )
-            };
-            let ink = if let Some(size) = font_size {
-                render(*size * f32::from(doc.dpi) / 72.0)?
-            } else {
-                let (mut lo, mut hi) = (1.0_f32, (target_h as f32 * 4.0).clamp(4.0, 4096.0));
-                let mut best = render(lo)?;
-                while hi < 4096.0 {
-                    match render(hi) {
-                        Ok(candidate) if f64::from(candidate.height()) <= target_h => {
-                            lo = hi;
-                            best = candidate;
-                            hi = (hi * 2.0).min(4096.0);
-                        }
-                        _ => break,
-                    }
-                }
-                for _ in 0..16 {
-                    let mid = (lo + hi) / 2.0;
-                    match render(mid) {
-                        Ok(candidate) if f64::from(candidate.height()) <= target_h => {
-                            lo = mid;
-                            best = candidate;
-                        }
-                        Ok(_) | Err(RenderError::DimensionMismatch(_)) => hi = mid,
-                        Err(e) => return Err(e),
-                    }
-                }
-                best
-            };
-            // One design dot avoids hinting/edge quantization clipping at
-            // the next output DPI, while keeping the edit box near ink.
-            content.width_mm = f64::from(ink.width() + 1 + 2 * inset) / ppm;
-            if let Some(size) = font_size {
-                content.height_mm = f64::from(ink.height() + 1 + 2 * inset) / ppm;
-                if let Some(border) = &object.border {
-                    // Border and glyph rounding differ between printer grids.
-                    // Reserve the largest physical extent at the supported
-                    // resolutions, independently of the connected printer.
-                    for dpi in [180, 360] {
-                        if dpi == doc.dpi {
-                            continue;
-                        }
-                        let measured = render(*size * f32::from(dpi) / 72.0)?;
-                        let inset = border.inset_pixels(dpi)?;
-                        let ppm = f64::from(dpi) / 25.4;
-                        content.width_mm = content
-                            .width_mm
-                            .max(f64::from(measured.width() + 1 + 2 * inset) / ppm);
-                        content.height_mm = content
-                            .height_mm
-                            .max(f64::from(measured.height() + 1 + 2 * inset) / ppm);
-                    }
-                }
-            }
-        }
+        resolve_object(object, doc.version, doc.dpi, &doc.font_name, renderer)?;
+    }
+    Ok(())
+}
+
+/// Measure a single object's auto-sized content with a reusable font cache.
+/// GUI transactions use the same sizing as preview before accepting an edit.
+pub fn resolve_object(
+    object: &mut LabelObject,
+    version: u32,
+    design_dpi: u16,
+    font_name: &str,
+    renderer: &mut TextRenderer,
+) -> Result<()> {
+    if design_dpi == 0 {
+        return Err(RenderError::Layout("design DPI must be positive".into()));
+    }
+    validate(object, version)?;
+    object.validate_features(version)?;
+    let Some(policy) = &object.layout else {
+        return Ok(());
+    };
+    if policy.width != WidthSizing::Content {
         update_allocation(object);
         check_allocation(object)?;
+        return Ok(());
     }
+    let content = object.content_box.as_mut().ok_or_else(|| {
+        RenderError::Layout("content sizing requires independent content geometry".into())
+    })?;
+    content.validate()?;
+    if let ObjectContent::Text {
+        content: text,
+        font_size,
+        align,
+        line_spacing,
+        styles,
+    } = &object.content
+        && !text.trim().is_empty()
+    {
+        let ppm = f64::from(design_dpi) / 25.4;
+        let inset = object
+            .border
+            .as_ref()
+            .map(|b| b.inset_pixels(design_dpi))
+            .transpose()?
+            .unwrap_or(0);
+        let target_h = content.height_mm * ppm - 2.0 * f64::from(inset);
+        if font_size.is_none() && target_h < 1.0 {
+            return Err(RenderError::Layout("border and spacing leave no room for text; enlarge the object or reduce the border".into()));
+        }
+        let normalized: Vec<_> = if font_size.is_none() && !styles.is_empty() {
+            crate::styled_text::style_regions(text, styles)
+                .into_iter()
+                .map(|(range, mut style)| {
+                    style.font_size = Some(style.font_size.unwrap_or(12.0));
+                    crate::styled_text::StyleSpan {
+                        start: range.start,
+                        end: range.end,
+                        style,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let base_size = if normalized.is_empty() {
+            font_size.unwrap_or(12.0)
+        } else {
+            normalized
+                .iter()
+                .filter_map(|s| s.style.font_size)
+                .fold(0.1_f32, f32::max)
+        };
+        let render_styles = if normalized.is_empty() {
+            styles
+        } else {
+            &normalized
+        };
+        let mut render = |size| {
+            renderer.render_unbounded_styled(
+                text,
+                font_name,
+                size,
+                *align,
+                *line_spacing,
+                render_styles,
+                base_size,
+            )
+        };
+        let ink = if let Some(size) = font_size {
+            render(*size * f32::from(design_dpi) / 72.0)?
+        } else {
+            let (mut lo, mut hi) = (1.0_f32, (target_h as f32 * 4.0).clamp(4.0, 4096.0));
+            let mut best = render(lo)?;
+            while hi < 4096.0 {
+                match render(hi) {
+                    Ok(candidate) if f64::from(candidate.height()) <= target_h => {
+                        lo = hi;
+                        best = candidate;
+                        hi = (hi * 2.0).min(4096.0);
+                    }
+                    _ => break,
+                }
+            }
+            for _ in 0..16 {
+                let mid = (lo + hi) / 2.0;
+                match render(mid) {
+                    Ok(candidate) if f64::from(candidate.height()) <= target_h => {
+                        lo = mid;
+                        best = candidate;
+                    }
+                    Ok(_) | Err(RenderError::DimensionMismatch(_)) => hi = mid,
+                    Err(e) => return Err(e),
+                }
+            }
+            best
+        };
+        // One design dot avoids hinting/edge quantization clipping at
+        // the next output DPI, while keeping the edit box near ink.
+        content.width_mm = f64::from(ink.width() + 1 + 2 * inset) / ppm;
+        if let Some(size) = font_size {
+            content.height_mm = f64::from(ink.height() + 1 + 2 * inset) / ppm;
+            if let Some(border) = &object.border {
+                // Border and glyph rounding differ between printer grids.
+                // Reserve the largest physical extent at the supported
+                // resolutions, independently of the connected printer.
+                for dpi in [180, 360] {
+                    if dpi == design_dpi {
+                        continue;
+                    }
+                    let measured = render(*size * f32::from(dpi) / 72.0)?;
+                    let inset = border.inset_pixels(dpi)?;
+                    let ppm = f64::from(dpi) / 25.4;
+                    content.width_mm = content
+                        .width_mm
+                        .max(f64::from(measured.width() + 1 + 2 * inset) / ppm);
+                    content.height_mm = content
+                        .height_mm
+                        .max(f64::from(measured.height() + 1 + 2 * inset) / ppm);
+                }
+            }
+        }
+    }
+    update_allocation(object);
+    check_allocation(object)?;
     Ok(())
 }
 

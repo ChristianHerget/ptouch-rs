@@ -13,6 +13,7 @@ use crate::document::{
     DOCUMENT_VERSION, LabelDocument, LabelElement, LabelObject, ObjectContent, render_elements,
 };
 use crate::image_loader::{self, ImageLoadOptions};
+use crate::surface::RasterLayer;
 use crate::text::{TextAlign, TextRenderer};
 use crate::{RenderError, Result};
 
@@ -192,15 +193,17 @@ pub fn render_document(
         object.validate_features(doc.version)?;
     }
     crate::sequence::validate(&doc.elements, doc.version)?;
+    crate::scene::validate(&doc.elements, doc.version)?;
     let mut resolved;
     let doc = if doc
         .elements
         .iter()
         .filter_map(LabelElement::as_object)
-        .any(|o| o.layout.is_some())
+        .any(|o| o.layout.is_some() || o.scene.as_ref().is_some_and(|s| s.anchor.is_some()))
     {
         resolved = doc.clone();
         crate::object_layout::resolve(&mut resolved, renderer)?;
+        crate::scene::resolve(&mut resolved)?;
         &resolved
     } else {
         doc
@@ -293,9 +296,15 @@ pub fn render_document(
                     index + 1
                 )));
             }
-            sequence_cursor.right_mm = cursor_mm;
-            let x_mm =
-                sequence_cursor.place(frame, element.as_object().and_then(|o| o.sequence))?;
+            let attached = element
+                .as_object()
+                .is_some_and(|o| o.scene.as_ref().is_some_and(|s| s.anchor.is_some()));
+            let x_mm = if attached {
+                frame.x_mm
+            } else {
+                sequence_cursor.right_mm = cursor_mm;
+                sequence_cursor.place(frame, element.as_object().and_then(|o| o.sequence))?
+            };
             let right_mm = x_mm + frame.width_mm;
             let x = boundary(x_mm, target_dpi)?;
             let y = boundary(frame.y_mm, target_dpi)?;
@@ -348,7 +357,10 @@ pub fn render_document(
                             &doc.font_name,
                             doc.font_margin,
                             target_dpi,
-                        )?,
+                        )
+                        .map(|(ink, clipped, local)| {
+                            (RasterLayer::from_ink(ink), clipped, local)
+                        })?,
                         LabelElement::Object(object) => render_object(
                             object,
                             doc,
@@ -393,7 +405,9 @@ pub fn render_document(
                 ));
             }
             content_bounds.push(geometry);
-            cursor_mm = right_mm;
+            if !attached {
+                cursor_mm = right_mm;
+            }
             (
                 segment.mirrored(flip_h, flip_v),
                 ElementBounds {
@@ -429,7 +443,7 @@ pub fn render_document(
             // Preserve the historical arithmetic order at half-pixel edges.
             cursor_mm += f64::from(width) * 25.4 / f64::from(target_dpi);
             (
-                segment,
+                RasterLayer::from_ink(segment),
                 ElementBounds {
                     element_index: index,
                     x,
@@ -448,14 +462,17 @@ pub fn render_document(
         total_width = total_width
             .max(rect.x + rect.width)
             .max(content_right.max(0) as u32);
-        segment_pixels += u64::from(segment.width()) * u64::from(segment.height());
+        segment.validate()?;
+        segment_pixels += u64::from(segment.width())
+            * u64::from(segment.height())
+            * if segment.coverage.is_some() { 2 } else { 1 };
         let canvas_pixels = u64::from(total_width) * u64::from(tape_width_px);
         if segment_pixels + canvas_pixels > MAX_LAYOUT_PIXELS {
             return Err(RenderError::Layout(
                 "layout working set is too large; reduce object count or frame dimensions".into(),
             ));
         }
-        segments.push((segment, left, top));
+        segments.push((index, segment, left, top));
         bounds.push(rect);
     }
     if bounds.is_empty() {
@@ -468,8 +485,22 @@ pub fn render_document(
     }
     check_size(total_width, tape_width_px)?;
     let mut bitmap = LabelBitmap::new(total_width, tape_width_px);
-    for (segment, left, top) in &segments {
-        blit(&mut bitmap, segment, *left, *top);
+    if doc
+        .elements
+        .iter()
+        .any(|e| e.as_object().is_some_and(|o| o.scene.is_some()))
+    {
+        let mut ranks = vec![0; doc.elements.len()];
+        for (rank, index) in crate::scene::paint_order(&doc.elements)
+            .into_iter()
+            .enumerate()
+        {
+            ranks[index] = rank;
+        }
+        segments.sort_by_key(|(index, ..)| ranks[*index]);
+    }
+    for (_, segment, left, top) in &segments {
+        segment.paint(&mut bitmap, *left, *top);
     }
     for rect in &mut bounds {
         if doc.flip_h {
@@ -618,6 +649,7 @@ pub fn convert_to_objects(
                     );
                 }
                 LabelObject {
+                    scene: None,
                     sequence: None,
                     border: None,
                     frame,
@@ -655,6 +687,7 @@ pub fn convert_to_objects(
                     index + 1
                 );
                 LabelObject {
+                    scene: None,
                     sequence: None,
                     border: None,
                     frame,
@@ -667,10 +700,13 @@ pub fn convert_to_objects(
                         path: path.clone(),
                         image_data: image_data.clone(),
                         bitmap: bitmap.clone(),
+                        preserve_alpha: false,
+                        coverage: None,
                     },
                 }
             }
             LabelElement::CutMark | LabelElement::Padding { .. } => LabelObject {
+                scene: None,
                 sequence: None,
                 border: None,
                 frame,
@@ -780,7 +816,7 @@ fn signed_boundary(px: f64) -> Result<i64> {
     Ok(px.round() as i64)
 }
 
-type IndependentRaster = (LabelBitmap, bool, ContentGeometry, i64, i64);
+type IndependentRaster = (RasterLayer, bool, ContentGeometry, i64, i64);
 
 fn render_independent(
     object: &LabelObject,
@@ -795,7 +831,10 @@ fn render_independent(
         .expect("independent content box");
     content_box.validate()?;
     let ppm = f64::from(dpi) / 25.4;
-    let minimum = u32::from(matches!(object.content, ObjectContent::Line { .. }));
+    let minimum = u32::from(matches!(
+        object.content,
+        ObjectContent::Line { .. } | ObjectContent::Shape { .. }
+    ));
     let width = boundary(content_box.width_mm, dpi)?.max(minimum);
     let height = boundary(content_box.height_mm, dpi)?.max(minimum);
     if width == 0 || height == 0 {
@@ -812,19 +851,42 @@ fn render_independent(
     signed_boundary(center[0])?;
     signed_boundary(center[1])?;
     let (source, clipped, _) = render_object(object, doc, width, height, dpi, renderer, 0.0)?;
-    let mut bitmap = checked_rotate(&source, object.rotation)?;
-    if source.data().iter().any(|byte| *byte != 0) && !bitmap.data().iter().any(|byte| *byte != 0) {
+    let mut bitmap = RasterLayer {
+        ink: checked_rotate(&source.ink, object.rotation)?,
+        coverage: source
+            .coverage
+            .as_ref()
+            .map(|mask| checked_rotate(mask, object.rotation))
+            .transpose()?,
+    };
+    if source.ink.data().iter().any(|byte| *byte != 0)
+        && !bitmap.ink.data().iter().any(|byte| *byte != 0)
+    {
         if matches!(
             object.content,
-            ObjectContent::CutMark | ObjectContent::Line { .. }
+            ObjectContent::CutMark | ObjectContent::Line { .. } | ObjectContent::Shape { .. }
         ) {
-            bitmap.set_pixel(bitmap.width() / 2, bitmap.height() / 2, true);
+            let (x, y) = (bitmap.width() / 2, bitmap.height() / 2);
+            bitmap.ink.set_pixel(x, y, true);
+            if let Some(mask) = &mut bitmap.coverage {
+                // The positive-stroke fallback must be covered as well as
+                // black, or masked composition would silently discard it.
+                mask.set_pixel(x, y, true);
+            }
         } else {
             return Err(RenderError::Layout(
                 "rotated content has no visible pixels at this output DPI; enlarge the content box"
                     .into(),
             ));
         }
+    }
+    if let (Some(source_mask), Some(mask)) = (&source.coverage, &mut bitmap.coverage)
+        && source_mask.data().iter().any(|byte| *byte != 0)
+        && !mask.data().iter().any(|byte| *byte != 0)
+    {
+        // A one-dot paper shape can disappear between inverse-rotation
+        // samples even though it has no ink to trigger the stroke fallback.
+        mask.set_pixel(mask.width() / 2, mask.height() / 2, true);
     }
     let left = signed_boundary(center[0] - f64::from(bitmap.width()) / 2.0)?;
     let top = signed_boundary(center[1] - f64::from(bitmap.height()) / 2.0)?;
@@ -848,7 +910,7 @@ fn render_object(
     dpi: u16,
     renderer: &mut TextRenderer,
     rotation: f32,
-) -> Result<(LabelBitmap, bool, LocalContent)> {
+) -> Result<(RasterLayer, bool, LocalContent)> {
     if let Some(border) = &object.border {
         let inset = border.inset_pixels(dpi)?;
         let inner_width = width.checked_sub(2 * inset).filter(|v| *v > 0);
@@ -859,10 +921,17 @@ fn render_object(
         let (inner, clipped, _) =
             render_object_content(object, doc, inner_width, inner_height, dpi, renderer, 0.0)?;
         let mut outer = LabelBitmap::new(width, height);
-        blit(&mut outer, &inner, i64::from(inset), i64::from(inset));
+        blit(&mut outer, &inner.ink, i64::from(inset), i64::from(inset));
         border.draw(&mut outer, dpi)?;
-        let (bitmap, geometry) = render_contained(
+        let coverage = inner.coverage.map(|mask| {
+            let mut outer_mask = LabelBitmap::new(width, height);
+            blit(&mut outer_mask, &mask, i64::from(inset), i64::from(inset));
+            blit(&mut outer_mask, &outer, 0, 0);
+            outer_mask
+        });
+        let (bitmap, geometry) = render_layer_contained(
             &outer,
+            coverage.as_ref(),
             rotation,
             object.frame.vertical_align,
             width,
@@ -882,7 +951,7 @@ fn render_object_content(
     dpi: u16,
     renderer: &mut TextRenderer,
     rotation: f32,
-) -> Result<(LabelBitmap, bool, LocalContent)> {
+) -> Result<(RasterLayer, bool, LocalContent)> {
     match &object.content {
         ObjectContent::Text {
             content,
@@ -904,7 +973,43 @@ fn render_object_content(
             &doc.font_name,
             doc.font_margin,
             dpi,
-        ),
+        )
+        .map(|(ink, clipped, local)| (RasterLayer::from_ink(ink), clipped, local)),
+        ObjectContent::Image {
+            image_data,
+            bitmap,
+            coverage,
+            preserve_alpha: true,
+            ..
+        } => {
+            let decoded = if bitmap.is_some() && coverage.is_some() {
+                None
+            } else {
+                Some(image_loader::load_layer_from_reader(
+                    Cursor::new(image_data),
+                    &ImageLoadOptions::default(),
+                )?)
+            };
+            let ink = decoded
+                .as_ref()
+                .map(|layer| &layer.ink)
+                .or(bitmap.as_ref())
+                .ok_or_else(|| RenderError::Layout("image object has no image data".into()))?;
+            let mask = decoded
+                .as_ref()
+                .and_then(|layer| layer.coverage.as_ref())
+                .or(coverage.as_deref());
+            let (layer, geometry) = render_layer_contained(
+                ink,
+                mask,
+                rotation,
+                object.frame.vertical_align,
+                width,
+                height,
+                false,
+            )?;
+            Ok((layer, false, geometry))
+        }
         ObjectContent::Image {
             image_data, bitmap, ..
         } => {
@@ -924,7 +1029,7 @@ fn render_object_content(
                 height,
                 false,
             )?;
-            Ok((bitmap, false, geometry))
+            Ok((RasterLayer::from_ink(bitmap), false, geometry))
         }
         ObjectContent::Line { pattern } => {
             let source = pattern.raster_line(width, height, dpi)?;
@@ -936,7 +1041,20 @@ fn render_object_content(
                 height,
                 true,
             )?;
-            Ok((bitmap, false, geometry))
+            Ok((RasterLayer::from_ink(bitmap), false, geometry))
+        }
+        ObjectContent::Shape { style } => {
+            let source = style.raster(width, height, dpi)?;
+            let (layer, geometry) = render_layer_contained(
+                &source.ink,
+                source.coverage.as_ref(),
+                rotation,
+                object.frame.vertical_align,
+                width,
+                height,
+                true,
+            )?;
+            Ok((layer, false, geometry))
         }
         ObjectContent::CutMark => {
             // A cut guide spans its frame rather than inheriting the legacy
@@ -957,14 +1075,41 @@ fn render_object_content(
                 height,
                 true,
             )?;
-            Ok((bitmap, false, geometry))
+            Ok((RasterLayer::from_ink(bitmap), false, geometry))
         }
         ObjectContent::Padding => Ok((
-            LabelBitmap::new(width, height),
+            RasterLayer::from_ink(LabelBitmap::new(width, height)),
             false,
             LocalContent::rectangle(width, height, rotation),
         )),
     }
+}
+
+fn render_layer_contained(
+    ink: &LabelBitmap,
+    coverage: Option<&LabelBitmap>,
+    rotation: f32,
+    vertical_align: VerticalAlign,
+    width: u32,
+    height: u32,
+    preserve_ink: bool,
+) -> Result<(RasterLayer, LocalContent)> {
+    let preserve = preserve_ink && ink.data().iter().any(|byte| *byte != 0);
+    let (ink, geometry) = render_contained(ink, rotation, vertical_align, width, height, preserve)?;
+    let coverage = coverage
+        .map(|mask| {
+            render_contained(
+                mask,
+                rotation,
+                vertical_align,
+                width,
+                height,
+                preserve_ink && mask.data().iter().any(|byte| *byte != 0),
+            )
+            .map(|(mask, _)| mask)
+        })
+        .transpose()?;
+    Ok((RasterLayer { ink, coverage }, geometry))
 }
 
 /// Rotate first, then contain the entire result without changing its aspect
@@ -1739,11 +1884,14 @@ mod tests {
             path: None,
             image_data: vec![],
             bitmap: Some(bitmap),
+            preserve_alpha: false,
+            coverage: None,
         }
     }
 
     fn object(content: ObjectContent, frame: TextBox) -> LabelElement {
         LabelElement::Object(LabelObject {
+            scene: None,
             sequence: None,
             border: None,
             content,

@@ -13,10 +13,13 @@ use ptouch_render::document::{
 use ptouch_render::image_loader;
 use ptouch_render::text::TextAlign;
 
-use crate::state::{AppState, CanvasEditTarget, LabelElement};
+use crate::state::{AppState, CanvasEditTarget, CanvasTarget, LabelElement};
 
 /// Render the right-side properties panel.
 pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
+    // Loaded history or a completed relation edit can retain a previous layout
+    // target. Apply the shared attachment selection rule before widget IDs.
+    state.select_canvas_target(state.selected_canvas_target());
     ui.push_id(
         (
             state.selection_revision,
@@ -40,8 +43,12 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
             return;
         }
     };
+    if super::scene_tools::show_attachment(ui, state) {
+        return;
+    }
 
     // We need to clone the element to avoid borrow issues, then write back.
+    let scene_font_before = state.uses_scene().then(|| state.font_name.clone());
     let mut element = state.elements[selected].clone();
     let mut changed = false;
 
@@ -105,6 +112,11 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
+    // The global font transaction resolves every host and attached child. Give
+    // it this frame rather than writing stale local geometry over its result.
+    if scene_font_before.is_some_and(|font| font != state.font_name) {
+        return;
+    }
     if changed {
         if let (Some(before), Some(candidate)) = (
             state.elements[selected].as_object(),
@@ -338,6 +350,7 @@ fn show_font_properties(
             .hint_text("Search fonts..."),
     );
     let query = state.font_search.to_lowercase();
+    let mut selected_font = None;
     egui::ComboBox::from_id_salt("font_selector")
         .selected_text(&state.font_name)
         .width(150.0)
@@ -351,12 +364,22 @@ fn show_font_properties(
                     .selectable_label(state.font_name == *font, font)
                     .clicked()
                 {
-                    state.font_name = font.clone();
-                    state.font_search.clear();
-                    changed = true;
+                    selected_font = Some(font.clone());
                 }
             }
         });
+    if let Some(font) = selected_font {
+        if state.uses_scene() {
+            match state.apply_scene_font(font) {
+                Ok(()) => state.font_search.clear(),
+                Err(error) => state.status_message = error,
+            }
+        } else {
+            state.font_name = font;
+            state.font_search.clear();
+            changed = true;
+        }
+    }
     let mut auto = font_size.is_none();
     if ui.checkbox(&mut auto, "Auto font size").changed() {
         *font_size = (!auto).then_some(if points { 12.0 } else { 24.0 });
@@ -755,37 +778,43 @@ fn show_content_box(
     let minimum = 25.4 / f64::from(state.target_dpi());
     let old = dimensions.clone();
     if free {
-        ui.horizontal(|ui| {
-            for (label, position, offset, flipped) in [
-                (
-                    "X",
-                    object.frame.x_mm,
-                    &mut dimensions.offset_x_mm,
-                    object.flip_h,
-                ),
-                (
-                    "Y",
-                    object.frame.y_mm,
-                    &mut dimensions.offset_y_mm,
-                    object.flip_v,
-                ),
-            ] {
-                ui.label(label);
-                let mut value = position;
-                if ui
-                    .add(
-                        crate::widgets::decimal_drag(&mut value)
-                            .range(0.0..=10_000.0)
-                            .speed(0.1)
-                            .suffix(" mm"),
-                    )
-                    .changed()
-                {
-                    *offset += (value - position) * if flipped { -1.0 } else { 1.0 };
-                    changed = true;
+        let attached = object.scene.as_ref().is_some_and(|s| s.anchor.is_some());
+        ui.add_enabled_ui(!attached, |ui| {
+            ui.horizontal(|ui| {
+                for (label, position, offset, flipped) in [
+                    (
+                        "X",
+                        object.frame.x_mm,
+                        &mut dimensions.offset_x_mm,
+                        object.flip_h,
+                    ),
+                    (
+                        "Y",
+                        object.frame.y_mm,
+                        &mut dimensions.offset_y_mm,
+                        object.flip_v,
+                    ),
+                ] {
+                    ui.label(label);
+                    let mut value = position;
+                    if ui
+                        .add(
+                            crate::widgets::decimal_drag(&mut value)
+                                .range(0.0..=10_000.0)
+                                .speed(0.1)
+                                .suffix(" mm"),
+                        )
+                        .changed()
+                    {
+                        *offset += (value - position) * if flipped { -1.0 } else { 1.0 };
+                        changed = true;
+                    }
                 }
-            }
+            });
         });
+        if attached {
+            ui.small("Move on the canvas or edit Attachment offsets.");
+        }
     }
     ui.add_enabled_ui(!auto_fit, |ui| {
         egui::Grid::new("object_content_dimensions")
@@ -921,20 +950,28 @@ fn show_object_properties(
             offset_x_mm: 0.0,
             offset_y_mm: 0.0,
         });
+    let attached = object
+        .scene
+        .as_ref()
+        .is_some_and(|scene| scene.anchor.is_some());
     let layout = state.canvas_edit_target == CanvasEditTarget::Slot;
-    if ui
-        .button(if layout {
-            "Done adjusting layout"
-        } else {
-            "Adjust layout…"
-        })
-        .clicked()
+    if !attached
+        && ui
+            .button(if layout {
+                "Done adjusting layout"
+            } else {
+                "Adjust layout…"
+            })
+            .clicked()
     {
-        state.canvas_edit_target = if layout {
-            CanvasEditTarget::Content
-        } else {
-            CanvasEditTarget::Slot
-        };
+        state.select_canvas_target(state.selected_element.map(|element| CanvasTarget {
+            element,
+            edit: if layout {
+                CanvasEditTarget::Content
+            } else {
+                CanvasEditTarget::Slot
+            },
+        }));
     }
     let mut changed = match state.canvas_edit_target {
         CanvasEditTarget::Content => {
@@ -1013,6 +1050,8 @@ fn show_object_properties(
             path,
             image_data,
             bitmap,
+            preserve_alpha,
+            coverage,
         } => {
             ui.label("Image");
             let filename = path.as_ref().and_then(|path| path.file_name()).map_or_else(
@@ -1030,10 +1069,19 @@ fn show_object_properties(
             ui.small(
                 "The image keeps its aspect ratio inside the object box, then rotates with it.",
             );
+            if ui.add_enabled(state.is_free_layout(), egui::Checkbox::new(preserve_alpha, "Use image transparency"))
+                .on_hover_text("Transparent pixels pass through; opaque white covers lower layers. Partial alpha becomes monochrome coverage.")
+                .changed() {
+                *bitmap = None; *coverage = None; changed = true;
+            }
             if let Some(path) = path.clone()
                 && ui.button("Reload").clicked()
             {
                 if load_image_into(&path, image_data, bitmap) {
+                    *coverage = None;
+                    if *preserve_alpha {
+                        *bitmap = None;
+                    }
                     changed = true;
                 } else {
                     state.status_message = format!("Image load error: {}", path.display());
@@ -1044,6 +1092,10 @@ fn show_object_properties(
             {
                 if load_image_into(&new_path, image_data, bitmap) {
                     *path = Some(new_path);
+                    *coverage = None;
+                    if *preserve_alpha {
+                        *bitmap = None;
+                    }
                     changed = true;
                 } else {
                     state.status_message = format!("Image load error: {}", new_path.display());
@@ -1054,6 +1106,63 @@ fn show_object_properties(
             ui.label("Printed line");
             changed |= show_stroke_pattern(ui, pattern);
             ui.small("Printed guide only; does not operate the cutter.");
+        }
+        ObjectContent::Shape { style } => {
+            ui.label("Shape");
+            egui::ComboBox::from_id_salt("shape_kind")
+                .selected_text(match style.kind {
+                    ptouch_render::shape::ShapeKind::Rectangle => "Rectangle",
+                    ptouch_render::shape::ShapeKind::Ellipse => "Ellipse",
+                })
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut style.kind,
+                            ptouch_render::shape::ShapeKind::Rectangle,
+                            "Rectangle",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut style.kind,
+                            ptouch_render::shape::ShapeKind::Ellipse,
+                            "Ellipse",
+                        )
+                        .changed();
+                });
+            if style.kind == ptouch_render::shape::ShapeKind::Ellipse
+                && ui.button("Make circle").clicked()
+                && let Some(c) = &mut object.content_box
+            {
+                let side = c.width_mm.min(c.height_mm);
+                c.width_mm = side;
+                c.height_mm = side;
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Fill:");
+                for (fill, label) in [
+                    (ptouch_render::shape::ShapeFill::None, "None"),
+                    (ptouch_render::shape::ShapeFill::Ink, "Ink"),
+                    (ptouch_render::shape::ShapeFill::Paper, "Tape"),
+                ] {
+                    changed |= ui.selectable_value(&mut style.fill, fill, label).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Stroke:");
+                changed |= ui
+                    .add(
+                        crate::widgets::decimal_drag(&mut style.stroke_width_mm)
+                            .range(0.0..=1000.0)
+                            .speed(0.1)
+                            .min_decimals(2)
+                            .suffix(" mm"),
+                    )
+                    .changed();
+            });
+            changed |= show_stroke_pattern(ui, &mut style.pattern);
+            ui.small("Tape fill covers lower layers. None keeps the inside transparent.");
         }
         ObjectContent::CutMark => {
             ui.label("Cut mark");
@@ -1385,6 +1494,37 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attached_properties_normalize_a_stale_layout_target_without_editing_the_document() {
+        let mut state = AppState::default();
+        state.add_text();
+        assert!(state.add_overlay_text(0));
+        state.canvas_edit_target = CanvasEditTarget::Slot;
+        state.needs_rerender = false;
+        let before = state.document();
+        let context = egui::Context::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 1600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| show_properties(ui, &mut state),
+        );
+        output.textures_delta.clear();
+        assert_eq!(state.canvas_edit_target, CanvasEditTarget::Content);
+        assert_eq!(state.document(), before);
+        assert!(!state.needs_rerender);
+        assert!(!output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Text(text)
+                if text.galley.text() == "Adjust layout…"
+                    || text.galley.text() == "Done adjusting layout"
+        )));
+    }
 
     #[test]
     fn viewing_properties_does_not_clamp_an_existing_design() {

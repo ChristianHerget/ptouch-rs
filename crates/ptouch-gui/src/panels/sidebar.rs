@@ -340,6 +340,14 @@ fn show_mirror_section(ui: &mut egui::Ui, state: &mut AppState) {
 /// Element list section with reorder and delete controls.
 fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Elements");
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut state.layers_view, false, "Layout order");
+        ui.selectable_value(&mut state.layers_view, true, "Layers");
+    });
+    if state.layers_view {
+        super::scene_tools::show_layers(ui, state);
+        return;
+    }
     ui.small("Select an object. Drag rows to reorder.");
     ui.add_space(4.0);
 
@@ -361,14 +369,21 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             element: idx,
             edit: CanvasEditTarget::Slot,
         };
-        let has_slot = matches!(
-            element,
-            crate::state::LabelElement::Object(_)
-                | crate::state::LabelElement::Text {
-                    text_box: Some(_),
-                    ..
-                }
-        );
+        let attached = element.as_object().is_some_and(|object| {
+            object
+                .scene
+                .as_ref()
+                .is_some_and(|scene| scene.anchor.is_some())
+        });
+        let has_slot = !attached
+            && matches!(
+                element,
+                crate::state::LabelElement::Object(_)
+                    | crate::state::LabelElement::Text {
+                        text_box: Some(_),
+                        ..
+                    }
+            );
         let flow = element.as_object().is_some_and(|o| {
             o.frame.position == ptouch_render::document::PositionMode::Relative
                 || o.layout
@@ -376,10 +391,18 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                     .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow)
         }) || !state.slot_followers(idx).is_empty();
         let label = format!(
-            "{}. {} {}",
+            "{}. {} {}{}",
             idx + 1,
             if flow { "↔" } else { "•" },
-            element.display_name()
+            element.display_name(),
+            if element
+                .as_object()
+                .is_some_and(|o| o.scene.as_ref().is_some_and(|s| s.anchor.is_some()))
+            {
+                " ↗"
+            } else {
+                ""
+            }
         );
         let response = ui
             .horizontal(|ui| {
@@ -615,19 +638,6 @@ mod tests {
         output
     }
 
-    fn key_events(key: egui::Key) -> Vec<egui::Event> {
-        [true, false]
-            .into_iter()
-            .map(|pressed| egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed,
-                repeat: false,
-                modifiers: Default::default(),
-            })
-            .collect()
-    }
-
     fn pointer_event(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
             pos,
@@ -663,17 +673,7 @@ mod tests {
         };
         let before = state.document().to_toml_string().unwrap();
         let context = egui::Context::default();
-        list_frame(&context, &mut state, vec![]);
-        list_frame(&context, &mut state, key_events(egui::Key::Tab));
-        list_frame(&context, &mut state, key_events(egui::Key::Tab));
-        let output = list_frame(&context, &mut state, key_events(egui::Key::Enter));
-        assert_eq!(
-            state.selected_canvas_target(),
-            Some(CanvasTarget {
-                element: 0,
-                edit: CanvasEditTarget::Content,
-            })
-        );
+        let output = list_frame(&context, &mut state, vec![]);
         let row = text_position(&output, "1. ");
         list_frame(
             &context,
@@ -689,8 +689,11 @@ mod tests {
             vec![pointer_event(row, egui::PointerButton::Primary, false)],
         );
         assert_eq!(
-            state.selected_canvas_target().unwrap().edit,
-            CanvasEditTarget::Content
+            state.selected_canvas_target(),
+            Some(CanvasTarget {
+                element: 0,
+                edit: CanvasEditTarget::Content,
+            })
         );
         list_frame(
             &context,

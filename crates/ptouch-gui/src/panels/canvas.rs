@@ -57,10 +57,12 @@ struct ReorderDrag {
 
 /// Render and edit at the original raster scale, independent of GPU downsampling.
 pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
+    state.select_canvas_target(state.selected_canvas_target());
     let drag_id = ui.id().with("object_drag");
     let snap_id = ui.id().with("snap_mm");
     let press_id = ui.id().with("canvas_press");
     let menu_id = ui.id().with("canvas_menu_target");
+    let menu_pos_id = ui.id().with("canvas_menu_position");
     let previous_hover = state.canvas_hover_target;
     let previous_drag = state.canvas_drag_target;
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -71,7 +73,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             && let Some(before) = active.before
         {
             state.restore_document(before);
-            state.selected_element = Some(active.element);
+            state.select_canvas_target(Some(CanvasTarget {
+                element: active.element,
+                edit: state.canvas_edit_target,
+            }));
         }
         ui.ctx().data_mut(|data| {
             data.remove::<CanvasDrag>(drag_id);
@@ -223,11 +228,21 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 egui::Stroke::new(1.0, egui::Color32::from_gray(128)),
                 egui::StrokeKind::Outside,
             );
-            let geometry: Vec<_> = state
+            let mut geometry: Vec<_> = state
                 .preview_bounds
                 .iter()
                 .filter_map(|bound| editing_geometry(state, label_rect.min, bound))
                 .collect();
+            if state.uses_scene() {
+                let mut ranks = vec![0; state.elements.len()];
+                for (rank, index) in ptouch_render::scene::paint_order(&state.elements)
+                    .into_iter()
+                    .enumerate()
+                {
+                    ranks[index] = rank;
+                }
+                geometry.sort_by_key(|g| ranks[g.element]);
+            }
             let selected = state.selected_canvas_target();
             let hit = |pos| {
                 canvas_hit(
@@ -358,14 +373,70 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     state.overall_flip_v,
                 )
                 .map(|h| h.target);
-                ui.ctx().data_mut(|data| data.insert_temp(menu_id, target));
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(menu_id, target);
+                    data.insert_temp(menu_pos_id, pos);
+                });
             }
             response.context_menu(|ui| {
+                let mut selected_layer = false;
+                if let Some(pos) = ui
+                    .ctx()
+                    .data_mut(|data| data.get_temp::<egui::Pos2>(menu_pos_id))
+                {
+                    let layers: Vec<_> = geometry
+                        .iter()
+                        .rev()
+                        .filter(|g| {
+                            g.object.is_some_and(|q| {
+                                quad_contains(q, pos)
+                                    || (g.line && quad_edge_distance(q, pos) <= 4.0)
+                            })
+                        })
+                        .map(|g| (g.element, state.elements[g.element].display_name()))
+                        .collect();
+                    if !layers.is_empty() {
+                        ui.menu_button("Select layer", |ui| {
+                            for (element, label) in layers {
+                                if ui.button(label).clicked() {
+                                    state.select_canvas_target(Some(CanvasTarget {
+                                        element,
+                                        edit: CanvasEditTarget::Content,
+                                    }));
+                                    selected_layer = true;
+                                    ui.close();
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+                if selected_layer {
+                    // Close the root context menu too, so Arrange cannot act on
+                    // its previous target after selecting a covered object.
+                    ui.close();
+                    return;
+                }
                 let target = ui
                     .ctx()
                     .data_mut(|data| data.get_temp::<Option<CanvasTarget>>(menu_id))
                     .flatten();
                 if let Some(target) = target {
+                    ui.add_enabled_ui(state.is_free_layout(), |ui| {
+                        ui.menu_button("Arrange", |ui| {
+                            for (label, action) in [
+                                ("Bring to front", crate::state::LayerMove::Front),
+                                ("Bring forward", crate::state::LayerMove::Forward),
+                                ("Send backward", crate::state::LayerMove::Backward),
+                                ("Send to back", crate::state::LayerMove::Back),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    state.change_layer(target.element, action);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                     if ui.button("Edit content").clicked() {
                         state.select_canvas_target(Some(CanvasTarget {
                             edit: CanvasEditTarget::Content,
@@ -373,13 +444,24 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         }));
                         ui.close();
                     }
-                    let has_slot = state
+                    let attached = state
                         .elements
                         .get(target.element)
-                        .is_some_and(|e| e.as_object().is_some())
-                        || geometry
-                            .iter()
-                            .any(|g| g.element == target.element && g.has_slot);
+                        .and_then(|element| element.as_object())
+                        .is_some_and(|object| {
+                            object
+                                .scene
+                                .as_ref()
+                                .is_some_and(|scene| scene.anchor.is_some())
+                        });
+                    let has_slot = !attached
+                        && (state
+                            .elements
+                            .get(target.element)
+                            .is_some_and(|e| e.as_object().is_some())
+                            || geometry
+                                .iter()
+                                .any(|g| g.element == target.element && g.has_slot));
                     if ui
                         .add_enabled(has_slot, egui::Button::new("Adjust layout…"))
                         .clicked()
@@ -506,18 +588,24 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         && let Some(before) = &drag.before
                     {
                         state.elements = before.elements.clone();
-                        state.selected_element = Some(drag.element);
+                        state.select_canvas_target(Some(CanvasTarget {
+                            element: drag.element,
+                            edit: CanvasEditTarget::Slot,
+                        }));
                         if to != drag.element {
                             state.reorder_object(drag.element, to);
                         } else {
                             state.mark_dirty();
                         }
-                        state.selected_element = Some(to);
-                        reorder.current = to;
-                        let target = CanvasTarget {
+                        state.select_canvas_target(Some(CanvasTarget {
                             element: to,
                             edit: CanvasEditTarget::Slot,
-                        };
+                        }));
+                        reorder.current = to;
+                        let target = state.selected_canvas_target().unwrap_or(CanvasTarget {
+                            element: to,
+                            edit: CanvasEditTarget::Content,
+                        });
                         state.canvas_drag_target = Some(target);
                         ui.ctx().data_mut(|data| {
                             if let Some(mut press) = data.get_temp::<CanvasPress>(press_id) {

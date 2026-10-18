@@ -16,9 +16,12 @@ pub mod image_loader;
 pub mod layout;
 pub mod object_layout;
 pub mod raster;
+pub mod scene;
 pub mod sequence;
+pub mod shape;
 pub mod stroke;
 pub mod styled_text;
+pub mod surface;
 pub mod text;
 
 /// Errors produced by the render crate.
