@@ -106,9 +106,7 @@ the interface process so connecting and printing do not block window updates.
 Library users can also open `ptouch_core::BluetoothDevice`, call `init`, prepare
 16-byte raster lines using bottom-to-top dot order, then call `print_raster` and
 `close`. Native objects stay on the main thread and cannot be sent or shared
-across threads. These synchronous session calls are suitable for the example;
-the GUI needs a separate event-driven service before Bluetooth selection is
-added. Close assumes exclusive ownership and also disconnects the printer's
+across threads. Close assumes exclusive ownership and also disconnects the printer's
 baseband connection. Apple's baseband close is synchronous. If an async write
 never completes, one transfer buffer is conservatively retained to avoid freeing
 memory still potentially used by Bluetooth; this only occurs on a failed
