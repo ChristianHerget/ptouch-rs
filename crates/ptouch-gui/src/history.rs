@@ -144,8 +144,16 @@ fn snapshot_bytes(snapshot: &Snapshot) -> usize {
                         content, styles, ..
                     } => content.len() + styles.len() * 256 + 512,
                     ptouch_render::document::ObjectContent::Image {
-                        image_data, bitmap, ..
-                    } => image_data.len() + bitmap.as_ref().map_or(0, |b| b.data().len()) + 512,
+                        image_data,
+                        bitmap,
+                        coverage,
+                        ..
+                    } => {
+                        image_data.len()
+                            + bitmap.as_ref().map_or(0, |b| b.data().len())
+                            + coverage.as_ref().map_or(0, |b| b.data().len())
+                            + 512
+                    }
                     _ => 512,
                 }
             } else if let ptouch_render::document::LabelElement::Image {
@@ -216,6 +224,35 @@ mod tests {
         let restored = h.step(false).unwrap();
         assert_eq!(restored.document, doc(1));
         assert_eq!(restored.selection, Some(0));
+    }
+
+    #[test]
+    fn transparent_image_coverage_counts_toward_history_memory_limit() {
+        use ptouch_render::{
+            bitmap::LabelBitmap,
+            document::{LabelObject, ObjectContent, TextBox},
+        };
+        let mut document = doc(0);
+        document.version = 12;
+        let mut image = LabelObject::text("", TextBox::default());
+        image.content = ObjectContent::Image {
+            path: None,
+            image_data: Vec::new(),
+            bitmap: Some(LabelBitmap::new(4096, 2048)),
+            preserve_alpha: true,
+            coverage: Some(Box::new(LabelBitmap::new(4096, 2048))),
+        };
+        document.elements.push(LabelElement::Object(image));
+        let mut history = DocumentHistory::default();
+        for n in 0..40 {
+            document.elements[0] = LabelElement::Padding { pixels: n };
+            history.observe(document.clone(), None, false, false, f64::from(n));
+        }
+        assert!(history.undo.len() < 32);
+        assert_eq!(
+            history.step(false).unwrap().document.elements[0],
+            LabelElement::Padding { pixels: 38 }
+        );
     }
 
     #[test]
