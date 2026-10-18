@@ -1,0 +1,317 @@
+version = 12
+tape_width_mm = 12
+dpi = 180
+font_name = "DejaVu Sans"
+font_margin = 0
+flip_h = false
+flip_v = false
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 1
+layer = 0
+
+[elements.frame]
+width_mm = 20.0
+height_mm = 10.0
+position = "absolute"
+x_mm = 1.0
+y_mm = 0.0
+gap_mm = 2.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 15.0
+height_mm = 5.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "PORT 01"
+font_size = 10.0
+align = "center"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 2
+layer = 1
+
+[elements.frame]
+width_mm = 20.0
+height_mm = 10.0
+position = "relative"
+x_mm = 0.0
+y_mm = 0.0
+gap_mm = 2.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 15.0
+height_mm = 5.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "PORT 02"
+font_size = 10.0
+align = "center"
+
+[[elements]]
+type = "object"
+sequence = 1
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 3
+layer = 2
+
+[elements.frame]
+width_mm = 20.0
+height_mm = 10.0
+position = "relative"
+x_mm = 0.0
+y_mm = 0.0
+gap_mm = 2.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "flow"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 15.0
+height_mm = 5.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "text"
+content = "UPLINK"
+font_size = 10.0
+align = "center"
+
+[[elements]]
+type = "object"
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 4
+layer = 3
+
+[elements.scene.anchor]
+target = 1
+horizontal = 0.5
+vertical = 0.5
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.frame]
+width_mm = 18.0
+height_mm = 8.0
+position = "absolute"
+x_mm = 2.0
+y_mm = 1.0
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "free"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 18.0
+height_mm = 8.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "shape"
+
+[elements.content.style]
+kind = "rectangle"
+fill = "none"
+stroke_width_mm = 0.3
+
+[elements.content.style.pattern]
+kind = "solid"
+dash_mm = 2.0
+gap_mm = 1.0
+
+[[elements]]
+type = "object"
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 5
+layer = 4
+
+[elements.scene.anchor]
+target = 1
+horizontal = 1.0
+vertical = 0.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.frame]
+width_mm = 3.0
+height_mm = 3.0
+position = "absolute"
+x_mm = 18.0
+y_mm = 0.0
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "free"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 3.0
+height_mm = 3.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "image"
+image_data = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0Ij48cGF0aCBkPSJNOCAxMGg0OHYzNkg4ek0yMCA0NnY4bTI0LTh2OE0yNSAxMHYxMGgxNFYxME0xOCAzMHY4bTktOHY4bTEwLTh2OG05LTh2OCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJibGFjayIgc3Ryb2tlLXdpZHRoPSI1Ii8+PC9zdmc+"
+preserve_alpha = true
+
+[[elements]]
+type = "object"
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 6
+layer = 5
+
+[elements.scene.anchor]
+target = 2
+horizontal = 0.5
+vertical = 0.5
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.frame]
+width_mm = 18.0
+height_mm = 8.0
+position = "absolute"
+x_mm = 24.0
+y_mm = 1.0
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "free"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 18.0
+height_mm = 8.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "shape"
+
+[elements.content.style]
+kind = "ellipse"
+fill = "none"
+stroke_width_mm = 0.3
+
+[elements.content.style.pattern]
+kind = "dashed"
+dash_mm = 2.0
+gap_mm = 1.0
+
+[[elements]]
+type = "object"
+rotation = 0.0
+flip_h = false
+flip_v = false
+
+[elements.scene]
+id = 7
+layer = 6
+
+[elements.scene.anchor]
+target = 3
+horizontal = 1.0
+vertical = 0.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.frame]
+width_mm = 2.0
+height_mm = 2.0
+position = "absolute"
+x_mm = 63.0
+y_mm = 0.0
+gap_mm = 0.0
+vertical_align = "center"
+
+[elements.layout]
+placement = "free"
+width = "fixed"
+constrain = true
+padding_mm = 0.0
+
+[elements.content_box]
+width_mm = 2.0
+height_mm = 2.0
+offset_x_mm = 0.0
+offset_y_mm = 0.0
+
+[elements.content]
+type = "shape"
+
+[elements.content.style]
+kind = "ellipse"
+fill = "none"
+stroke_width_mm = 0.3
+
+[elements.content.style.pattern]
+kind = "solid"
+dash_mm = 2.0
+gap_mm = 1.0

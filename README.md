@@ -3,7 +3,7 @@
 Rust tool for Brother P-Touch USB label printers. CLI and GUI.
 Optional native macOS Bluetooth support is available in `ptouch-core` for the PT-P300BT.
 
-![Text, image borders and printed cutting guides](https://github.com/user-attachments/assets/8cef5d8e-4d8a-47c7-9002-bcc44c11e32e)
+![Shapes, image overlays and drawing layers](https://github.com/user-attachments/assets/8aae9bf9-21ec-4a0e-b5d8-369e946a3773)
 
 ## Features
 
@@ -350,6 +350,8 @@ design DPI** is selected. `--tape-width` changes the exported printable height i
 pixels, not the layout DPI or its millimeter coordinates.
 
 ### Shapes, layers and overlays
+
+Open the [example layout](examples/shapes-overlays.ptl) to try the controls.
 
 **Add Shape** creates a rectangle, ellipse or circle preset with the same move,
 resize, rotate and mirror controls as text and images. Set its stroke width and
