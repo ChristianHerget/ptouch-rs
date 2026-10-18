@@ -10,4 +10,5 @@ pub mod sidebar;
 pub mod status_bar;
 pub mod toolbar;
 
+mod legacy_canvas;
 pub mod scene_tools;

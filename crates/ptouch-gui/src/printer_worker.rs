@@ -11,11 +11,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use log::{error, info};
-use ptouch_core::device::DeviceFlags;
+use ptouch_core::network::PrintOutcome;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_core::transport::PtouchDevice;
 
-use crate::state::{PrinterCommand, PrinterEvent, PrinterResponse, PrinterTarget};
+use crate::state::{
+    PrinterCommand, PrinterEvent, PrinterResponse, PrinterSelection, PrinterTarget,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HELPER_ARG: &str = "--ptouch-bluetooth-helper";
@@ -26,7 +28,10 @@ pub fn printer_worker(
     ctx: egui::Context,
 ) {
     info!("Printer worker started");
-    let mut current_target = PrinterTarget::Usb;
+    let mut current_target = PrinterSelection {
+        target: PrinterTarget::Usb,
+        generation: 0,
+    };
     // An interrupted job can still be printing. Resume status requests only
     // after an explicit user operation, not the background polling timer.
     let mut poll_enabled = true;
@@ -35,6 +40,14 @@ pub fn printer_worker(
 
     loop {
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(PrinterCommand::DiscoverUsbProfiles) => {
+                let result = ptouch_core::usb_profiles::discover().map_err(|e| e.to_string());
+                let _ = resp_tx.send(PrinterEvent {
+                    target: None,
+                    response: PrinterResponse::UsbProfiles(result),
+                });
+                ctx.request_repaint();
+            }
             Ok(PrinterCommand::DiscoverBluetooth) => discover_bluetooth(&resp_tx, &ctx),
             Ok(PrinterCommand::Poll(target)) => {
                 discover_usb(&resp_tx, &ctx);
@@ -44,8 +57,12 @@ pub fn printer_worker(
             }
             Ok(PrinterCommand::Print {
                 raster_lines,
+                resolution,
+                expected_media,
+                job_timeout_secs,
                 chain_print,
                 auto_cut,
+                precut,
                 quality,
                 target,
                 cancellation,
@@ -55,9 +72,15 @@ pub fn printer_worker(
                     &current_target,
                     (&resp_tx, &ctx),
                     &raster_lines,
-                    chain_print,
-                    auto_cut,
-                    quality,
+                    PrintSettings {
+                        resolution,
+                        expected_media,
+                        job_timeout_secs,
+                        chain_print,
+                        auto_cut,
+                        precut,
+                        quality,
+                    },
                     &cancellation,
                 );
             }
@@ -121,9 +144,16 @@ fn discover_bluetooth(resp_tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context)
     ctx.request_repaint();
 }
 
-fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
-    let response = match target {
-        PrinterTarget::Usb | PrinterTarget::UsbAt(_) => poll_usb(target),
+fn do_poll(target: &PrinterSelection, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::Context) {
+    let response = match &target.target {
+        PrinterTarget::Unavailable(e) => Err(e.clone()),
+        PrinterTarget::Profile(p) | PrinterTarget::TemporaryProfile(p) if target.is_network() => {
+            poll_network(p)
+        }
+        PrinterTarget::Profile(_)
+        | PrinterTarget::TemporaryProfile(_)
+        | PrinterTarget::Usb
+        | PrinterTarget::UsbAt(_) => poll_usb(target),
         #[cfg(windows)]
         PrinterTarget::UsbPrint { .. } => poll_usb(target),
         #[cfg(any(target_os = "macos", test))]
@@ -141,6 +171,17 @@ fn do_poll(target: &PrinterTarget, tx: &mpsc::Sender<PrinterEvent>, ctx: &egui::
 }
 
 fn open_usb(target: &PrinterTarget) -> ptouch_core::Result<PtouchDevice> {
+    if let PrinterTarget::Unavailable(e) = target {
+        return Err(ptouch_core::PtouchError::StatusError(e.clone()));
+    }
+    if let Some(p) = target.profile() {
+        if let ptouch_profiles::Connection::Usb { serial } = &p.connection {
+            return PtouchDevice::open_profile(&p.model, serial.as_deref());
+        }
+        return Err(ptouch_core::PtouchError::UnsupportedOperation(
+            "network target cannot use USB",
+        ));
+    }
     #[cfg(windows)]
     if let PrinterTarget::UsbPrint { instance_id } = target {
         return PtouchDevice::open_usbprint(instance_id);
@@ -150,14 +191,43 @@ fn open_usb(target: &PrinterTarget) -> ptouch_core::Result<PtouchDevice> {
         .map_or_else(PtouchDevice::open_first, PtouchDevice::open_at)
 }
 
+fn open_network(
+    profile: &ptouch_profiles::PrinterProfile,
+) -> Result<ptouch_core::network::NetworkPrinter, String> {
+    let ptouch_profiles::Connection::Network { host } = &profile.connection else {
+        return Err("Not a network profile".into());
+    };
+    ptouch_core::network::NetworkPrinter::open(&profile.model, host, profile.allow_experimental)
+        .map_err(|e| e.to_string())
+}
+
+fn poll_network(profile: &ptouch_profiles::PrinterProfile) -> Result<PrinterResponse, String> {
+    let dev = open_network(profile)?;
+    let status = dev.status();
+    if status.has_error() {
+        return Err(status.error_description());
+    }
+    let band = dev.band().ok_or("Unsupported or missing tape")?;
+    Ok(PrinterResponse::Connected {
+        model_name: dev.model.name.into(),
+        media_width: status.media_width,
+        media_type: status.media_type_name().into(),
+        media_code: status.media_type,
+        max_px: dev.model.raster_pins,
+        dpi: dev.model.head_dpi,
+        tape_width_px: band.print_pins,
+        band_left: Some(band.left_pins),
+    })
+}
+
 fn poll_usb(target: &PrinterTarget) -> Result<PrinterResponse, String> {
     let mut dev = open_usb(target).map_err(|e| e.to_string())?;
     let max_px = dev.max_px();
     let dpi = dev.device_info().dpi;
-    let quality_modes = dev.flags().contains(DeviceFlags::LEGACY_HIRES);
     let model_name = dev.device_info().name.to_string();
     let status = dev.query_status().map_err(|e| e.to_string())?;
     let media_width = status.media_width;
+    let media_code = status.media_type;
     let media_type = status.media_type_name().to_string();
     let tape_width_px = dev.tape_width_px().unwrap_or(max_px);
     let response = PrinterResponse::Connected {
@@ -166,7 +236,8 @@ fn poll_usb(target: &PrinterTarget) -> Result<PrinterResponse, String> {
         media_type,
         max_px,
         dpi,
-        quality_modes,
+        media_code,
+        band_left: None,
         tape_width_px,
     };
     let _ = dev.close();
@@ -213,46 +284,92 @@ fn parse_bluetooth_status(output: &str) -> Result<PrinterResponse, String> {
         media_type: fields[2].to_string(),
         max_px: fields[3].parse().map_err(|_| "Invalid raster width")?,
         dpi: fields[4].parse().map_err(|_| "Invalid resolution")?,
-        quality_modes: false,
+        media_code: 1,
+        band_left: None,
         tape_width_px: fields[5].parse().map_err(|_| "Invalid tape width")?,
     })
 }
 
-fn do_print(
-    target: &PrinterTarget,
-    response: (&mpsc::Sender<PrinterEvent>, &egui::Context),
-    raster_lines: &[Vec<u8>],
+#[derive(Clone, Copy)]
+struct PrintSettings {
+    resolution: ptouch_core::PrintResolution,
+    expected_media: (u8, u8),
+    job_timeout_secs: u32,
     chain_print: bool,
     auto_cut: bool,
+    precut: bool,
     quality: PrintQuality,
+}
+
+fn do_print(
+    target: &PrinterSelection,
+    response: (&mpsc::Sender<PrinterEvent>, &egui::Context),
+    raster_lines: &[Vec<u8>],
+    settings: PrintSettings,
     cancellation: &ptouch_core::CancellationToken,
 ) -> bool {
+    let PrintSettings {
+        resolution,
+        expected_media,
+        job_timeout_secs,
+        chain_print,
+        auto_cut: _,
+        precut,
+        quality,
+    } = settings;
     let (tx, ctx) = response;
-    let result = match target {
-        PrinterTarget::Usb | PrinterTarget::UsbAt(_) => print_usb(
-            raster_lines,
-            chain_print,
-            auto_cut,
-            quality,
-            target,
-            cancellation.clone(),
-        ),
+    if let Some(p) = target.profile()
+        && target.is_network()
+    {
+        let result = (|| {
+            let mut dev = open_network(p)?;
+            if (dev.status().media_width, dev.status().media_type) != expected_media {
+                return Err("Tape changed after rendering; refresh before printing".to_string());
+            }
+            dev.set_cancellation_token(cancellation.clone());
+            dev.set_job_timeout(Duration::from_secs(u64::from(job_timeout_secs)))
+                .map_err(|e| e.to_string())?;
+            dev.print_raster(raster_lines, resolution, chain_print, precut, quality)
+                .map_err(|e| e.to_string())
+        })();
+        let completed = matches!(result, Ok(ptouch_core::network::PrintOutcome::Complete));
+        let response = match result {
+            Ok(ptouch_core::network::PrintOutcome::Complete) => PrinterResponse::PrintDone,
+            Ok(ptouch_core::network::PrintOutcome::SubmittedUnconfirmed) => {
+                PrinterResponse::SubmittedUnconfirmed
+            }
+            Err(e) => PrinterResponse::Error(e),
+        };
+        let _ = tx.send(PrinterEvent {
+            target: Some(target.clone()),
+            response,
+        });
+        ctx.request_repaint();
+        return completed;
+    }
+    let result = match &target.target {
+        PrinterTarget::Unavailable(e) => Err(e.clone()),
+        PrinterTarget::Profile(_)
+        | PrinterTarget::TemporaryProfile(_)
+        | PrinterTarget::Usb
+        | PrinterTarget::UsbAt(_) => {
+            print_usb(raster_lines, settings, target, cancellation.clone())
+        }
         #[cfg(windows)]
-        PrinterTarget::UsbPrint { .. } => print_usb(
-            raster_lines,
-            chain_print,
-            auto_cut,
-            quality,
-            target,
-            cancellation.clone(),
-        ),
+        PrinterTarget::UsbPrint { .. } => {
+            print_usb(raster_lines, settings, target, cancellation.clone())
+        }
         #[cfg(any(target_os = "macos", test))]
-        PrinterTarget::Bluetooth { address, .. } => print_bluetooth(address, raster_lines),
+        PrinterTarget::Bluetooth { address, .. } => {
+            print_bluetooth(address, raster_lines, resolution).map(|()| PrintOutcome::Complete)
+        }
     };
-    let completed = result.is_ok();
-    let response = result
-        .map(|()| PrinterResponse::PrintDone)
-        .unwrap_or_else(PrinterResponse::Error);
+    let completed = matches!(result, Ok(PrintOutcome::Complete));
+    let response = match result {
+        Ok(PrintOutcome::Complete) => PrinterResponse::PrintDone,
+        Ok(PrintOutcome::SubmittedUnconfirmed) => PrinterResponse::SubmittedUnconfirmed,
+        Err(e) => PrinterResponse::Error(e),
+    };
     let _ = tx.send(PrinterEvent {
         target: Some(target.clone()),
         response,
@@ -263,24 +380,48 @@ fn do_print(
 
 fn print_usb(
     raster_lines: &[Vec<u8>],
-    chain_print: bool,
-    auto_cut: bool,
-    quality: PrintQuality,
+    settings: PrintSettings,
     target: &PrinterTarget,
     cancellation: ptouch_core::CancellationToken,
-) -> Result<(), String> {
+) -> Result<PrintOutcome, String> {
+    let PrintSettings {
+        resolution,
+        job_timeout_secs,
+        chain_print,
+        auto_cut,
+        quality,
+        expected_media,
+        ..
+    } = settings;
     let mut dev = open_usb(target).map_err(|e| format!("Connect error: {e}"))?;
     dev.set_cancellation_token(cancellation);
+    dev.set_job_timeout(Duration::from_secs(u64::from(job_timeout_secs)))
+        .map_err(|e| e.to_string())?;
     dev.init().map_err(|e| format!("Init error: {e}"))?;
-    let result = dev
-        .print_raster(raster_lines, chain_print, auto_cut, quality)
-        .map_err(|e| format!("Print error: {e}"));
+    if dev
+        .status()
+        .is_none_or(|s| (s.media_width, s.media_type) != expected_media)
+    {
+        return Err("Tape changed after rendering; refresh before printing".into());
+    }
+    let result = match dev.print_raster(raster_lines, resolution, chain_print, auto_cut, quality) {
+        Ok(()) => Ok(PrintOutcome::Complete),
+        Err(ptouch_core::PtouchError::CompletionUnknown) => Ok(PrintOutcome::SubmittedUnconfirmed),
+        Err(e) => Err(format!("Print error: {e}")),
+    };
     let _ = dev.close();
     result
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String> {
+fn print_bluetooth(
+    address: &str,
+    raster_lines: &[Vec<u8>],
+    resolution: ptouch_core::PrintResolution,
+) -> Result<(), String> {
+    if resolution != ptouch_core::PrintResolution::square(180) {
+        return Err("PT-P300BT requires 180×180 dpi".into());
+    }
     #[cfg(target_os = "macos")]
     {
         let bytes: Vec<u8> = raster_lines.iter().flatten().copied().collect();
@@ -294,12 +435,14 @@ fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String
 }
 
 fn do_feed_and_cut(
-    target: &PrinterTarget,
+    target: &PrinterSelection,
     tx: &mpsc::Sender<PrinterEvent>,
     ctx: &egui::Context,
     cancellation: ptouch_core::CancellationToken,
 ) -> bool {
-    let result = if target.is_bluetooth() {
+    let result = if target.is_network() {
+        Err("Standalone network feed and cut is not supported".to_string())
+    } else if target.is_bluetooth() {
         Err("PT-P300BT has a manual cutter".to_string())
     } else {
         (|| {
@@ -428,7 +571,9 @@ fn run_native_helper(args: &[String]) -> Result<(), String> {
             let lines: Vec<Vec<u8>> = bytes.chunks_exact(LINE_BYTES).map(<[u8]>::to_vec).collect();
             let mut device = BluetoothDevice::open(address).map_err(|e| e.to_string())?;
             device.init().map_err(|e| e.to_string())?;
-            device.print_raster(&lines).map_err(|e| e.to_string())?;
+            device
+                .print_raster(&lines, ptouch_core::PrintResolution::square(180))
+                .map_err(|e| e.to_string())?;
             device.close().map_err(|e| e.to_string())
         }
         _ => Err("Unknown Bluetooth helper operation".to_string()),

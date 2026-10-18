@@ -24,7 +24,7 @@ use crate::text::{TextAlign, TextRenderer};
 
 pub use crate::layout::{
     ContentBox, ContentGeometry, ElementBounds, PositionMode, RenderedLabel, TextBox,
-    VerticalAlign, render_document,
+    VerticalAlign, render_document, render_document_at_resolution,
 };
 
 /// Newest supported on-disk layout format version.
@@ -754,11 +754,19 @@ impl LabelElement {
                     format!("Text: {}", preview)
                 }
             }
-            LabelElement::Image { path, .. }
+            LabelElement::Image {
+                path, image_data, ..
+            }
             | LabelElement::Object(LabelObject {
-                content: ObjectContent::Image { path, .. },
+                content:
+                    ObjectContent::Image {
+                        path, image_data, ..
+                    },
                 ..
             }) => {
+                if let Some(symbol) = crate::symbol::metadata(image_data) {
+                    return format!("Symbol: {}", symbol.name);
+                }
                 let name = path
                     .as_ref()
                     .and_then(|p| p.file_name())
@@ -800,6 +808,28 @@ struct FontSettings<'a> {
     margin: u32,
 }
 
+/// Print pixels and the feed-column range contributed by each source element.
+/// Missing or empty ranges have no visible output. Ranges share the bitmap's
+/// resolution and are collected during composition, rather than re-rendered.
+pub struct RenderedElements {
+    pub bitmap: LabelBitmap,
+    pub element_spans: Vec<Option<std::ops::Range<u32>>>,
+}
+
+impl RenderedElements {
+    /// Mirror the composed print pixels and their element coordinates together.
+    pub fn mirrored(mut self, horizontal: bool, vertical: bool) -> Self {
+        if horizontal {
+            let width = self.bitmap.width();
+            for span in self.element_spans.iter_mut().flatten() {
+                *span = width - span.end..width - span.start;
+            }
+        }
+        self.bitmap = self.bitmap.mirrored(horizontal, vertical);
+        self
+    }
+}
+
 /// Render an ordered element list into a single label bitmap.
 ///
 /// Elements are rendered to `tape_width_px` tall segments and concatenated left
@@ -814,9 +844,24 @@ pub fn render_elements(
     font_margin: u32,
     renderer: &mut TextRenderer,
 ) -> Result<Option<LabelBitmap>> {
-    let mut result: Option<LabelBitmap> = None;
+    Ok(
+        render_elements_scaled(elements, tape_width_px, font_name, font_margin, renderer, 1)?
+            .map(|rendered| rendered.bitmap),
+    )
+}
 
-    for element in elements {
+fn render_elements_scaled(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+    source_scale: u32,
+) -> Result<Option<RenderedElements>> {
+    let mut result: Option<LabelBitmap> = None;
+    let mut element_spans = vec![None; elements.len()];
+
+    for (index, element) in elements.iter().enumerate() {
         let segment = match element {
             LabelElement::Object(_) => {
                 return Err(RenderError::Layout(
@@ -871,17 +916,149 @@ pub fn render_elements(
                 Some(seg) => seg.mirrored(*flip_h, *flip_v),
                 None => continue,
             },
-            LabelElement::CutMark => compose::cutmark(tape_width_px),
+            LabelElement::CutMark => {
+                compose::cutmark(tape_width_px / source_scale).scale_to_height(tape_width_px)
+            }
             LabelElement::Padding { pixels } => compose::padding(tape_width_px, *pixels),
         };
 
+        let start = result.as_ref().map_or(0, LabelBitmap::width);
+        element_spans[index] = Some(start..start + segment.width());
         result = Some(match result {
             Some(prev) => prev.append(&segment),
             None => segment,
         });
     }
 
-    Ok(result)
+    Ok(result.map(|bitmap| RenderedElements {
+        bitmap,
+        element_spans,
+    }))
+}
+
+/// Render print pixels at a selected resolution. Document coordinates stay in
+/// square head-DPI pixels; only the output feed axis changes density.
+pub fn render_elements_at_resolution(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+    resolution: ptouch_core::PrintResolution,
+) -> Result<Option<LabelBitmap>> {
+    Ok(render_elements_with_layout_at_resolution(
+        elements,
+        tape_width_px,
+        font_name,
+        font_margin,
+        renderer,
+        resolution,
+    )?
+    .map(|rendered| rendered.bitmap))
+}
+
+/// Render once, retaining each source element's range in the final print pixels.
+pub fn render_elements_with_layout_at_resolution(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+    resolution: ptouch_core::PrintResolution,
+) -> Result<Option<RenderedElements>> {
+    if resolution.head_dpi == 0 || resolution.feed_dpi == 0 {
+        return Err(crate::RenderError::Text(
+            "Resolution must be positive".into(),
+        ));
+    }
+    if u32::from(resolution.feed_dpi) == u32::from(resolution.head_dpi) * 2 {
+        render_elements_high_resolution_with_layout(
+            elements,
+            tape_width_px,
+            font_name,
+            font_margin,
+            renderer,
+        )
+    } else if resolution.feed_dpi == resolution.head_dpi {
+        render_elements_scaled(elements, tape_width_px, font_name, font_margin, renderer, 1)
+    } else if u32::from(resolution.feed_dpi) * 2 == u32::from(resolution.head_dpi) {
+        Ok(
+            render_elements_scaled(elements, tape_width_px, font_name, font_margin, renderer, 1)?
+                .map(|mut rendered| {
+                    rendered.bitmap = rendered.bitmap.halve_feed();
+                    // The whole label samples source columns 0, 2, 4, ... .
+                    // Rounding each boundary up assigns every sampled column
+                    // to its source element, even at odd segment boundaries.
+                    for span in rendered.element_spans.iter_mut().flatten() {
+                        *span = span.start.div_ceil(2)..span.end.div_ceil(2);
+                    }
+                    rendered
+                }),
+        )
+    } else {
+        Err(crate::RenderError::Text(
+            "Unsupported head/feed resolution ratio".into(),
+        ))
+    }
+}
+
+/// Render source content at twice the feed resolution, preserving tape height.
+pub fn render_elements_high_resolution(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+) -> Result<Option<LabelBitmap>> {
+    Ok(render_elements_high_resolution_with_layout(
+        elements,
+        tape_width_px,
+        font_name,
+        font_margin,
+        renderer,
+    )?
+    .map(|rendered| rendered.bitmap))
+}
+
+fn render_elements_high_resolution_with_layout(
+    elements: &[LabelElement],
+    tape_width_px: u32,
+    font_name: &str,
+    font_margin: u32,
+    renderer: &mut TextRenderer,
+) -> Result<Option<RenderedElements>> {
+    let mut elements = elements.to_vec();
+    for element in &mut elements {
+        match element {
+            LabelElement::Text { font_size, .. } => *font_size = font_size.map(|v| v * 2.0),
+            LabelElement::Image {
+                target_height,
+                bitmap,
+                image_data,
+                ..
+            } => {
+                *target_height = target_height.map(|v| v * 2);
+                if !image_data.is_empty() {
+                    *bitmap = None;
+                }
+            }
+            LabelElement::Padding { pixels } => *pixels *= 2,
+            LabelElement::CutMark => {}
+            LabelElement::Object(_) => {}
+        }
+    }
+    Ok(render_elements_scaled(
+        &elements,
+        tape_width_px * 2,
+        font_name,
+        font_margin * 2,
+        renderer,
+        2,
+    )?
+    .map(|mut rendered| {
+        rendered.bitmap = rendered.bitmap.halve_height();
+        rendered
+    }))
 }
 
 /// Render a single text element to a tape-height bitmap, or `None` to skip it.
@@ -954,12 +1131,18 @@ fn render_image_segment(
     target_height: Option<u32>,
     tape_width_px: u32,
 ) -> Option<LabelBitmap> {
+    // A symbol's eager 24-unit cache is only a loading check. Rasterize its
+    // vector source at the actual print size in legacy layouts as well.
+    let cached = cached.filter(|_| crate::symbol::metadata(image_data).is_none());
     let bmp = if let Some(bmp) = cached {
         bmp.clone()
     } else if !image_data.is_empty() {
         match image_loader::load_image_from_reader(
             Cursor::new(image_data),
-            &ImageLoadOptions::default(),
+            &ImageLoadOptions {
+                target_height: Some(target_height.unwrap_or(tape_width_px)),
+                ..ImageLoadOptions::default()
+            },
         ) {
             Ok(bmp) => bmp,
             Err(e) => {
@@ -1041,6 +1224,173 @@ mod tests {
             LabelElement::Object(LabelObject::text("端口 ".repeat(10), TextBox::default()));
         assert!(!unicode.display_name().contains('\n'));
         assert!(unicode.display_name().ends_with("..."));
+    }
+
+    #[test]
+    fn high_resolution_rasterizes_embedded_svg_from_source() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16"><path d="M1 15L31 1" stroke="black" stroke-width="1"/></svg>"#;
+        let element = LabelElement::image_from_bytes(None, svg.to_vec());
+        let mut doc = text_doc("");
+        doc.elements = vec![element];
+        let doc = LabelDocument::from_toml_str(&doc.to_toml_string().unwrap()).unwrap();
+        let mut renderer = TextRenderer::new();
+        let standard = render_elements(&doc.elements, 32, "sans-serif", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        let high = render_elements_at_resolution(
+            &doc.elements,
+            32,
+            "sans-serif",
+            0,
+            &mut renderer,
+            ptouch_core::PrintResolution {
+                head_dpi: 180,
+                feed_dpi: 360,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(high.width(), standard.width() * 2);
+        assert_eq!(high.height(), standard.height());
+        assert!(
+            (0..high.width() / 2).any(|x| {
+                (0..high.height()).any(|y| high.get_pixel(x * 2, y) != high.get_pixel(x * 2 + 1, y))
+            }),
+            "vector detail must survive between adjacent feed columns"
+        );
+    }
+
+    #[test]
+    fn high_resolution_preserves_cutmark_size_and_dash_pattern() {
+        let mut renderer = TextRenderer::new();
+        let elements = [LabelElement::CutMark, LabelElement::Padding { pixels: 7 }];
+        let standard = render_elements(&elements, 70, "sans-serif", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        let high = render_elements_high_resolution(&elements, 70, "sans-serif", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(high.width(), standard.width() * 2);
+        for x in 0..standard.width() {
+            for y in 0..standard.height() {
+                assert_eq!(high.get_pixel(x * 2, y), standard.get_pixel(x, y));
+                assert_eq!(high.get_pixel(x * 2 + 1, y), standard.get_pixel(x, y));
+            }
+        }
+    }
+    #[test]
+    fn high_resolution_preserves_height_and_renders_distinct_feed_columns() {
+        let elements = vec![
+            LabelElement::Text {
+                text_box: None,
+                content: "Wi-Fi W".into(),
+                font_size: Some(36.0),
+                align: TextAlign::Left,
+                rotation: 0.0,
+                flip_h: false,
+                flip_v: false,
+            },
+            LabelElement::Padding { pixels: 10 },
+        ];
+        let mut renderer = TextRenderer::new();
+        let normal = render_elements(&elements, 70, "DejaVuSans", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        let high = render_elements_high_resolution(&elements, 70, "DejaVuSans", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(high.height(), normal.height());
+        assert!(high.width().abs_diff(normal.width() * 2) <= 2);
+        assert!(
+            (0..high.width() / 2)
+                .any(|x| (0..70).any(|y| high.get_pixel(2 * x, y) != high.get_pixel(2 * x + 1, y)))
+        );
+    }
+
+    #[test]
+    fn every_quality_preserves_physical_geometry_and_high_modes_add_detail() {
+        use ptouch_core::quality::QualityProfile;
+        for (name, head, height) in [
+            ("PT-P750W", 180, 70),
+            ("PT-9500PC", 360, 150),
+            ("PT-9700PC", 360, 150),
+        ] {
+            for rotation in [0.0, 90.0] {
+                let elements = vec![
+                    LabelElement::Text {
+                        text_box: None,
+                        content: "Wi-Fi W".into(),
+                        font_size: Some(36.0),
+                        align: TextAlign::Left,
+                        rotation,
+                        flip_h: true,
+                        flip_v: false,
+                    },
+                    LabelElement::Padding { pixels: 10 },
+                ];
+                let mut renderer = TextRenderer::new();
+                let normal = render_elements(&elements, height, "DejaVuSans", 0, &mut renderer)
+                    .unwrap()
+                    .unwrap();
+                for mode in QualityProfile::for_model(name, head).modes {
+                    let printed = render_elements_at_resolution(
+                        &elements,
+                        height,
+                        "DejaVuSans",
+                        0,
+                        &mut renderer,
+                        mode.resolution,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .mirrored(true, true);
+                    assert_eq!(printed.height(), height);
+                    let expected = f64::from(normal.width()) * f64::from(mode.resolution.feed_dpi)
+                        / f64::from(head);
+                    assert!(
+                        (f64::from(printed.width()) - expected).abs() <= 2.0,
+                        "{name} {rotation} {mode:?}"
+                    );
+                    if mode.quality == ptouch_core::PrintQuality::HighRes && rotation == 0.0 {
+                        assert!((0..printed.width() / 2).any(|x| (0..height).any(|y| {
+                            printed.get_pixel(2 * x, y) != printed.get_pixel(2 * x + 1, y)
+                        })));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_resolution_resamples_bitmap_inputs_without_changing_head_height() {
+        let mut image = flipped_image_element(png_left_black(80, 40), true);
+        if let LabelElement::Image { target_height, .. } = &mut image {
+            *target_height = Some(40);
+        }
+        let elements = [image, LabelElement::Padding { pixels: 12 }];
+        let mut renderer = TextRenderer::new();
+        let render = |renderer: &mut TextRenderer, feed| {
+            render_elements_at_resolution(
+                &elements,
+                76,
+                "DejaVuSans",
+                0,
+                renderer,
+                ptouch_core::PrintResolution {
+                    head_dpi: 180,
+                    feed_dpi: feed,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let normal = render(&mut renderer, 180);
+        let high = render(&mut renderer, 360);
+        assert_eq!(
+            (high.width(), high.height()),
+            (normal.width() * 2, normal.height())
+        );
+        assert!((0..high.width()).any(|x| (0..high.height()).any(|y| high.get_pixel(x, y))));
     }
 
     /// Encode a solid black image of the given size as PNG bytes.
@@ -1804,5 +2154,187 @@ mod tests {
         );
         doc.elements[0].as_object_mut().unwrap().border = None;
         assert_eq!(doc.to_toml_string().unwrap(), plain);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use ptouch_core::PrintResolution;
+
+    fn empty_text() -> LabelElement {
+        LabelElement::Text {
+            text_box: None,
+            content: String::new(),
+            font_size: None,
+            align: TextAlign::Left,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+        }
+    }
+
+    #[test]
+    fn spans_cover_print_columns_at_every_resolution_including_odd_draft_boundaries() {
+        let elements = [
+            LabelElement::Padding { pixels: 7 },
+            LabelElement::CutMark,
+            empty_text(),
+            LabelElement::Padding { pixels: 5 },
+        ];
+        let mut renderer = TextRenderer::new();
+        let normal = render_elements(&elements, 70, "sans-serif", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        for (head, feed, expected) in [
+            (180, 180, vec![Some(0..7), Some(7..16), None, Some(16..21)]),
+            (
+                180,
+                360,
+                vec![Some(0..14), Some(14..32), None, Some(32..42)],
+            ),
+            (360, 360, vec![Some(0..7), Some(7..16), None, Some(16..21)]),
+            (
+                360,
+                720,
+                vec![Some(0..14), Some(14..32), None, Some(32..42)],
+            ),
+            (360, 180, vec![Some(0..4), Some(4..8), None, Some(8..11)]),
+        ] {
+            let resolution = PrintResolution {
+                head_dpi: head,
+                feed_dpi: feed,
+            };
+            let rendered = render_elements_with_layout_at_resolution(
+                &elements,
+                70,
+                "sans-serif",
+                0,
+                &mut renderer,
+                resolution,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(rendered.element_spans, expected);
+            let mut covered = vec![0; rendered.bitmap.width() as usize];
+            for span in rendered.element_spans.iter().flatten() {
+                for x in span.clone() {
+                    covered[x as usize] += 1;
+                }
+            }
+            assert!(covered.iter().all(|&count| count == 1));
+            // Padding and cutmarks have an exact known raster at each density.
+            for x in 0..rendered.bitmap.width() {
+                let source = if feed == head * 2 {
+                    x / 2
+                } else if feed * 2 == head {
+                    x * 2
+                } else {
+                    x
+                };
+                for y in 0..70 {
+                    assert_eq!(rendered.bitmap.get_pixel(x, y), normal.get_pixel(source, y));
+                }
+            }
+            let width = rendered.bitmap.width();
+            let mirrored = rendered.mirrored(true, true);
+            for (actual, expected) in mirrored.element_spans.iter().zip(expected.iter()) {
+                assert_eq!(
+                    *actual,
+                    expected
+                        .as_ref()
+                        .map(|span| width - span.end..width - span.start)
+                );
+            }
+            for x in 0..width {
+                let source = if feed == head * 2 {
+                    (width - 1 - x) / 2
+                } else if feed * 2 == head {
+                    (width - 1 - x) * 2
+                } else {
+                    width - 1 - x
+                };
+                for y in 0..70 {
+                    assert_eq!(
+                        mirrored.bitmap.get_pixel(x, y),
+                        normal.get_pixel(source, 69 - y)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsampled_draft_elements_have_empty_spans_without_moving_other_elements() {
+        let rendered = render_elements_with_layout_at_resolution(
+            &[
+                LabelElement::Padding { pixels: 1 },
+                LabelElement::Padding { pixels: 1 },
+                LabelElement::Padding { pixels: 1 },
+            ],
+            70,
+            "sans-serif",
+            0,
+            &mut TextRenderer::new(),
+            PrintResolution {
+                head_dpi: 360,
+                feed_dpi: 180,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rendered.bitmap.width(), 2);
+        assert_eq!(
+            rendered.element_spans,
+            vec![Some(0..1), Some(1..1), Some(1..2)]
+        );
+    }
+
+    #[test]
+    fn rotated_and_mirrored_image_bounds_follow_the_composed_segments() {
+        let mut image = LabelBitmap::new(31, 17);
+        image.set_pixel(0, 0, true);
+        let elements = [
+            LabelElement::Padding { pixels: 3 },
+            LabelElement::Image {
+                path: None,
+                image_data: Vec::new(),
+                bitmap: Some(image),
+                rotation: 37.0,
+                target_height: Some(24),
+                flip_h: true,
+                flip_v: true,
+            },
+            empty_text(),
+            LabelElement::Padding { pixels: 8 },
+        ];
+        for feed in [180, 360, 720] {
+            let resolution = PrintResolution {
+                head_dpi: 360,
+                feed_dpi: feed,
+            };
+            let rendered = render_elements_with_layout_at_resolution(
+                &elements,
+                70,
+                "sans-serif",
+                0,
+                &mut TextRenderer::new(),
+                resolution,
+            )
+            .unwrap()
+            .unwrap();
+            let spans = &rendered.element_spans;
+            assert_eq!(spans[0].as_ref().unwrap().start, 0);
+            assert_eq!(
+                spans[0].as_ref().unwrap().end,
+                spans[1].as_ref().unwrap().start
+            );
+            assert_eq!(
+                spans[1].as_ref().unwrap().end,
+                spans[3].as_ref().unwrap().start
+            );
+            assert_eq!(spans[3].as_ref().unwrap().end, rendered.bitmap.width());
+            assert!(spans[2].is_none());
+        }
     }
 }

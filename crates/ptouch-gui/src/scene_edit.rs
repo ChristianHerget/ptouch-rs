@@ -34,7 +34,7 @@ struct SceneSnapshot {
     target: CanvasEditTarget,
     hovered: Option<CanvasTarget>,
     dragged: Option<CanvasTarget>,
-    edit_revision: u64,
+    document_revision: u64,
     selection_revision: u64,
     editor_generation: u64,
     needs_rerender: bool,
@@ -49,7 +49,7 @@ impl SceneSnapshot {
             target: state.canvas_edit_target,
             hovered: state.canvas_hover_target,
             dragged: state.canvas_drag_target,
-            edit_revision: state.edit_revision,
+            document_revision: state.document_revision,
             selection_revision: state.selection_revision,
             editor_generation: state.editor_generation,
             needs_rerender: state.needs_rerender,
@@ -63,7 +63,7 @@ impl SceneSnapshot {
         state.canvas_edit_target = self.target;
         state.canvas_hover_target = self.hovered;
         state.canvas_drag_target = self.dragged;
-        state.edit_revision = self.edit_revision;
+        state.document_revision = self.document_revision;
         state.selection_revision = self.selection_revision;
         state.editor_generation = self.editor_generation;
         state.needs_rerender = self.needs_rerender;
@@ -112,6 +112,79 @@ fn is_attached(element: &LabelElement) -> bool {
 }
 
 impl AppState {
+    fn record_scene_action(
+        &mut self,
+        name: &'static str,
+        action: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        let before = self.content_snapshot();
+        if !action(self) {
+            return false;
+        }
+        self.record_content(
+            before,
+            name,
+            self.editor.changed_group,
+            self.editor.changed_time,
+        );
+        true
+    }
+    pub fn change_layer(&mut self, index: usize, movement: LayerMove) -> bool {
+        self.record_scene_action("Arrange layers", |state| {
+            state.change_layer_unrecorded(index, movement)
+        })
+    }
+    pub fn reorder_layer(&mut self, from: usize, to: usize) -> bool {
+        self.record_scene_action("Reorder layers", |state| {
+            state.reorder_layer_unrecorded(from, to)
+        })
+    }
+    pub fn add_shape(&mut self, kind: ShapeKind, circle: bool) -> bool {
+        self.record_scene_action("Add shape", |state| {
+            state.add_shape_unrecorded(kind, circle)
+        })
+    }
+    pub fn add_overlay_text(&mut self, host: usize) -> bool {
+        self.record_scene_action("Add text overlay", |state| {
+            state.add_overlay_text_unrecorded(host)
+        })
+    }
+    pub fn add_overlay_image_bytes(
+        &mut self,
+        host: usize,
+        path: Option<PathBuf>,
+        bytes: Vec<u8>,
+    ) -> bool {
+        self.record_scene_action("Add image overlay", |state| {
+            state.add_overlay_image_bytes_unrecorded(host, path, bytes)
+        })
+    }
+    pub fn add_overlay_shape(&mut self, host: usize, kind: ShapeKind, circle: bool) -> bool {
+        self.record_scene_action("Add shape overlay", |state| {
+            state.add_overlay_shape_unrecorded(host, kind, circle)
+        })
+    }
+    pub fn attach_overlay(&mut self, child: usize, host: usize) -> bool {
+        self.record_scene_action("Attach overlay", |state| {
+            state.attach_overlay_unrecorded(child, host)
+        })
+    }
+    pub fn detach_overlay(&mut self, index: usize) -> bool {
+        self.record_scene_action("Detach overlay", |state| {
+            state.detach_overlay_unrecorded(index)
+        })
+    }
+    pub fn set_overlay_alignment(&mut self, index: usize, horizontal: f64, vertical: f64) -> bool {
+        self.record_scene_action("Align overlay", |state| {
+            state.set_overlay_alignment_unrecorded(index, horizontal, vertical)
+        })
+    }
+    pub fn set_overlay_anchor(&mut self, index: usize, anchor: Anchor) -> bool {
+        self.record_scene_action("Edit overlay anchor", |state| {
+            state.set_overlay_anchor_unrecorded(index, anchor)
+        })
+    }
+
     /// Lightweight validation used during pointer movement. No font system,
     /// TOML encoding or source-image decoding runs in this path.
     pub(crate) fn validate_scene_geometry(&mut self) -> Result<(), String> {
@@ -164,7 +237,8 @@ impl AppState {
         let old_font = std::mem::replace(&mut self.font_name, font);
         let mut doc = self.document();
         let renderer = self
-            .scene_measurement_renderer
+            .editor
+            .layout_renderer
             .get_or_insert_with(ptouch_render::text::TextRenderer::new);
         let result = object_layout::resolve(&mut doc, renderer)
             .map_err(|error| error.to_string())
@@ -253,7 +327,7 @@ impl AppState {
         true
     }
 
-    pub fn change_layer(&mut self, index: usize, movement: LayerMove) -> bool {
+    fn change_layer_unrecorded(&mut self, index: usize, movement: LayerMove) -> bool {
         let mut order = scene::paint_order(&self.elements);
         let Some(from) = order.iter().position(|&item| item == index) else {
             return false;
@@ -273,7 +347,7 @@ impl AppState {
     }
 
     /// Both indices identify objects, regardless of which list is displayed.
-    pub fn reorder_layer(&mut self, from: usize, to: usize) -> bool {
+    fn reorder_layer_unrecorded(&mut self, from: usize, to: usize) -> bool {
         let mut order = scene::paint_order(&self.elements);
         let (Some(source), Some(target)) = (
             order.iter().position(|&item| item == from),
@@ -352,7 +426,7 @@ impl AppState {
         object
     }
 
-    pub fn add_shape(&mut self, kind: ShapeKind, circle: bool) -> bool {
+    fn add_shape_unrecorded(&mut self, kind: ShapeKind, circle: bool) -> bool {
         let height = (self.printable_height_mm() * 0.7).min(7.0);
         let width = if circle { height } else { height * 1.6 };
         let mut frame = self.default_object_frame(width, height);
@@ -373,7 +447,7 @@ impl AppState {
         })
     }
 
-    pub fn add_overlay_text(&mut self, host: usize) -> bool {
+    fn add_overlay_text_unrecorded(&mut self, host: usize) -> bool {
         let Some((_, _, width, height)) = self.element_rect_mm(host) else {
             return false;
         };
@@ -390,7 +464,7 @@ impl AppState {
         self.append_scene_object(object, Some(host))
     }
 
-    pub fn add_overlay_image_bytes(
+    fn add_overlay_image_bytes_unrecorded(
         &mut self,
         host: usize,
         path: Option<PathBuf>,
@@ -432,7 +506,7 @@ impl AppState {
         self.append_scene_object(object, Some(host))
     }
 
-    pub fn add_overlay_shape(&mut self, host: usize, kind: ShapeKind, circle: bool) -> bool {
+    fn add_overlay_shape_unrecorded(&mut self, host: usize, kind: ShapeKind, circle: bool) -> bool {
         let Some((_, _, width, height)) = self.element_rect_mm(host) else {
             return false;
         };
@@ -458,7 +532,7 @@ impl AppState {
             && scene::children(&self.elements, child).is_empty()
     }
 
-    pub fn attach_overlay(&mut self, child: usize, host: usize) -> bool {
+    fn attach_overlay_unrecorded(&mut self, child: usize, host: usize) -> bool {
         if !self.can_attach_overlay(child, host) {
             self.status_message =
                 "An overlay needs an independent host and cannot host overlays".into();
@@ -510,7 +584,7 @@ impl AppState {
         )
     }
 
-    pub fn detach_overlay(&mut self, index: usize) -> bool {
+    fn detach_overlay_unrecorded(&mut self, index: usize) -> bool {
         if !self.elements.get(index).is_some_and(is_attached) {
             return false;
         }
@@ -530,7 +604,12 @@ impl AppState {
         )
     }
 
-    pub fn set_overlay_alignment(&mut self, index: usize, horizontal: f64, vertical: f64) -> bool {
+    fn set_overlay_alignment_unrecorded(
+        &mut self,
+        index: usize,
+        horizontal: f64,
+        vertical: f64,
+    ) -> bool {
         let Some(mut anchor) = self
             .elements
             .get(index)
@@ -558,10 +637,10 @@ impl AppState {
         anchor.horizontal = horizontal;
         anchor.vertical = vertical;
         anchor = scene::offset_for_frame(&anchor, &world[index], &world[host]);
-        self.set_overlay_anchor(index, anchor)
+        self.set_overlay_anchor_unrecorded(index, anchor)
     }
 
-    pub fn set_overlay_anchor(&mut self, index: usize, anchor: Anchor) -> bool {
+    fn set_overlay_anchor_unrecorded(&mut self, index: usize, anchor: Anchor) -> bool {
         let Some(object) = self.elements.get(index).and_then(LabelElement::as_object) else {
             return false;
         };
@@ -633,7 +712,8 @@ impl AppState {
                 || before.layout != object.layout);
         if measure {
             let renderer = self
-                .scene_measurement_renderer
+                .editor
+                .layout_renderer
                 .get_or_insert_with(ptouch_render::text::TextRenderer::new);
             object_layout::resolve_object(
                 &mut object,
@@ -1100,11 +1180,11 @@ mod tests {
         assert!(state.set_overlay_anchor(3, anchor));
         let before = state.document();
         let selection = state.selected_element;
-        let revision = state.edit_revision;
+        let revision = state.document_revision;
         assert!(!state.reorder_scene_element(1, 0));
         assert_eq!(state.document(), before);
         assert_eq!(state.selected_element, selection);
-        assert_eq!(state.edit_revision, revision);
+        assert_eq!(state.document_revision, revision);
     }
 
     fn assert_close(left: f64, right: f64) {
@@ -1190,7 +1270,7 @@ mod tests {
         }
         assert!(state.apply_scene_object_edit(0, object).is_err());
         assert_eq!(state.document(), before);
-        assert!(state.scene_measurement_renderer.is_some());
+        assert!(state.editor.layout_renderer.is_some());
     }
 
     #[test]
@@ -1278,12 +1358,12 @@ mod tests {
         state.needs_rerender = false;
         let before = state.document();
         let selected = state.selected_element;
-        let revision = state.edit_revision;
+        let revision = state.document_revision;
         let mut invalid = state.elements[3].as_object().unwrap().clone();
         invalid.content_box.as_mut().unwrap().height_mm = 20.0;
         assert!(state.apply_scene_object_edit(3, invalid).is_err());
         assert_eq!(state.document(), before);
-        assert_eq!(state.edit_revision, revision);
+        assert_eq!(state.document_revision, revision);
         assert!(!state.needs_rerender);
         let mut anchor = anchor_of(state.elements[3].as_object().unwrap())
             .unwrap()
@@ -1292,7 +1372,7 @@ mod tests {
         assert!(!state.set_overlay_anchor(3, anchor));
         assert_eq!(state.document(), before);
         assert_eq!(state.selected_element, selected);
-        assert_eq!(state.edit_revision, revision);
+        assert_eq!(state.document_revision, revision);
         assert!(!state.needs_rerender);
     }
 
@@ -1385,10 +1465,8 @@ mod tests {
         let before = state.document();
         let child_id = scene_id(&state.elements, 3).unwrap();
         let child_world = worlds(&state)[3].clone();
-        state
-            .history
-            .observe(before.clone(), Some(0), false, false, 0.0);
-        assert!(state.delete_scene_element(0));
+
+        assert!(state.apply_editor_action(crate::editor::EditorAction::Delete(0)));
         let child = state
             .elements
             .iter()
@@ -1401,10 +1479,8 @@ mod tests {
         assert!(!is_attached(&state.elements[child]));
         assert_eq!(worlds(&state)[child], child_world);
         assert_close(worlds(&state)[0].x_mm, 2.0);
-        state
-            .history
-            .observe(state.document(), state.selected_element, false, false, 1.0);
-        state.history_step(false);
+
+        state.apply_editor_action(crate::editor::EditorAction::Undo);
         assert_eq!(state.document(), before);
     }
 
@@ -1438,5 +1514,33 @@ mod tests {
             assert!(object.sequence.is_none());
         }
         state.validate_scene_geometry().unwrap();
+    }
+    #[test]
+    fn scene_commands_share_history_and_rejected_edits_preserve_redo() {
+        use crate::editor::EditorAction;
+        let mut state = fixture();
+        state.select_element(Some(0));
+        let initial = state.document().to_toml_string().unwrap();
+        assert!(state.add_overlay_shape(0, ShapeKind::Ellipse, true));
+        let overlay = state.selected_element.unwrap();
+        let added = state.document().to_toml_string().unwrap();
+        assert!(state.change_layer(overlay, LayerMove::Back));
+        let arranged = state.document().to_toml_string().unwrap();
+        assert!(state.detach_overlay(overlay));
+        let detached = state.document().to_toml_string().unwrap();
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().to_toml_string().unwrap(), arranged);
+        assert!(!state.attach_overlay(0, 0));
+        assert_eq!(state.document().to_toml_string().unwrap(), arranged);
+        assert_eq!(state.editor.history.redo_name(), Some("Detach overlay"));
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().to_toml_string().unwrap(), added);
+        assert!(state.apply_editor_action(EditorAction::Undo));
+        assert_eq!(state.document().to_toml_string().unwrap(), initial);
+        assert!(!state.apply_editor_action(EditorAction::Undo));
+        for _ in 0..3 {
+            assert!(state.apply_editor_action(EditorAction::Redo));
+        }
+        assert_eq!(state.document().to_toml_string().unwrap(), detached);
     }
 }

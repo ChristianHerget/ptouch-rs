@@ -14,6 +14,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Ephemeral selection and insertion attributes participate in document history.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct InlineState {
+    pub selection: Option<CCursorRange>,
+    pub pending: TextStyle,
+    pub pending_at: Option<usize>,
+}
+
 #[derive(Clone, Default)]
 struct Snapshot {
     document: StyledText,
@@ -24,13 +32,9 @@ struct Snapshot {
 
 #[derive(Clone, Default)]
 struct Session {
-    last_action: f64,
     current: Snapshot,
     committed: StyledText,
-    undo: Vec<Arc<Snapshot>>,
-    redo: Vec<Arc<Snapshot>>,
     composition: Option<Snapshot>,
-    typing_group: Option<(f64, Option<CCursorRange>)>,
     font_search: String,
 }
 
@@ -46,52 +50,7 @@ impl Session {
         }
     }
 
-    fn record(&mut self, before: Snapshot, typing: bool, time: f64) {
-        if before.document == self.current.document && before.pending == self.current.pending {
-            return;
-        }
-        self.last_action = time;
-        let coalesce = typing
-            && self
-                .typing_group
-                .is_some_and(|(last, caret)| time - last < 1.0 && caret == before.selection);
-        if !coalesce {
-            self.undo.push(Arc::new(before));
-        }
-        self.redo.clear();
-        // Bounded full-state history: styles and insertion attributes participate.
-        while self.undo.len() > 100
-            || self
-                .undo
-                .iter()
-                .map(|s| s.document.text.len() + s.document.spans.len() * 128)
-                .sum::<usize>()
-                > 8_388_608
-        {
-            self.undo.remove(0);
-        }
-        self.typing_group = typing.then_some((time, self.current.selection));
-    }
-
-    fn history(&mut self, redo: bool) -> bool {
-        let (source, destination) = if redo {
-            (&mut self.redo, &mut self.undo)
-        } else {
-            (&mut self.undo, &mut self.redo)
-        };
-        let Some(previous) = source.pop() else {
-            return false;
-        };
-        destination.push(Arc::new(self.current.clone()));
-        self.current = (*previous).clone();
-        self.committed = self.current.document.clone();
-        self.composition = None;
-        self.typing_group = None;
-        true
-    }
-
-    fn format(&mut self, patch: StylePatch, time: f64) {
-        let before = self.current.clone();
+    fn format(&mut self, patch: StylePatch) {
         let range = selected_range(self.current.selection);
         if range.is_empty() {
             patch.apply(&mut self.current.pending);
@@ -103,38 +62,8 @@ impl Session {
                 .document
                 .style_at(selected_range(self.current.selection).start);
         }
-        self.record(before, false, time);
         self.committed = self.current.document.clone();
     }
-}
-
-/// Insertion formatting is transient editor state, so it does not create a
-/// document snapshot. Route only such a newer action ahead of document undo.
-pub fn pending_history(ctx: &Context, id: Id, redo: bool, after: f64) -> bool {
-    let session_id = id.with("session");
-    let Some(mut session) = ctx.data_mut(|d| d.get_temp::<Session>(session_id)) else {
-        return false;
-    };
-    let source = if redo { &session.redo } else { &session.undo };
-    if session.last_action < after
-        || source
-            .last()
-            .is_none_or(|s| s.document != session.current.document)
-    {
-        return false;
-    }
-    if !session.history(redo) {
-        return false;
-    }
-    session.last_action = ctx.input(|i| i.time);
-    ctx.data_mut(|d| d.insert_temp(session_id, session));
-    ctx.request_repaint();
-    true
-}
-
-pub fn is_composing(ctx: &Context, id: Id) -> bool {
-    ctx.data_mut(|d| d.get_temp::<Session>(id.with("session")))
-        .is_some_and(|s| s.composition.is_some())
 }
 
 #[derive(Clone)]
@@ -408,8 +337,6 @@ fn layout_job(
 
 enum Action {
     Format(StylePatch),
-    Undo,
-    Redo,
 }
 
 /// Changes the authoritative text only after IME composition is committed.
@@ -422,6 +349,7 @@ pub fn show(
     default_font: &str,
     base_size: f32,
     fonts: &[String],
+    editor: &mut crate::editor::Editor,
 ) -> bool {
     let base_size = if base_size.is_finite() && base_size > 0.0 {
         base_size
@@ -437,9 +365,19 @@ pub fn show(
         .ctx()
         .data_mut(|data| data.get_temp::<Session>(session_id))
         .unwrap_or_else(|| Session::new(original.clone()));
-    if original != session.committed {
+    if original != session.committed || editor.rich_restore {
         session = Session::new(original.clone());
     }
+    if let Some((stored_id, state)) = &editor.rich_text
+        && *stored_id == id
+    {
+        session.current.selection = state.selection;
+        session.current.pending = state.pending.clone();
+        session.current.pending_at = state.pending_at;
+    }
+    editor.rich_restore = false;
+    let before_pending = session.current.pending.clone();
+    let before_pending_at = session.current.pending_at;
     let mut widget_state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
     let focused = ui.memory(|m| m.has_focus(id));
     // Native TextEdit may collapse its selection after losing focus. Keep the
@@ -467,32 +405,8 @@ pub fn show(
     }
     let before = session.current.clone();
     let events = ui.input(|i| i.events.clone());
-    let document_history = ui.ctx().data_mut(|d| {
-        d.get_temp::<bool>(Id::new("document_history"))
-            .unwrap_or(false)
-    });
     let mut action = None;
     if focused || !ui.ctx().text_edit_focused() {
-        // More specific modifiers first: egui's logical shortcuts can accept Shift.
-        for (shortcut, command) in [
-            (
-                KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
-                Action::Redo,
-            ),
-            (
-                KeyboardShortcut::new(Modifiers::COMMAND, Key::Z),
-                Action::Undo,
-            ),
-            (
-                KeyboardShortcut::new(Modifiers::COMMAND, Key::Y),
-                Action::Redo,
-            ),
-        ] {
-            if !document_history && ui.input_mut(|i| i.consume_shortcut(&shortcut)) {
-                action = Some(command);
-                break;
-            }
-        }
         for (key, patch) in [
             (
                 Key::B,
@@ -628,19 +542,11 @@ pub fn show(
         output.state.clear_undoer();
         output.state.clone().store(ui.ctx(), id);
     } else if session.composition.is_none() || ime_finished {
-        let prior = session.composition.take().unwrap_or(before);
-        let typing = events
-            .iter()
-            .any(|e| matches!(e, Event::Text(_) | Event::Ime(ImeEvent::Commit(_))))
-            && !events.iter().any(|e| matches!(e, Event::Paste(_)));
-        session.record(prior, typing, ui.input(|i| i.time));
+        session.composition = None;
         session.committed = session.current.document.clone();
     }
     if session.current.selection != old_selection {
         session.current.pending_at = None;
-        if !native_changed {
-            session.typing_group = None;
-        }
         let range = selected_range(session.current.selection);
         if native_changed && session.current.document.is_empty() {
             // Deleting the last styled character keeps that insertion style.
@@ -706,20 +612,6 @@ pub fn show(
             if format_button(ui, label, name, state).clicked() {
                 action = Some(Action::Format(patch));
             }
-        }
-        if !document_history
-            && ui
-                .add_enabled(!session.undo.is_empty(), Button::new("Undo"))
-                .clicked()
-        {
-            action = Some(Action::Undo);
-        }
-        if !document_history
-            && ui
-                .add_enabled(!session.redo.is_empty(), Button::new("Redo"))
-                .clicked()
-        {
-            action = Some(Action::Redo);
         }
     });
     if [
@@ -831,19 +723,14 @@ pub fn show(
                 }
             }
         });
+    let formatting = action.is_some();
     if let Some(action) = action {
         // A style click ends unfinished composition before changing the selection.
         if let Some(prior) = session.composition.take() {
             session.current = prior;
         }
         match action {
-            Action::Format(patch) => session.format(patch, ui.input(|i| i.time)),
-            Action::Undo => {
-                session.history(false);
-            }
-            Action::Redo => {
-                session.history(true);
-            }
+            Action::Format(patch) => session.format(patch),
         }
         output
             .state
@@ -854,10 +741,27 @@ pub fn show(
         output.response.request_focus();
         ui.ctx().request_repaint();
     }
-    let changed = original != session.committed;
+    let changed = original != session.committed
+        || before_pending != session.current.pending && formatting
+        || before_pending_at != session.current.pending_at && formatting;
     if changed {
         *content = session.committed.text.clone();
         *spans = session.committed.spans.clone();
+    }
+    if changed {
+        output.response.mark_changed();
+    }
+    editor.input(&output.response);
+    editor.rich_text = Some((
+        id,
+        InlineState {
+            selection: session.current.selection,
+            pending: session.current.pending.clone(),
+            pending_at: session.current.pending_at,
+        },
+    ));
+    if formatting || events.iter().any(|e| matches!(e, Event::Paste(_))) {
+        editor.changed_group = None;
     }
     ui.ctx()
         .data_mut(|data| data.insert_temp(session_id, session));
@@ -873,6 +777,7 @@ mod tests {
         ctx: Context,
         id: Id,
         document: StyledText,
+        state: crate::state::AppState,
     }
 
     impl EditorHarness {
@@ -884,14 +789,33 @@ mod tests {
                     text: text.into(),
                     spans: vec![],
                 },
+                state: crate::state::AppState::default(),
             };
+            h.state
+                .elements
+                .push(ptouch_render::document::LabelElement::Object(
+                    ptouch_render::document::LabelObject::text(text, Default::default()),
+                ));
+            h.state.select_element(Some(0));
             h.frame(vec![]);
             h.frame(vec![]);
             h.select(0..0);
             h
         }
         fn frame(&mut self, events: Vec<Event>) -> Vec<egui::epaint::ClippedShape> {
-            let Self { ctx, id, document } = self;
+            let Self {
+                ctx,
+                id,
+                document,
+                state,
+            } = self;
+            if let ptouch_render::document::ObjectContent::Text {
+                content, styles, ..
+            } = &mut state.elements[0].as_object_mut().unwrap().content
+            {
+                *content = document.text.clone();
+                *styles = document.spans.clone();
+            }
             let mut output = ctx.run_ui(
                 RawInput {
                     events,
@@ -899,15 +823,41 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    show(
-                        ui,
-                        &mut document.text,
-                        &mut document.spans,
-                        *id,
-                        "DejaVu Sans",
-                        12.0,
-                        &["DejaVu Serif".into()],
-                    );
+                    crate::editor::begin_frame(ui.ctx(), state);
+                    let before = state.content_snapshot();
+                    let mut object = state.elements[0].as_object().unwrap().clone();
+                    if let ptouch_render::document::ObjectContent::Text {
+                        content, styles, ..
+                    } = &mut object.content
+                    {
+                        let changed = show(
+                            ui,
+                            content,
+                            styles,
+                            *id,
+                            "DejaVu Sans",
+                            12.0,
+                            &["DejaVu Serif".into()],
+                            &mut state.editor,
+                        );
+                        state.elements[0] = ptouch_render::document::LabelElement::Object(object);
+                        if changed {
+                            state.record_content(
+                                before,
+                                "Edit text",
+                                state.editor.changed_group,
+                                ui.input(|i| i.time),
+                            );
+                        }
+                    }
+                    crate::editor::end_frame(ui.ctx(), state);
+                    if let ptouch_render::document::ObjectContent::Text {
+                        content, styles, ..
+                    } = &state.elements[0].as_object().unwrap().content
+                    {
+                        document.text = content.clone();
+                        document.spans = styles.clone();
+                    }
                 },
             );
             output.textures_delta.clear();
@@ -936,6 +886,39 @@ mod tests {
                 },
             }]);
         }
+    }
+
+    #[test]
+    fn rich_text_and_object_actions_share_one_chronological_history() {
+        use crate::editor::{EditorAction, apply_action};
+        let mut h = EditorHarness::new("AB");
+        h.select(0..1);
+        h.command(Key::B, false);
+        h.select(2..2);
+        h.command(Key::I, false);
+        h.frame(vec![Event::Text("端口".into())]);
+        let rich = h.document.clone();
+        assert!(rich.style_at(0).bold && rich.style_at(2).italic);
+        apply_action(&h.ctx, &mut h.state, EditorAction::Duplicate(0));
+        assert_eq!(h.state.elements.len(), 2);
+        h.command(Key::Z, false);
+        assert_eq!(h.state.elements.len(), 1);
+        assert_eq!(h.document, rich);
+        h.command(Key::Z, false);
+        assert_eq!(h.document.text, "AB");
+        h.command(Key::Z, false);
+        assert!(!h.state.editor.rich_text.as_ref().unwrap().1.pending.italic);
+        h.command(Key::Z, false);
+        assert!(h.document.spans.is_empty());
+        for _ in 0..4 {
+            h.command(Key::Z, true);
+        }
+        assert_eq!(h.state.elements.len(), 2);
+        assert_eq!(h.document, rich);
+        let saved = h.state.document().to_toml_string().unwrap();
+        apply_action(&h.ctx, &mut h.state, EditorAction::Delete(1));
+        h.command(Key::Z, false);
+        assert_eq!(h.state.document().to_toml_string().unwrap(), saved);
     }
 
     #[test]
@@ -1228,6 +1211,13 @@ mod tests {
             ctx: source.ctx.clone(),
             id: Id::new("other-editor"),
             document: StyledText::default(),
+            state: crate::state::AppState {
+                elements: vec![ptouch_render::document::LabelElement::Object(
+                    ptouch_render::document::LabelObject::text("", Default::default()),
+                )],
+                selected_element: Some(0),
+                ..Default::default()
+            },
         };
         target.frame(vec![]);
         target.select(0..0);

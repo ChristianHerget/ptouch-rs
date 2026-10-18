@@ -22,6 +22,7 @@ pub mod shape;
 pub mod stroke;
 pub mod styled_text;
 pub mod surface;
+pub mod symbol;
 pub mod text;
 
 /// Errors produced by the render crate.

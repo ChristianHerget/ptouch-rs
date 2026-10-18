@@ -38,7 +38,8 @@ impl crate::state::AppState {
             self.document_version.max(4),
             self.design_dpi,
             &self.font_name,
-            self.scene_measurement_renderer
+            self.editor
+                .layout_renderer
                 .get_or_insert_with(ptouch_render::text::TextRenderer::new),
         );
         if let Some(policy) = &mut candidate.layout {
@@ -239,7 +240,8 @@ mod tests {
                             state.design_dpi,
                             &state.font_name,
                             state
-                                .scene_measurement_renderer
+                                .editor
+                                .layout_renderer
                                 .get_or_insert_with(ptouch_render::text::TextRenderer::new),
                         )
                         .unwrap();
@@ -277,7 +279,7 @@ mod tests {
                                     state.document_version,
                                     state.design_dpi,
                                     &state.font_name,
-                                    state.scene_measurement_renderer.as_mut().unwrap(),
+                                    state.editor.layout_renderer.as_mut().unwrap(),
                                 )
                                 .unwrap();
                                 assert_eq!(&rendered, result);

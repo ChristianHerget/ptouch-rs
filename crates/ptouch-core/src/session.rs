@@ -300,6 +300,7 @@ impl<T: Transport> PrinterSession<T> {
     /// * `chain_print` - If true, don't cut the tape (chain mode).
     /// * `precut` - If true AND device supports precut, send precut command.
     /// * `quality` - Print quality mode (device must support non-standard).
+    /// * `resolution` - Actual input raster DPI; must match the selected mode.
     ///
     /// # Errors
     ///
@@ -309,6 +310,7 @@ impl<T: Transport> PrinterSession<T> {
     pub fn print_raster(
         &mut self,
         lines: &[Vec<u8>],
+        resolution: crate::PrintResolution,
         chain_print: bool,
         precut: bool,
         quality: protocol::PrintQuality,
@@ -321,13 +323,9 @@ impl<T: Transport> PrinterSession<T> {
             print_status_is_ready(status)?;
         }
 
-        if quality != protocol::PrintQuality::Standard
-            && !self.profile.flags.contains(DeviceFlags::LEGACY_HIRES)
-        {
-            return Err(PtouchError::UnsupportedQuality(
-                self.profile.name.to_string(),
-            ));
-        }
+        let mode = self.profile.quality().mode(quality)?;
+        mode.validate_resolution(resolution)?;
+        mode.validate_media(self.status.as_ref().map_or(0, |s| s.media_type))?;
 
         if self.profile.dialect == Dialect::P300Bt {
             let status = self.status.as_ref().ok_or(PtouchError::NotInitialized)?;
@@ -348,14 +346,21 @@ impl<T: Transport> PrinterSession<T> {
             quality,
         };
 
-        let job = protocol::build_print_job(lines, self.profile.flags, &opts);
+        let job = protocol::build_print_job(
+            lines,
+            resolution,
+            self.profile.flags,
+            self.profile.quality(),
+            &opts,
+        )?;
         info!(
-            "Print job: model={}, tape={}mm, input_lines={}, length={:.2}mm, dpi={}, quality={:?}, wire_bytes={}, final={:02x?}",
+            "Print job: model={}, tape={}mm, input_lines={}, length={:.2}mm, dpi={}x{}, quality={:?}, wire_bytes={}, final={:02x?}",
             self.profile.name,
             opts.media_width,
             lines.len(),
-            lines.len() as f64 * 25.4 / f64::from(self.profile.dpi),
-            self.profile.dpi,
+            resolution.length_mm(lines.len()),
+            resolution.head_dpi,
+            resolution.feed_dpi,
             quality,
             job.iter().map(Vec::len).sum::<usize>(),
             job.last().unwrap_or(&Vec::new())
@@ -371,7 +376,7 @@ impl<T: Transport> PrinterSession<T> {
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            self.wait_until_ready(started)
+            self.wait_until_ready(started, self.quiet_timeout(lines.len(), resolution))
         } else {
             self.receive_print_completion(started)
         };
@@ -407,7 +412,13 @@ impl<T: Transport> PrinterSession<T> {
             ..protocol::JobOptions::default()
         };
 
-        let job = protocol::build_print_job(&lines, self.profile.flags, &opts);
+        let job = protocol::build_print_job(
+            &lines,
+            crate::PrintResolution::square(self.profile.dpi),
+            self.profile.flags,
+            self.profile.quality(),
+            &opts,
+        )?;
         let started = Instant::now();
         if let Err(error) = self.send_job(job) {
             self.initialized = false;
@@ -419,7 +430,7 @@ impl<T: Transport> PrinterSession<T> {
             .flags
             .contains(DeviceFlags::WAIT_FOR_RECEIVE_READY)
         {
-            if let Err(error) = self.wait_until_ready(started) {
+            if let Err(error) = self.wait_until_ready(started, PRINT_STATUS_IDLE_TIMEOUT) {
                 self.initialized = false;
                 return Err(error);
             }
@@ -484,14 +495,22 @@ impl<T: Transport> PrinterSession<T> {
         Ok(())
     }
 
-    fn wait_until_ready(&mut self, started: Instant) -> Result<()> {
+    // Some printers stay silent while feeding. Allow enough time for the
+    // rendered length at a conservative 5 mm/s plus cutting overhead, while
+    // retaining the caller's absolute job deadline.
+    fn quiet_timeout(&self, columns: usize, resolution: crate::PrintResolution) -> Duration {
+        Duration::from_secs_f64((resolution.length_mm(columns) / 5.0 + 10.0).max(30.0))
+            .min(self.job_timeout)
+    }
+
+    fn wait_until_ready(&mut self, started: Instant, quiet_timeout: Duration) -> Result<()> {
         let remaining = self
             .job_timeout
             .checked_sub(started.elapsed())
             .unwrap_or_default();
         let result = receive_print_status_bounded(
             |buf, timeout| self.receive_with_timeout(buf, timeout),
-            PRINT_STATUS_IDLE_TIMEOUT,
+            quiet_timeout,
             remaining,
         );
         match result {
@@ -844,6 +863,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mismatched_raster_resolution_sends_no_job_data() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.init().unwrap();
+        let count = session.transport.writes.borrow().len();
+        assert!(matches!(
+            session.print_raster(
+                &[vec![0; 16]],
+                crate::PrintResolution::square(360),
+                false,
+                false,
+                protocol::PrintQuality::Standard
+            ),
+            Err(PtouchError::RasterResolution { .. })
+        ));
+        assert_eq!(session.transport.writes.borrow().len(), count);
+    }
+
+    #[test]
     fn drain_rejects_continuous_input_and_preserves_transport_errors() {
         let mut reads = 0;
         let result = drain_input(
@@ -904,6 +941,7 @@ mod tests {
         session.job_timeout = Duration::from_millis(5);
         let result = session.print_raster(
             &[vec![0; 16]],
+            crate::PrintResolution::square(180),
             true,
             false,
             protocol::PrintQuality::Standard,
@@ -913,6 +951,7 @@ mod tests {
         assert!(matches!(
             session.print_raster(
                 &[vec![0; 16]],
+                crate::PrintResolution::square(180),
                 false,
                 false,
                 protocol::PrintQuality::Standard
@@ -1035,6 +1074,7 @@ mod tests {
         assert!(matches!(
             session.print_raster(
                 &[vec![0; 16]],
+                crate::PrintResolution::square(180),
                 false,
                 false,
                 protocol::PrintQuality::Standard
@@ -1046,6 +1086,7 @@ mod tests {
         assert!(matches!(
             session.print_raster(
                 &[vec![0; 16]],
+                crate::PrintResolution::square(180),
                 false,
                 false,
                 protocol::PrintQuality::Standard
@@ -1191,6 +1232,7 @@ mod tests {
         session.job_timeout = Duration::from_millis(5);
         let result = session.print_raster(
             &[vec![0; 16], vec![0x80; 16]],
+            crate::PrintResolution::square(180),
             false,
             false,
             protocol::PrintQuality::Standard,
@@ -1224,6 +1266,7 @@ mod tests {
         session
             .print_raster(
                 &[vec![0; 16]],
+                crate::PrintResolution::square(180),
                 false,
                 false,
                 protocol::PrintQuality::Standard,
@@ -1245,7 +1288,13 @@ mod tests {
             .borrow_mut()
             .extend([status_packet(6, 0).to_vec(), error.to_vec()]);
         assert!(matches!(
-            session.print_raster(&[vec![0; 16]], false, false, protocol::PrintQuality::Standard),
+            session.print_raster(
+                &[vec![0; 16]],
+                crate::PrintResolution::square(180),
+                false,
+                false,
+                protocol::PrintQuality::Standard,
+            ),
             Err(PtouchError::StatusError(message)) if message == "Communication error"
         ));
         assert!(!session.is_initialized());
@@ -1301,6 +1350,7 @@ mod tests {
             assert!(matches!(
                 session.print_raster(
                     &[vec![0; 16]],
+                    crate::PrintResolution::square(180),
                     false,
                     false,
                     protocol::PrintQuality::Standard
@@ -1329,6 +1379,7 @@ mod tests {
             session
                 .print_raster(
                     &[vec![0; 16]],
+                    crate::PrintResolution::square(180),
                     false,
                     false,
                     protocol::PrintQuality::Standard,
@@ -1660,6 +1711,7 @@ mod tests {
         session
             .print_raster(
                 &[vec![0; 16]],
+                crate::PrintResolution::square(180),
                 false,
                 false,
                 protocol::PrintQuality::Standard,

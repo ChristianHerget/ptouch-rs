@@ -529,3 +529,160 @@ fn a_rotated_single_dot_paper_fill_covers_at_least_one_background_pixel() {
         }
     }
 }
+
+const OUTPUT_RESOLUTIONS: [(u16, u16); 5] =
+    [(180, 180), (180, 360), (360, 180), (360, 360), (360, 720)];
+
+fn render_resolution(doc: &LabelDocument, head_dpi: u16, feed_dpi: u16) -> LabelBitmap {
+    RENDERER.with(|renderer| {
+        let output = ptouch_render::document::render_document_at_resolution(
+            doc,
+            76 * u32::from(head_dpi / 180),
+            ptouch_core::PrintResolution { head_dpi, feed_dpi },
+            &mut renderer.borrow_mut(),
+        )
+        .unwrap();
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        output.bitmap.unwrap()
+    })
+}
+
+#[test]
+fn alpha_coverage_layers_and_mirroring_agree_at_every_print_quality() {
+    for design_dpi in [180, 360] {
+        for (head_dpi, feed_dpi) in OUTPUT_RESOLUTIONS {
+            let mut png = alpha_scene(png_icon());
+            let mut svg = alpha_scene(svg_icon());
+            png.dpi = design_dpi;
+            svg.dpi = design_dpi;
+            let baseline = render_resolution(&png, head_dpi, feed_dpi);
+            for (x, ink) in [(23, false), (31, true), (39, true)] {
+                assert_eq!(
+                    baseline.get_pixel(
+                        x * u32::from(feed_dpi / 180),
+                        25 * u32::from(head_dpi / 180)
+                    ),
+                    ink
+                );
+            }
+            for rotation in [0.0, 90.0, 37.0] {
+                for (flip_h, flip_v) in [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    for doc in [&mut png, &mut svg] {
+                        let icon = doc.elements[2].as_object_mut().unwrap();
+                        icon.rotation = rotation;
+                        icon.flip_h = flip_h;
+                        icon.flip_v = flip_v;
+                    }
+                    let before = png.to_toml_string().unwrap();
+                    let bitmap = render_resolution(&png, head_dpi, feed_dpi);
+                    assert_eq!(
+                        bitmap,
+                        render_resolution(&svg, head_dpi, feed_dpi),
+                        "PNG/SVG at {head_dpi}x{feed_dpi}, {rotation}, {flip_h}/{flip_v}"
+                    );
+                    assert_eq!(
+                        png.to_toml_string().unwrap(),
+                        before,
+                        "rendering must not mutate its document"
+                    );
+                    let reopened = LabelDocument::from_toml_str(&before).unwrap();
+                    assert_eq!(bitmap, render_resolution(&reopened, head_dpi, feed_dpi));
+                    let mut mirrored = png.clone();
+                    mirrored.flip_h = true;
+                    mirrored.flip_v = true;
+                    assert_eq!(
+                        bitmap.mirrored(true, true),
+                        render_resolution(&mirrored, head_dpi, feed_dpi)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn attached_shapes_and_explicit_sequences_keep_physical_positions_at_every_quality() {
+    for design_dpi in [180, 360] {
+        let (mut doc, host_id, child_id, _) = flow_scene(true);
+        doc.dpi = design_dpi;
+        let child = doc.elements[1].as_object_mut().unwrap();
+        child.content = ObjectContent::Shape {
+            style: ShapeStyle {
+                fill: ShapeFill::Paper,
+                stroke_width_mm: 0.0,
+                ..Default::default()
+            },
+        };
+        let world = scene::world_frames(&doc.elements).unwrap();
+        let child = doc.elements.remove(1);
+        doc.elements.insert(0, child);
+        let encoded = doc.to_toml_string().unwrap();
+        let reopened = LabelDocument::from_toml_str(&encoded).unwrap();
+        for (head_dpi, feed_dpi) in OUTPUT_RESOLUTIONS {
+            RENDERER.with(|renderer| {
+                let rendered = ptouch_render::document::render_document_at_resolution(
+                    &doc,
+                    76 * u32::from(head_dpi / 180),
+                    ptouch_core::PrintResolution { head_dpi, feed_dpi },
+                    &mut renderer.borrow_mut(),
+                )
+                .unwrap();
+                for object_id in [host_id, child_id] {
+                    let index = by_id(&doc, object_id);
+                    let original_index = if object_id == host_id { 0 } else { 1 };
+                    let bound = rendered
+                        .bounds
+                        .iter()
+                        .find(|bound| bound.element_index == index)
+                        .unwrap();
+                    assert_eq!(
+                        bound.x,
+                        (world[original_index].x_mm * f64::from(feed_dpi) / 25.4).round() as u32
+                    );
+                    assert_eq!(
+                        bound.y,
+                        (world[original_index].y_mm * f64::from(head_dpi) / 25.4).round() as u32
+                    );
+                }
+            });
+            assert_eq!(
+                render_resolution(&doc, head_dpi, feed_dpi),
+                render_resolution(&reopened, head_dpi, feed_dpi)
+            );
+        }
+    }
+}
+
+#[test]
+fn positive_rotated_lines_and_paper_masks_survive_rectangular_sampling() {
+    for (head_dpi, feed_dpi) in OUTPUT_RESOLUTIONS {
+        for angle in [0.0, 17.0, 45.0, 90.0] {
+            let mut tiny = shape(20.0, 20.0, 30.0, 30.0, ShapeFill::Paper);
+            let object = tiny.as_object_mut().unwrap();
+            object.rotation = angle;
+            let content = object.content_box.as_mut().unwrap();
+            content.width_mm = mm(1.0);
+            content.height_mm = mm(1.0);
+            let doc = document(vec![
+                shape(0.0, 0.0, 100.0, 60.0, ShapeFill::Ink),
+                tiny.clone(),
+            ]);
+            let bitmap = render_resolution(&doc, head_dpi, feed_dpi);
+            let sx = u32::from(feed_dpi / 180);
+            let sy = u32::from(head_dpi / 180);
+            assert!(
+                (20 * sy..50 * sy).any(|y| (20 * sx..50 * sx).any(|x| !bitmap.get_pixel(x, y))),
+                "paper mask at {head_dpi}x{feed_dpi}, {angle}"
+            );
+            tiny.as_object_mut().unwrap().content = ObjectContent::Line {
+                pattern: Default::default(),
+            };
+            let bitmap = render_resolution(&document(vec![tiny]), head_dpi, feed_dpi);
+            assert!(
+                bitmap.data().iter().any(|byte| *byte != 0),
+                "line at {head_dpi}x{feed_dpi}, {angle}"
+            );
+        }
+    }
+}

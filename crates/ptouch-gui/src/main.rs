@@ -12,12 +12,16 @@
 
 mod alignment;
 mod app;
-mod history;
+mod calibration_ui;
+mod editor;
 mod panels;
+mod preview;
 mod printer_worker;
+mod profile_ui;
 mod rich_text_editor;
 mod scene_edit;
 mod state;
+mod symbols;
 mod widgets;
 
 /// Decode the embedded application icon for the running window.
@@ -56,9 +60,33 @@ fn main() -> eframe::Result<()> {
         std::process::exit(exit_code);
     }
     env_logger::init();
-    let smoke_test = std::env::args().any(|arg| arg == "--smoke-test");
-    // Offline mode leaves USB and Bluetooth untouched while editing/exporting.
-    let offline = std::env::args().any(|arg| arg == "--offline");
+    let mut smoke_test = false;
+    let mut offline = false;
+    let mut profiles_dir = ptouch_profiles::default_directory();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--smoke-test" => smoke_test = true,
+            "--offline" => offline = true,
+            "--profiles-dir" => {
+                profiles_dir = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        eprintln!("--profiles-dir requires a directory");
+                        std::process::exit(1)
+                    })
+            }
+            "--help" | "-h" => {
+                println!("ptouch-gui [--profiles-dir DIRECTORY] [--offline] [--smoke-test]");
+                return Ok(());
+            }
+            _ => {
+                eprintln!("Unknown option: {arg}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // `with_app_id` sets the Wayland app_id / X11 WM_CLASS so the desktop entry
     // (StartupWMClass) associates its icon with the window.
@@ -78,6 +106,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "P-Touch Label Printer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::PtouchApp::new(cc, smoke_test, offline)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::PtouchApp::new(
+                cc,
+                smoke_test,
+                offline,
+                profiles_dir,
+            )))
+        }),
     )
 }

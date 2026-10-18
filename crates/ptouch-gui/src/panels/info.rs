@@ -15,7 +15,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             for tip in [
-                "Select an object on the canvas or in Elements.",
+                "Select an object on the canvas or in Objects.",
                 "Drag to move; use the square handle to scale and the round handle to rotate.",
                 "Free positioning keeps other objects in place. In sequence, allocation width and gaps place the following objects.",
                 "Adjust layout changes the allocation. Gap before is empty space outside it. Align within allocation positions the content inside it.",

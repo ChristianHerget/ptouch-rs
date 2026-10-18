@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bitmap::LabelBitmap;
 use crate::document::{
-    DOCUMENT_VERSION, LabelDocument, LabelElement, LabelObject, ObjectContent, render_elements,
+    DOCUMENT_VERSION, LabelDocument, LabelElement, LabelObject, ObjectContent,
+    render_elements_with_layout_at_resolution,
 };
 use crate::image_loader::{self, ImageLoadOptions};
 use crate::surface::RasterLayer;
@@ -125,6 +126,119 @@ pub struct RenderedLabel {
     pub diagnostics: Vec<String>,
 }
 
+impl RenderedLabel {
+    /// Reflect pixels and all selection geometry together, exactly once.
+    pub fn mirrored(mut self, horizontal: bool, vertical: bool) -> Self {
+        if let Some(bitmap) = &self.bitmap {
+            let width = bitmap.width();
+            let height = bitmap.height();
+            for rect in &mut self.bounds {
+                if horizontal {
+                    rect.x = width - rect.x - rect.width;
+                }
+                if vertical {
+                    rect.y = height - rect.y - rect.height;
+                }
+            }
+            for geometry in &mut self.content_bounds {
+                for point in &mut geometry.corners {
+                    if horizontal {
+                        point[0] = width as f32 - point[0];
+                    }
+                    if vertical {
+                        point[1] = height as f32 - point[1];
+                    }
+                }
+            }
+            self.bitmap = Some(bitmap.mirrored(horizontal, vertical));
+        }
+        self
+    }
+}
+
+/// Render a document in printer dots. Physical X uses feed DPI and Y uses head
+/// DPI. Rotations happen in square source pixels before sampling to actual dots.
+pub fn render_document_at_resolution(
+    doc: &LabelDocument,
+    tape_width_px: u32,
+    resolution: ptouch_core::PrintResolution,
+    renderer: &mut TextRenderer,
+) -> Result<RenderedLabel> {
+    use ptouch_core::PrintResolution;
+    let PrintResolution { head_dpi, feed_dpi } = resolution;
+    if head_dpi == 0
+        || feed_dpi == 0
+        || !(head_dpi == feed_dpi
+            || u32::from(head_dpi) * 2 == u32::from(feed_dpi)
+            || u32::from(feed_dpi) * 2 == u32::from(head_dpi))
+    {
+        return Err(RenderError::Layout(
+            "unsupported head/feed resolution".into(),
+        ));
+    }
+    if head_dpi == feed_dpi {
+        return render_document(doc, tape_width_px, head_dpi, renderer);
+    }
+    if doc.version == 0
+        || doc.version > DOCUMENT_VERSION
+        || doc.dpi == 0
+        || tape_width_px == 0
+        || tape_width_px > 4096
+    {
+        return Err(RenderError::Layout(
+            "invalid document version, DPI or printable height".into(),
+        ));
+    }
+    // Preserve legacy global draft sampling (including odd element boundaries).
+    if doc.elements.iter().all(|element| {
+        matches!(
+            element,
+            LabelElement::Text { text_box: None, .. }
+                | LabelElement::Image { .. }
+                | LabelElement::CutMark
+                | LabelElement::Padding { .. }
+        )
+    }) {
+        let rendered = render_elements_with_layout_at_resolution(
+            &doc.elements,
+            tape_width_px,
+            &doc.font_name,
+            doc.font_margin,
+            renderer,
+            resolution,
+        )?;
+        return Ok(match rendered {
+            Some(rendered) => RenderedLabel {
+                bounds: rendered
+                    .element_spans
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(element_index, span)| {
+                        span.as_ref().map(|span| ElementBounds {
+                            element_index,
+                            x: span.start,
+                            y: 0,
+                            width: span.end - span.start,
+                            height: tape_width_px,
+                        })
+                    })
+                    .collect(),
+                bitmap: Some(rendered.bitmap),
+                content_bounds: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+            .mirrored(doc.flip_h, doc.flip_v),
+            None => RenderedLabel {
+                bitmap: None,
+                bounds: Vec::new(),
+                content_bounds: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        });
+    }
+    render_document_impl(doc, tape_width_px, resolution, renderer)
+}
+
 const MAX_LAYOUT_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_LENGTH_PX: u32 = 1_000_000;
 
@@ -181,12 +295,28 @@ fn boundary(mm: f64, dpi: u16) -> Result<u32> {
 ///
 /// Box starts and ends are rounded from absolute millimeter boundaries, avoiding
 /// cumulative per-port rounding. Each element updates the flow cursor to its
-/// own right edge, even after an absolute move backwards. Overlaps combine
-/// black pixels. Legacy dimensions and unboxed font sizes remain raster pixels.
+/// own right edge, even after an absolute move backwards. Explicit sequence
+/// links and attachments keep independent placement. Scene layers can cover
+/// earlier ink with paper; legacy white stays transparent. Unboxed dimensions
+/// and font sizes retain their historical raster-pixel interpretation.
 pub fn render_document(
     doc: &LabelDocument,
     tape_width_px: u32,
     target_dpi: u16,
+    renderer: &mut TextRenderer,
+) -> Result<RenderedLabel> {
+    render_document_impl(
+        doc,
+        tape_width_px,
+        ptouch_core::PrintResolution::square(target_dpi),
+        renderer,
+    )
+}
+
+fn render_document_impl(
+    doc: &LabelDocument,
+    tape_width_px: u32,
+    resolution: ptouch_core::PrintResolution,
     renderer: &mut TextRenderer,
 ) -> Result<RenderedLabel> {
     for object in doc.elements.iter().filter_map(LabelElement::as_object) {
@@ -208,6 +338,7 @@ pub fn render_document(
     } else {
         doc
     };
+    let target_dpi = resolution.head_dpi.max(resolution.feed_dpi);
     if doc.version == 0 || doc.version > DOCUMENT_VERSION {
         return Err(RenderError::Layout(format!(
             "unsupported layout version {}",
@@ -219,6 +350,20 @@ pub fn render_document(
             "DPI and printable height must be positive; height must not exceed 4096 pixels".into(),
         ));
     }
+    let source_scale = u32::from(target_dpi / resolution.head_dpi);
+    let source_height = tape_width_px
+        .checked_mul(source_scale)
+        .ok_or_else(|| RenderError::Layout("printable height overflow".into()))?;
+    let source_doc = if source_scale > 1 && doc.font_margin > 0 {
+        let mut source = doc.clone();
+        source.font_margin = source
+            .font_margin
+            .checked_mul(source_scale)
+            .ok_or_else(|| RenderError::Layout("font margin overflow".into()))?;
+        Cow::Owned(source)
+    } else {
+        Cow::Borrowed(doc)
+    };
     let mut cursor_mm = 0.0;
     let mut sequence_cursor = crate::sequence::LayoutCursor::default();
     let mut segments = Vec::new();
@@ -318,11 +463,11 @@ pub fn render_document(
                 right = right.max(x.saturating_add(1));
                 bottom = bottom.max(y.saturating_add(1));
             }
-            if right <= x || bottom <= y || bottom > tape_width_px {
+            if right <= x || bottom <= y || bottom > source_height {
                 return Err(RenderError::Layout(format!(
                     "element {}: box must be at least one output pixel in each dimension and fit inside the printable height ({:.3} mm)",
                     index + 1,
-                    f64::from(tape_width_px) / ppm
+                    f64::from(source_height) / ppm
                 )));
             }
             check_size(right, tape_width_px)?;
@@ -334,7 +479,7 @@ pub fn render_document(
             ];
             let (segment, clipped, mut geometry, mut left, mut top) = match element {
                 LabelElement::Object(object) if object.content_box.is_some() => {
-                    render_independent(object, doc, slot_center, target_dpi, renderer)?
+                    render_independent(object, &source_doc, slot_center, target_dpi, renderer)?
                 }
                 _ => {
                     let (segment, clipped, local) = match element {
@@ -355,7 +500,7 @@ pub fn render_document(
                             width,
                             height,
                             &doc.font_name,
-                            doc.font_margin,
+                            source_doc.font_margin,
                             target_dpi,
                         )
                         .map(|(ink, clipped, local)| {
@@ -363,7 +508,7 @@ pub fn render_document(
                         })?,
                         LabelElement::Object(object) => render_object(
                             object,
-                            doc,
+                            &source_doc,
                             width,
                             height,
                             target_dpi,
@@ -398,24 +543,96 @@ pub fn render_document(
                     point[1] = (mirror_center[1] * 2.0) as f32 - point[1];
                 }
             }
-            if left < 0 || top < 0 || top + i64::from(segment.height()) > i64::from(tape_width_px) {
+            if left < 0 || top < 0 || top + i64::from(segment.height()) > i64::from(source_height) {
                 diagnostics.push(format!(
                     "Element {}: content extends outside the printable area and is clipped",
                     index + 1
                 ));
             }
+            let output_x = boundary(x_mm, resolution.feed_dpi)?;
+            let output_y = boundary(frame.y_mm, resolution.head_dpi)?;
+            let mut output_right = boundary(right_mm, resolution.feed_dpi)?;
+            let mut output_bottom = boundary(frame.y_mm + frame.height_mm, resolution.head_dpi)?;
+            if matches!(
+                element.as_object().map(|o| &o.content),
+                Some(ObjectContent::Line { .. })
+            ) {
+                output_right = output_right.max(output_x.saturating_add(1));
+                output_bottom = output_bottom.max(output_y.saturating_add(1));
+            }
+            if output_right <= output_x || output_bottom <= output_y {
+                return Err(RenderError::Layout(
+                    "box must occupy at least one output dot".into(),
+                ));
+            }
+            let sx = f64::from(resolution.feed_dpi) / f64::from(target_dpi);
+            let sy = f64::from(resolution.head_dpi) / f64::from(target_dpi);
+            for point in &mut geometry.corners {
+                point[0] *= sx as f32;
+                point[1] *= sy as f32;
+            }
+            let segment = segment.mirrored(flip_h, flip_v);
+            let had_ink = segment.ink.data().iter().any(|byte| *byte != 0);
+            let had_coverage = segment
+                .coverage
+                .as_ref()
+                .is_some_and(|mask| mask.data().iter().any(|byte| *byte != 0));
+            let mut segment = if resolution.head_dpi < target_dpi {
+                RasterLayer {
+                    ink: segment.ink.halve_height(),
+                    coverage: segment.coverage.map(|mask| mask.halve_height()),
+                }
+            } else if resolution.feed_dpi < target_dpi {
+                RasterLayer {
+                    ink: segment.ink.halve_feed(),
+                    coverage: segment.coverage.map(|mask| mask.halve_feed()),
+                }
+            } else {
+                segment
+            };
+            if had_ink && !segment.ink.data().iter().any(|byte| *byte != 0) {
+                if matches!(
+                    element,
+                    LabelElement::Object(LabelObject {
+                        content: ObjectContent::CutMark
+                            | ObjectContent::Line { .. }
+                            | ObjectContent::Shape { .. },
+                        ..
+                    })
+                ) && segment.width() > 0
+                    && segment.height() > 0
+                {
+                    let (x, y) = (segment.width() / 2, segment.height() / 2);
+                    segment.ink.set_pixel(x, y, true);
+                    if let Some(mask) = &mut segment.coverage {
+                        mask.set_pixel(x, y, true);
+                    }
+                } else {
+                    return Err(RenderError::Layout("content has no visible pixels at the selected print resolution; enlarge its box".into()));
+                }
+            }
+            if had_coverage
+                && let Some(mask) = &mut segment.coverage
+                && !mask.data().iter().any(|byte| *byte != 0)
+                && mask.width() > 0
+                && mask.height() > 0
+            {
+                mask.set_pixel(mask.width() / 2, mask.height() / 2, true);
+            }
+            let left = (left as f64 * sx).round() as i64;
+            let top = (top as f64 * sy).round() as i64;
             content_bounds.push(geometry);
             if !attached {
                 cursor_mm = right_mm;
             }
             (
-                segment.mirrored(flip_h, flip_v),
+                segment,
                 ElementBounds {
                     element_index: index,
-                    x,
-                    y,
-                    width,
-                    height,
+                    x: output_x,
+                    y: output_y,
+                    width: output_right - output_x,
+                    height: output_bottom - output_y,
                 },
                 left,
                 top,
@@ -424,24 +641,25 @@ pub fn render_document(
             if let LabelElement::Padding { pixels } = element {
                 check_size(*pixels, tape_width_px)?;
             }
-            let Some(segment) = render_elements(
+            let Some(segment) = crate::document::render_elements_at_resolution(
                 std::slice::from_ref(element),
                 tape_width_px,
                 &doc.font_name,
                 doc.font_margin,
                 renderer,
+                resolution,
             )?
             else {
                 continue;
             };
-            let x = boundary(cursor_mm, target_dpi)?;
+            let x = boundary(cursor_mm, resolution.feed_dpi)?;
             let width = segment.width();
             let right = x
                 .checked_add(width)
                 .ok_or_else(|| RenderError::Layout("layout width overflow".into()))?;
             check_size(right, tape_width_px)?;
             // Preserve the historical arithmetic order at half-pixel edges.
-            cursor_mm += f64::from(width) * 25.4 / f64::from(target_dpi);
+            cursor_mm += f64::from(width) * 25.4 / f64::from(resolution.feed_dpi);
             (
                 RasterLayer::from_ink(segment),
                 ElementBounds {
@@ -502,30 +720,13 @@ pub fn render_document(
     for (_, segment, left, top) in &segments {
         segment.paint(&mut bitmap, *left, *top);
     }
-    for rect in &mut bounds {
-        if doc.flip_h {
-            rect.x = total_width - rect.x - rect.width;
-        }
-        if doc.flip_v {
-            rect.y = tape_width_px - rect.y - rect.height;
-        }
-    }
-    for geometry in &mut content_bounds {
-        for point in &mut geometry.corners {
-            if doc.flip_h {
-                point[0] = total_width as f32 - point[0];
-            }
-            if doc.flip_v {
-                point[1] = tape_width_px as f32 - point[1];
-            }
-        }
-    }
     Ok(RenderedLabel {
-        bitmap: Some(bitmap.mirrored(doc.flip_h, doc.flip_v)),
+        bitmap: Some(bitmap),
         bounds,
         content_bounds,
         diagnostics,
-    })
+    }
+    .mirrored(doc.flip_h, doc.flip_v))
 }
 
 /// Convert an existing layout explicitly, freezing the occupied geometry at
@@ -982,12 +1183,15 @@ fn render_object_content(
             preserve_alpha: true,
             ..
         } => {
-            let decoded = if bitmap.is_some() && coverage.is_some() {
+            let decoded = if image_data.is_empty() && bitmap.is_some() && coverage.is_some() {
                 None
             } else {
                 Some(image_loader::load_layer_from_reader(
                     Cursor::new(image_data),
-                    &ImageLoadOptions::default(),
+                    &ImageLoadOptions {
+                        target_height: Some(height),
+                        ..Default::default()
+                    },
                 )?)
             };
             let ink = decoded
@@ -1013,13 +1217,20 @@ fn render_object_content(
         ObjectContent::Image {
             image_data, bitmap, ..
         } => {
-            let source = match bitmap {
-                Some(bitmap) => Cow::Borrowed(bitmap),
-                None if !image_data.is_empty() => Cow::Owned(image_loader::load_image_from_reader(
+            // Source bytes retain vector and raster detail at the requested
+            // content size; the eager cache can be much smaller than this box.
+            let source = if !image_data.is_empty() {
+                Cow::Owned(image_loader::load_image_from_reader(
                     Cursor::new(image_data),
-                    &ImageLoadOptions::default(),
-                )?),
-                None => return Err(RenderError::Layout("image object has no image data".into())),
+                    &ImageLoadOptions {
+                        target_height: Some(height),
+                        ..Default::default()
+                    },
+                )?)
+            } else if let Some(bitmap) = bitmap {
+                Cow::Borrowed(bitmap)
+            } else {
+                return Err(RenderError::Layout("image object has no image data".into()));
             };
             let (bitmap, geometry) = render_contained(
                 &source,
@@ -1383,6 +1594,7 @@ fn render_box(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::render_elements;
     use std::collections::BTreeMap;
 
     fn element(content: &str, frame: TextBox) -> LabelElement {
@@ -2891,6 +3103,308 @@ mod tests {
         doc.elements[0].as_object_mut().unwrap().content = image_content(solid_bitmap(1, 1));
         assert!(render_document(&doc, 76, 180, &mut TextRenderer::with_test_font()).is_err());
     }
+    #[test]
+    fn physical_slots_use_each_output_axis_without_pitch_drift() {
+        use ptouch_core::PrintResolution;
+        let frames: Vec<_> = (0..30)
+            .map(|index| {
+                let frame = TextBox {
+                    x_mm: 2.13 + f64::from(index) * 10.37,
+                    y_mm: 0.73,
+                    width_mm: 8.19,
+                    height_mm: 3.01,
+                    ..TextBox::default()
+                };
+                independent_object(
+                    ObjectContent::Text {
+                        content: String::new(),
+                        font_size: None,
+                        align: TextAlign::Left,
+                        line_spacing: crate::text::DEFAULT_LINE_SPACING,
+                        styles: Vec::new(),
+                    },
+                    frame,
+                    8.19,
+                    3.01,
+                )
+            })
+            .collect();
+        let mut doc = document(frames);
+        doc.version = 4;
+        let mut renderer = TextRenderer::with_test_font();
+        for (head_dpi, feed_dpi) in [(180, 180), (180, 360), (360, 360), (360, 720), (360, 180)] {
+            let resolution = PrintResolution { head_dpi, feed_dpi };
+            let height = if head_dpi == 180 { 76 } else { 150 };
+            let rendered =
+                render_document_at_resolution(&doc, height, resolution, &mut renderer).unwrap();
+            assert_eq!(rendered.bitmap.as_ref().unwrap().height(), height);
+            for (index, bound) in rendered.bounds.iter().enumerate() {
+                let frame = &doc.elements[index].as_object().unwrap().frame;
+                assert_eq!(bound.x, boundary(frame.x_mm, feed_dpi).unwrap());
+                assert_eq!(
+                    bound.x + bound.width,
+                    boundary(frame.x_mm + frame.width_mm, feed_dpi).unwrap()
+                );
+                assert_eq!(bound.y, boundary(frame.y_mm, head_dpi).unwrap());
+                assert_eq!(
+                    bound.y + bound.height,
+                    boundary(frame.y_mm + frame.height_mm, head_dpi).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_square_object_rotations_and_mirrors_keep_physical_geometry() {
+        use ptouch_core::PrintResolution;
+        let mut object = independent_object(
+            image_content(solid_bitmap(30, 16)),
+            TextBox {
+                x_mm: 6.0,
+                y_mm: 2.0,
+                width_mm: 8.0,
+                height_mm: 4.0,
+                ..TextBox::default()
+            },
+            6.0,
+            2.0,
+        );
+        object.as_object_mut().unwrap().rotation = 37.0;
+        let mut doc = document(vec![object]);
+        doc.version = 4;
+        let mut renderer = TextRenderer::with_test_font();
+        for (head_dpi, feed_dpi) in [(180, 180), (180, 360), (360, 360), (360, 720), (360, 180)] {
+            let resolution = PrintResolution { head_dpi, feed_dpi };
+            let height = if head_dpi == 180 { 76 } else { 150 };
+            let normal =
+                render_document_at_resolution(&doc, height, resolution, &mut renderer).unwrap();
+            let corners = normal.content_bounds[0].corners;
+            let physical = corners.map(|p| {
+                [
+                    p[0] * 25.4 / f32::from(feed_dpi),
+                    p[1] * 25.4 / f32::from(head_dpi),
+                ]
+            });
+            let distance = |a: usize, b: usize| {
+                ((physical[a][0] - physical[b][0]).powi(2)
+                    + (physical[a][1] - physical[b][1]).powi(2))
+                .sqrt()
+            };
+            assert!((distance(0, 1) - 6.0).abs() < 0.16);
+            assert!((distance(1, 2) - 2.0).abs() < 0.16);
+            for (horizontal, vertical) in [(true, false), (false, true), (true, true)] {
+                let mut flipped = doc.clone();
+                flipped.flip_h = horizontal;
+                flipped.flip_v = vertical;
+                let mirrored =
+                    render_document_at_resolution(&flipped, height, resolution, &mut renderer)
+                        .unwrap();
+                let expected = normal
+                    .bitmap
+                    .as_ref()
+                    .unwrap()
+                    .mirrored(horizontal, vertical);
+                assert_eq!(mirrored.bitmap.as_ref().unwrap().data(), expected.data());
+                let expected = ContentGeometry {
+                    element_index: 0,
+                    corners: corners.map(|p| {
+                        [
+                            if horizontal {
+                                expected.width() as f32 - p[0]
+                            } else {
+                                p[0]
+                            },
+                            if vertical {
+                                expected.height() as f32 - p[1]
+                            } else {
+                                p[1]
+                            },
+                        ]
+                    }),
+                    edit_box: normal.content_bounds[0].edit_box.clone(),
+                };
+                assert_eq!(mirrored.content_bounds[0], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn document_resolution_preserves_legacy_sampling_and_rejects_invalid_modes() {
+        use ptouch_core::PrintResolution;
+        let mut doc = document(vec![
+            LabelElement::Padding { pixels: 7 },
+            LabelElement::CutMark,
+            LabelElement::Padding { pixels: 5 },
+        ]);
+        doc.version = 1;
+        doc.flip_h = true;
+        let mut renderer = TextRenderer::with_test_font();
+        for feed_dpi in [180, 360, 720] {
+            let resolution = PrintResolution {
+                head_dpi: 360,
+                feed_dpi,
+            };
+            let expected = crate::document::render_elements_at_resolution(
+                &doc.elements,
+                150,
+                &doc.font_name,
+                doc.font_margin,
+                &mut renderer,
+                resolution,
+            )
+            .unwrap()
+            .unwrap()
+            .mirrored(true, false);
+            let actual = render_document_at_resolution(&doc, 150, resolution, &mut renderer)
+                .unwrap()
+                .bitmap
+                .unwrap();
+            assert_eq!(actual.data(), expected.data());
+        }
+        for (head_dpi, feed_dpi) in [(0, 0), (180, 0), (180, 270)] {
+            assert!(
+                render_document_at_resolution(
+                    &doc,
+                    76,
+                    PrintResolution { head_dpi, feed_dpi },
+                    &mut renderer
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn v7_template_reflow_uses_design_dpi_at_every_output_resolution() {
+        use crate::document::ContentBox;
+        use crate::object_layout::{LayoutOptions, Placement, WidthSizing};
+        use ptouch_core::PrintResolution;
+        for design_dpi in [180, 360] {
+            let mut first = LabelObject::text(
+                "{{port}}",
+                TextBox {
+                    x_mm: 5.0,
+                    height_mm: 6.0,
+                    ..Default::default()
+                },
+            );
+            first.content_box = Some(ContentBox {
+                width_mm: 10.0,
+                height_mm: 4.0,
+                offset_x_mm: 0.0,
+                offset_y_mm: 0.0,
+            });
+            first.layout = Some(LayoutOptions {
+                placement: Placement::Flow,
+                width: WidthSizing::Content,
+                constrain: true,
+                padding_mm: 0.0,
+            });
+            let mut second = first.clone();
+            second.content = LabelObject::text("LAN", TextBox::default()).content;
+            second.frame.position = PositionMode::Relative;
+            second.frame.gap_mm = 2.5;
+            second.frame.width_mm = 12.0;
+            second.layout.as_mut().unwrap().width = WidthSizing::Fixed;
+            let mut base = document(vec![
+                LabelElement::Object(first),
+                LabelElement::Object(second),
+            ]);
+            base.version = 7;
+            base.dpi = design_dpi;
+            let mut starts = Vec::new();
+            let mut renderer = TextRenderer::with_test_font();
+            for value in ["A", "PORT 012345"] {
+                let mut doc = base.clone();
+                doc.apply_values(&std::collections::BTreeMap::from([(
+                    "port".into(),
+                    value.into(),
+                )]));
+                let original = doc.clone();
+                let mut resolved = doc.clone();
+                crate::object_layout::resolve(&mut resolved, &mut renderer).unwrap();
+                let right = 5.0 + resolved.elements[0].as_object().unwrap().frame.width_mm;
+                starts.push(right + 2.5);
+                for (head_dpi, feed_dpi) in
+                    [(180, 180), (180, 360), (360, 180), (360, 360), (360, 720)]
+                {
+                    let height = if head_dpi == 180 { 76 } else { 150 };
+                    let resolution = PrintResolution { head_dpi, feed_dpi };
+                    let actual =
+                        render_document_at_resolution(&doc, height, resolution, &mut renderer)
+                            .unwrap();
+                    let expected =
+                        render_document_at_resolution(&resolved, height, resolution, &mut renderer)
+                            .unwrap();
+                    assert_eq!(actual.bitmap, expected.bitmap);
+                    assert_eq!(actual.bounds, expected.bounds);
+                    assert_eq!(actual.bounds[1].x, boundary(right + 2.5, feed_dpi).unwrap());
+                    assert_eq!(
+                        actual.bounds[1].width,
+                        boundary(right + 14.5, feed_dpi).unwrap() - actual.bounds[1].x
+                    );
+                    assert_eq!(doc, original);
+                }
+            }
+            assert!(starts[1] > starts[0]);
+        }
+    }
+
+    #[test]
+    fn physical_svg_objects_render_source_detail_at_high_resolution() {
+        use ptouch_core::PrintResolution;
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><path d="M1 3L7 1" stroke="black" stroke-width="0.15"/></svg>"#;
+        let frame = TextBox {
+            width_mm: 12.0,
+            height_mm: 6.0,
+            ..TextBox::default()
+        };
+        let mut object = LabelObject::image_from_bytes(None, bytes.to_vec(), frame);
+        object.content_box = Some(ContentBox {
+            width_mm: 12.0,
+            height_mm: 6.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        let mut doc = document(vec![LabelElement::Object(object)]);
+        doc.version = 4;
+        let mut renderer = TextRenderer::with_test_font();
+        let high = render_document_at_resolution(
+            &doc,
+            76,
+            PrintResolution {
+                head_dpi: 180,
+                feed_dpi: 360,
+            },
+            &mut renderer,
+        )
+        .unwrap()
+        .bitmap
+        .unwrap();
+        assert!(high.data().iter().any(|byte| *byte != 0));
+        assert!((0..high.height()).any(|y| {
+            (0..high.width() / 2).any(|x| high.get_pixel(x * 2, y) != high.get_pixel(x * 2 + 1, y))
+        }));
+        // The decoded cache is not the source of print geometry or detail.
+        if let ObjectContent::Image { bitmap, .. } =
+            &mut doc.elements[0].as_object_mut().unwrap().content
+        {
+            *bitmap = None;
+        }
+        let reloaded = render_document_at_resolution(
+            &doc,
+            76,
+            PrintResolution {
+                head_dpi: 180,
+                feed_dpi: 360,
+            },
+            &mut renderer,
+        )
+        .unwrap()
+        .bitmap
+        .unwrap();
+        assert_eq!(high.data(), reloaded.data());
+    }
+
     #[test]
     fn rich_auto_fit_is_invariant_to_uniform_nominal_point_sizes() {
         use crate::styled_text::{StyleSpan, TextStyle};

@@ -9,8 +9,13 @@
 //! transmission.
 
 mod model;
+pub mod network;
+pub mod network_host;
 mod p300bt;
+pub mod printer_model;
+pub mod quality;
 mod session;
+mod snmp;
 
 /// Native macOS Bluetooth support, enabled with the `bluetooth` feature.
 #[cfg(all(feature = "bluetooth", target_os = "macos"))]
@@ -24,6 +29,7 @@ pub mod protocol;
 pub mod status;
 pub mod tape;
 pub mod transport;
+pub mod usb_profiles;
 
 // Re-export commonly used types at the crate root.
 #[cfg(all(feature = "bluetooth", target_os = "macos"))]
@@ -32,6 +38,7 @@ pub use control::CancellationToken;
 pub use device::{DeviceFlags, DeviceInfo};
 pub use error::{PtouchError, Result};
 pub use protocol::PrintQuality;
+pub use quality::PrintResolution;
 pub use status::PrinterStatus;
 pub use tape::TapeInfo;
 pub use transport::PtouchDevice;

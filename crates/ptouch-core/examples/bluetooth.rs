@@ -57,7 +57,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         if args[0] == "print" {
             let lines: Vec<Vec<u8>> = raster().into_iter().map(|line| line.to_vec()).collect();
-            printer.print_raster(&lines)?;
+            printer.print_raster(&lines, ptouch_core::PrintResolution::square(180))?;
             println!("Printer confirmed completion: {:?}", printer.status());
         }
         printer.close()?;

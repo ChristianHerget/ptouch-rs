@@ -54,7 +54,9 @@ pub fn show_layers(ui: &mut egui::Ui, state: &mut AppState) {
                 "{name}\nLayout element {}. Stacking changes keep X/Y and sequence order.",
                 index + 1
             ));
+        state.editor.surface(&response);
         if response.clicked() || response.drag_started() {
+            response.request_focus();
             selection = Some(index);
         }
         if !can_arrange {
@@ -263,17 +265,18 @@ pub fn show_attachment(ui: &mut egui::Ui, state: &mut AppState) -> bool {
                             ("Offset Y", &mut anchor.offset_y_mm),
                         ] {
                             ui.label(label);
-                            changed |= ui
-                                .add(
-                                    crate::widgets::decimal_drag(value)
-                                        .speed(0.1)
-                                        .clamp_existing_to_range(false)
-                                        .range(-10_000.0..=10_000.0)
-                                        .min_decimals(2)
-                                        .max_decimals(3)
-                                        .suffix(" mm"),
-                                )
-                                .changed();
+                            changed |= crate::editor::content_input(
+                                ui,
+                                &mut state.editor,
+                                crate::widgets::decimal_drag(value)
+                                    .speed(0.1)
+                                    .clamp_existing_to_range(false)
+                                    .range(-10_000.0..=10_000.0)
+                                    .min_decimals(2)
+                                    .max_decimals(3)
+                                    .suffix(" mm"),
+                            )
+                            .changed();
                             ui.end_row();
                         }
                     });

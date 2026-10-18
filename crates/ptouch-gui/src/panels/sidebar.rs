@@ -5,14 +5,13 @@
 
 use log::info;
 
-use ptouch_core::protocol::PrintQuality;
 use ptouch_core::tape;
 
 use crate::state::{AppState, CanvasEditTarget, CanvasTarget, PrinterCommand};
 
 /// Render the left sidebar.
 pub fn show_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    let mut scroll = egui::ScrollArea::vertical().show(ui, |ui| {
         show_printer_section(ui, state);
         ui.separator();
         show_tape_section(ui, state);
@@ -22,7 +21,23 @@ pub fn show_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
         show_mirror_section(ui, state);
         ui.separator();
         show_elements_section(ui, state);
+        ui.add_space(6.0);
+        super::toolbar::show_add_controls(ui, state);
     });
+    if state.element_drag(ui.ctx()).is_some()
+        && let Some(pointer) = ui.ctx().pointer_interact_pos()
+        && scroll.inner_rect.contains(pointer)
+    {
+        let delta = crate::preview::edge_pan(pointer, scroll.inner_rect, ui.input(|i| i.stable_dt));
+        if delta.y != 0.0 {
+            scroll.state.offset.y = (scroll.state.offset.y - delta.y).clamp(
+                0.0,
+                (scroll.content_size.y - scroll.inner_rect.height()).max(0.0),
+            );
+            scroll.state.store(ui.ctx(), scroll.id);
+            ui.ctx().request_repaint();
+        }
+    }
 }
 
 /// Printer connection section.
@@ -40,26 +55,37 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
                     crate::state::PrinterTarget::Usb,
                     "USB (automatic)",
                 );
+                if let Some(store) = &state.profiles.store {
+                    for entry in store.entries.values() {
+                        let target = crate::state::PrinterTarget::Profile(entry.profile.clone());
+                        ui.selectable_value(
+                            &mut state.printer_target,
+                            target.clone(),
+                            target.label(),
+                        );
+                    }
+                }
                 for target in state.usb_targets.iter().chain(&state.bluetooth_targets) {
                     ui.selectable_value(&mut state.printer_target, target.clone(), target.label());
                 }
             });
     });
     if state.printer_target != old_target {
-        state.calibration_enabled = false;
-        state.printer_connected = false;
-        state.preview_uses_printer = false;
-        state.update_tape_pixels();
-        state.mark_dirty();
-        state.printer_model = None;
-        state.printer_status = Some("Connecting...".to_string());
-        state.connecting = true;
-        state.auto_cut = !state.printer_target.is_bluetooth();
-        if let Some(ref tx) = state.printer_cmd_tx {
-            let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
-        }
+        state.select_target(state.printer_target.clone());
     }
 
+    if ui
+        .add_enabled(
+            !state.is_printer_busy(),
+            egui::Button::new("Manage printers…"),
+        )
+        .clicked()
+    {
+        state.profiles.open = true;
+    }
+    if let Some(error) = &state.profiles.error {
+        ui.colored_label(egui::Color32::RED, error);
+    }
     let model_text = state.printer_model.as_deref().unwrap_or("Not connected");
     ui.label(format!("Model: {}", model_text));
 
@@ -76,7 +102,7 @@ fn show_printer_section(ui: &mut egui::Ui, state: &mut AppState) {
         && let Some(ref tx) = state.printer_cmd_tx
     {
         state.connecting = true;
-        let _ = tx.send(PrinterCommand::Poll(state.printer_target.clone()));
+        let _ = tx.send(PrinterCommand::Poll(state.selection()));
         let _ = tx.send(PrinterCommand::DiscoverBluetooth);
         info!("Manual printer refresh requested");
     }
@@ -90,40 +116,42 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     let tapes = tape::supported_tapes(state.target_dpi());
     let current_label = format!("{} mm ({} px)", state.tape_width_mm, state.tape_width_px);
 
-    ui.add_enabled_ui(
-        !state.printer_target.is_bluetooth() || !state.printer_connected,
-        |ui| {
-            egui::ComboBox::from_label("Width")
-                .selected_text(&current_label)
-                .show_ui(ui, |ui| {
-                    for t in tapes {
-                        let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
-                        if ui
-                            .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
-                            .clicked()
-                        {
-                            state.update_tape_pixels();
-                            state.mark_dirty();
-                            info!("Tape changed: {} mm", t.width_mm);
-                        }
+    ui.add_enabled_ui(!state.printer_connected, |ui| {
+        egui::ComboBox::from_label("Width")
+            .selected_text(&current_label)
+            .show_ui(ui, |ui| {
+                for t in tapes {
+                    let label = format!("{} mm ({} px)", t.width_mm, t.pixels);
+                    if ui
+                        .selectable_value(&mut state.tape_width_mm, t.width_mm, &label)
+                        .clicked()
+                    {
+                        state.update_tape_pixels();
+                        state.mark_dirty();
+                        info!("Tape changed: {} mm", t.width_mm);
                     }
-                });
-        },
-    );
+                }
+            });
+    });
 
+    let before = state.content_snapshot();
+    let old_dpi = state.design_dpi;
     egui::ComboBox::from_label("Design DPI")
         .selected_text(state.design_dpi.to_string())
         .show_ui(ui, |ui| {
             for dpi in [180, 360] {
-                if ui.selectable_value(&mut state.design_dpi, dpi, dpi.to_string()).changed()
-                    && !state.printer_connected
-                {
-                    state.preview_uses_printer = false;
-                    state.update_tape_pixels();
-                    state.mark_dirty();
-                }
+                ui.selectable_value(&mut state.design_dpi, dpi, dpi.to_string());
             }
-        }).response.on_hover_text("Saved with the layout; used for offline preview and export. Connected printers use their own DPI.");
+        })
+        .response
+        .on_hover_text("Saved with the layout; used for offline preview and export.");
+    if state.design_dpi != old_dpi {
+        if !state.printer_connected {
+            state.preview_uses_printer = false;
+            state.update_tape_pixels();
+        }
+        state.record_content(before, "Design DPI", None, ui.input(|i| i.time));
+    }
     let source = if state.printer_connected {
         "printer"
     } else if state.preview_uses_printer {
@@ -131,9 +159,12 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
     } else {
         "design"
     };
-    ui.label(format!("Preview: {} DPI ({source})", state.target_dpi()));
-    ui.small(format!("Printable height: {:.2} mm", state.printable_height_mm()))
-        .on_hover_text("The printable area is narrower than the nominal tape. Layout Y coordinates start at its top edge.");
+    ui.small(format!("Printable: {:.2} mm", state.printable_height_mm()));
+    ui.small(format!(
+        "{} dots at {} DPI ({source})",
+        state.tape_width_px,
+        state.target_dpi()
+    ));
     if !state.printer_connected
         && state.preview_uses_printer
         && ui.button("Use design DPI").clicked()
@@ -147,6 +178,10 @@ fn show_tape_section(ui: &mut egui::Ui, state: &mut AppState) {
 /// Print options: auto-cut toggle and quality selection.
 fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Print Options");
+    ui.horizontal(|ui| {
+        ui.label("Job timeout (s)");
+        ui.add(egui::DragValue::new(&mut state.job_timeout_secs).range(1..=86400));
+    });
     ui.add_space(4.0);
     ui.add_enabled_ui(!state.printer_target.is_bluetooth(), |ui| {
         ui.horizontal(|ui| {
@@ -156,7 +191,7 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
                 .add(crate::widgets::toggle(&mut state.auto_cut))
                 .changed()
             {
-                state.calibration_enabled = false;
+                state.calibration_mode = crate::state::CalibrationMode::Profile;
             }
         })
     });
@@ -164,153 +199,35 @@ fn show_print_options(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label("Manual cutter");
     }
 
-    if state.printer_quality_modes {
-        let quality_label = |q: PrintQuality| match q {
-            PrintQuality::Standard => "Standard",
-            PrintQuality::HighRes => "High resolution",
-            PrintQuality::Draft => "Draft (high speed)",
-        };
-        egui::ComboBox::from_label("Quality")
-            .selected_text(quality_label(state.print_quality))
-            .show_ui(ui, |ui| {
-                for q in [
-                    PrintQuality::Standard,
-                    PrintQuality::HighRes,
-                    PrintQuality::Draft,
-                ] {
-                    if ui
-                        .selectable_value(&mut state.print_quality, q, quality_label(q))
-                        .changed()
-                    {
-                        state.calibration_enabled = false;
-                    }
-                }
-            });
+    if state.printer_target.is_network()
+        && ui
+            .checkbox(&mut state.precut, "Short margins (leading cut)")
+            .changed()
+    {
+        state.calibration_mode = crate::state::CalibrationMode::Profile;
     }
-    show_calibration(ui, state);
-}
 
-fn show_calibration(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.collapsing("Position calibration", |ui| {
-        ui.add_enabled_ui(!state.is_printer_busy(), |ui| {
-            ui.checkbox(&mut state.calibration_enabled, "Use custom correction");
-            ui.small("Default keeps the printer's current behavior.");
-            ui.horizontal(|ui| {
-                ui.label("Offset:");
-                ui.add(
-                    crate::widgets::decimal_drag(&mut state.calibration.offset_mm)
-                        .range(-100.0..=100.0)
-                        .min_decimals(2)
-                        .max_decimals(3)
-                        .speed(0.1)
-                        .suffix(" mm"),
-                );
-            });
-            ui.small("Positive adds leading space. Negative removes blank space only.");
-            ui.label("Saved profile:");
-            egui::ComboBox::from_id_salt("calibration_profile")
-                .selected_text(&state.calibration.name)
-                .show_ui(ui, |ui| {
-                    for profile in state.calibration_profiles.values() {
-                        if ui
-                            .selectable_label(state.calibration.name == profile.name, &profile.name)
-                            .clicked()
-                        {
-                            state.calibration = profile.clone();
-                            state.calibration_enabled = true;
-                        }
-                    }
-                });
-            ui.add(
-                egui::TextEdit::singleline(&mut state.calibration.name)
-                    .desired_width(ui.available_width())
-                    .hint_text("Printer and cut mode"),
-            );
-            ui.small("Save a separate profile for each printer and cut mode.");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Save profile").clicked() {
-                    match state.calibration.validate() {
-                        Ok(()) => {
-                            state
-                                .calibration_profiles
-                                .insert(state.calibration.name.clone(), state.calibration.clone());
-                            state.status_message = "Calibration profile saved".into();
-                        }
-                        Err(e) => state.status_message = e.to_string(),
-                    }
-                }
-                if ui.button("Default").clicked() {
-                    state.calibration_enabled = false;
-                }
-                if ui.button("Load file").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Calibration", &["toml"])
-                        .pick_file()
-                {
-                    match std::fs::read_to_string(path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|text| {
-                            ptouch_render::calibration::PrintCalibration::from_toml(&text)
-                                .map_err(|e| e.to_string())
-                        }) {
-                        Ok(profile) => {
-                            state.calibration = profile;
-                            state.calibration_enabled = true;
-                        }
-                        Err(e) => state.status_message = e,
-                    }
-                }
-                if ui.button("Export profile").clicked() {
-                    match state.calibration.to_toml() {
-                        Ok(text) => {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Calibration", &["toml"])
-                                .set_file_name("printer-calibration.toml")
-                                .save_file()
-                            {
-                                match std::fs::write(path, text) {
-                                    Ok(()) => {
-                                        state.status_message = "Calibration profile exported".into()
-                                    }
-                                    Err(e) => state.status_message = e.to_string(),
-                                }
-                            }
-                        }
-                        Err(e) => state.status_message = e.to_string(),
-                    }
+    if let Some(profile) = state.printer_quality {
+        let mut quality = state.print_quality;
+        let selected = profile.mode(state.print_quality).ok();
+        egui::ComboBox::from_label("Quality")
+            .selected_text(
+                selected
+                    .map(|m| m.label())
+                    .unwrap_or_else(|| "Unsupported quality".into()),
+            )
+            .show_ui(ui, |ui| {
+                for mode in profile.modes {
+                    ui.selectable_value(&mut quality, mode.quality, mode.label())
+                        .on_hover_text(format!(
+                            "DPI: across the head × along the tape. {}",
+                            mode.requirement()
+                        ));
                 }
             });
-            if ui
-                .add_enabled(
-                    state.preview_bitmap.is_some(),
-                    egui::Button::new("Export corrected image"),
-                )
-                .clicked()
-                && let Some(bitmap) = &state.preview_bitmap
-            {
-                match ptouch_render::calibration::apply_calibration(
-                    bitmap,
-                    state.target_dpi(),
-                    state
-                        .calibration_enabled
-                        .then_some(state.calibration.offset_mm),
-                ) {
-                    Ok(corrected) => {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PNG", &["png"])
-                            .save_file()
-                        {
-                            match corrected.save(&path) {
-                                Ok(()) => state.status_message = "Corrected image exported".into(),
-                                Err(e) => state.status_message = e.to_string(),
-                            }
-                        }
-                    }
-                    Err(e) => state.status_message = e.to_string(),
-                }
-            }
-        });
-    });
+        state.set_print_quality(quality);
+    }
+    crate::calibration_ui::show(ui, state);
 }
 
 /// Whole-label mirror section: flip the entire composed label.
@@ -320,26 +237,21 @@ fn show_calibration(ui: &mut egui::Ui, state: &mut AppState) {
 fn show_mirror_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Mirror");
     ui.add_space(4.0);
-
-    if ui
+    let before = state.content_snapshot();
+    let horizontal = ui
         .checkbox(&mut state.overall_flip_h, "Flip horizontal (left-right)")
-        .changed()
-    {
-        state.mark_dirty();
-        info!("Whole-label horizontal flip: {}", state.overall_flip_h);
-    }
-    if ui
+        .changed();
+    let vertical = ui
         .checkbox(&mut state.overall_flip_v, "Flip vertical (top-bottom)")
-        .changed()
-    {
-        state.mark_dirty();
-        info!("Whole-label vertical flip: {}", state.overall_flip_v);
+        .changed();
+    if horizontal || vertical {
+        state.record_content(before, "Mirror label", None, ui.input(|i| i.time));
     }
 }
 
 /// Element list section with reorder and delete controls.
 fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Elements");
+    ui.heading("Objects");
     ui.horizontal(|ui| {
         ui.selectable_value(&mut state.layers_view, false, "Layout order");
         ui.selectable_value(&mut state.layers_view, true, "Layers");
@@ -348,157 +260,123 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
         super::scene_tools::show_layers(ui, state);
         return;
     }
-    ui.small("Select an object. Drag rows to reorder.");
     ui.add_space(4.0);
-
     if state.elements.is_empty() {
-        ui.label("(no elements)");
+        ui.label("(no objects)");
         return;
     }
-
-    let mut action: Option<ElementAction> = None;
+    let mut action = None;
+    let mut rows = Vec::new();
     let mut selection = None;
-    let selected = state.selected_canvas_target();
-
-    for (row, idx) in state.layout_order().into_iter().enumerate() {
-        let element = &state.elements[idx];
-        let object_target = CanvasTarget {
-            element: idx,
-            edit: CanvasEditTarget::Content,
-        };
-        let slot_target = CanvasTarget {
-            element: idx,
-            edit: CanvasEditTarget::Slot,
-        };
-        let attached = element.as_object().is_some_and(|object| {
+    let content_target = |element| CanvasTarget {
+        element,
+        edit: CanvasEditTarget::Content,
+    };
+    let order = state.layout_order();
+    for (position, &idx) in order.iter().enumerate() {
+        let attached = state.elements[idx].as_object().is_some_and(|object| {
             object
                 .scene
                 .as_ref()
                 .is_some_and(|scene| scene.anchor.is_some())
         });
         if !attached
-            && let Some(object) = element.as_object()
+            && let Some(object) = state.elements[idx].as_object()
             && object.sequence.is_some()
             && object.frame.position == ptouch_render::document::PositionMode::Absolute
         {
             ui.small(format!("Sequence start · X {:.2} mm", object.frame.x_mm));
         }
-        let has_slot = !attached
-            && matches!(
-                element,
-                crate::state::LabelElement::Object(_)
-                    | crate::state::LabelElement::Text {
-                        text_box: Some(_),
-                        ..
-                    }
-            );
-        let flow = element.as_object().is_some_and(|o| {
-            o.frame.position == ptouch_render::document::PositionMode::Relative
-                || o.layout
-                    .as_ref()
-                    .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow)
-        }) || !state.slot_followers(idx).is_empty();
+        let is_selected = state.selected_element == Some(idx);
         let label = format!(
-            "{}. {} {}{}",
-            row + 1,
-            if flow { "↔" } else { "•" },
-            element.display_name(),
-            if element
-                .as_object()
-                .is_some_and(|o| o.scene.as_ref().is_some_and(|s| s.anchor.is_some()))
-            {
-                " ↗"
-            } else {
-                ""
-            }
+            "{}. {}{}",
+            position + 1,
+            state.elements[idx].display_name(),
+            if attached { " ↗" } else { "" }
         );
-        let response = ui
-            .horizontal(|ui| {
+        let row = ui.push_id(("element_row", idx), |ui| {
+            ui.horizontal(|ui| {
                 if attached {
                     ui.add_space(12.0);
                 }
-                let row_width = ui.available_width().max(20.0);
-
-                ui.add_sized(
-                    [row_width, ui.spacing().interact_size.y],
-                    egui::Button::selectable(
-                        selected.is_some_and(|t| t.element == idx),
-                        (&label, egui::Atom::grow()),
+                let handle = crate::widgets::drag_handle(ui)
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text("Drag to reorder; Alt+Up/Down moves the selected object");
+                state.editor.surface(&handle);
+                if !attached {
+                    handle.dnd_set_drag_payload(crate::preview::ElementDrag {
+                        index: idx,
+                        revision: state.document_revision,
+                    });
+                }
+                if handle.drag_started() {
+                    handle.request_focus();
+                    selection = Some(content_target(idx));
+                }
+                let width = (ui.available_width()
+                    - ui.spacing().interact_size.y
+                    - ui.spacing().item_spacing.x)
+                    .max(1.0);
+                let response = ui
+                    .add_sized(
+                        [width, ui.spacing().interact_size.y],
+                        egui::Button::selectable(is_selected, (&label, egui::Atom::grow()))
+                            .truncate(),
                     )
-                    .truncate()
-                    .sense(egui::Sense::click_and_drag()),
-                )
-                .on_hover_text(format!(
-                    "{label}\n{}",
-                    if attached {
-                        "Attached: moves with its host. Use Layers to change drawing order."
-                    } else if flow {
-                        "In sequence: reordering changes physical placement."
-                    } else {
-                        "Free position: reordering preserves X/Y coordinates."
-                    }
-                ))
+                    .on_hover_text(format!(
+                        "{label}\n{}",
+                        if attached {
+                            "Attached: moves with its host. Use Layers to change drawing order."
+                        } else {
+                            "Reorder layout; independent objects keep their positions."
+                        }
+                    ));
+                state.editor.surface(&response);
+                if response.clicked() {
+                    response.request_focus();
+                    selection = Some(content_target(idx));
+                }
+                let context = crate::editor::context_menu(&response, state, Some(idx));
+                selection = context.selection.map(content_target).or(selection);
+                action = context.action.or(action.take());
+                let (menu_response, menu) = crate::editor::row_menu(ui, state, idx);
+                state.editor.surface(&menu_response);
+                selection = menu.selection.map(content_target).or(selection);
+                action = menu.action.or(action.take());
             })
-            .inner;
-        if response.clicked() || response.drag_started() {
-            selection = Some(object_target);
-        }
-        response.context_menu(|ui| {
-            if ui.button("Duplicate").clicked() {
-                action = Some(ElementAction::Duplicate(idx));
-                ui.close();
-            }
-            if idx > 0 {
-                if state.can_swap_positions(idx, idx - 1)
-                    && ui
-                        .button("Swap positions with previous")
-                        .on_hover_text(
-                            "Exchange X/Y coordinates; each object keeps its size and content",
-                        )
-                        .clicked()
-                {
-                    action = Some(ElementAction::SwapPositions(idx));
-                    ui.close();
-                }
-                if state.can_swap_content(idx, idx - 1)
-                    && ui
-                        .button("Swap content with previous")
-                        .on_hover_text(
-                            "Exchange content and its transforms while keeping layout allocations",
-                        )
-                        .clicked()
-                {
-                    action = Some(ElementAction::SwapContent(idx));
-                    ui.close();
-                }
-            }
-            if ui.button("Edit content").clicked() {
-                selection = Some(object_target);
-                ui.close();
-            }
-            if ui
-                .add_enabled(has_slot, egui::Button::new("Adjust layout…"))
-                .clicked()
-            {
-                selection = Some(slot_target);
-                ui.close();
-            }
         });
-        if !attached {
-            response.dnd_set_drag_payload(ElementDrag(idx));
-        }
-        if let Some(source) = response.dnd_hover_payload::<ElementDrag>()
-            && state.layout_host(idx) != Some(source.0)
-        {
-            let y = if source.0 < idx {
-                response.rect.bottom()
-            } else {
-                response.rect.top()
-            };
-            let hint = match (
-                state.flow_chain(source.0),
-                state.layout_host(idx).and_then(|i| state.flow_chain(i)),
-            ) {
+        rows.push(row.inner.response.rect);
+    }
+    if let Some(target) = selection {
+        state.select_canvas_target(Some(target));
+        ui.ctx().request_repaint();
+    }
+    if let (Some(drag), Some(pointer), Some(first), Some(last)) = (
+        state.element_drag(ui.ctx()),
+        ui.ctx().pointer_interact_pos(),
+        rows.first(),
+        rows.last(),
+    ) {
+        let area = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), first.top() - 4.0),
+            egui::pos2(ui.max_rect().right(), last.bottom() + 8.0),
+        )
+        .intersect(ui.clip_rect());
+        if ui.rect_contains_pointer(area) {
+            let before = rows
+                .iter()
+                .position(|row| pointer.y < row.center().y)
+                .unwrap_or(rows.len());
+            let y = rows
+                .get(before)
+                .map_or(last.bottom() + 3.0, |row| row.top() - 2.0);
+            ui.painter().line_segment(
+                [egui::pos2(area.left(), y), egui::pos2(area.right(), y)],
+                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+            );
+            let target = order.get(before).copied().unwrap_or(state.elements.len());
+            let host = state.layout_host(target).unwrap_or(target);
+            let hint = match (state.flow_chain(drag.index), state.flow_chain(host)) {
                 (Some(from), Some(to)) if from != to => "Move into sequence",
                 (Some(_), _) => "Reorder sequence",
                 _ => "List order · keep position",
@@ -507,130 +385,169 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             let text =
                 ui.painter()
                     .layout_no_wrap(hint.into(), egui::FontId::proportional(11.0), color);
-            let position = egui::pos2(
-                response.rect.right() - text.size().x - 2.0,
-                y - text.size().y - 2.0,
-            );
+            let position = egui::pos2(area.right() - text.size().x - 2.0, y - text.size().y - 2.0);
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(position, text.size() + egui::vec2(2.0, 2.0)),
                 2.0,
                 ui.visuals().panel_fill,
             );
             ui.painter().galley(position, text, color);
-            ui.painter().line_segment(
-                [
-                    egui::pos2(response.rect.left(), y),
-                    egui::pos2(response.rect.right(), y),
-                ],
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(205, 115, 0)),
-            );
-        }
-        if let Some(source) = response.dnd_release_payload::<ElementDrag>() {
-            action = Some(ElementAction::MoveTo(source.0, idx));
-        }
-    }
-    if let Some(target) = selection {
-        state.select_canvas_target(Some(target));
-    }
-
-    ui.add_space(4.0);
-
-    ui.horizontal_wrapped(|ui| {
-        let has_selection = state.selected_element.is_some();
-        if ui
-            .add_enabled(has_selection, egui::Button::new("Duplicate"))
-            .on_hover_text(
-                "Copy with its settings: after the source in a sequence, or at the end for free positioning (Ctrl+D / Cmd+D)",
-            )
-            .clicked()
-            && let Some(idx) = state.selected_element
-        {
-            action = Some(ElementAction::Duplicate(idx));
-        }
-
-        if ui
-            .add_enabled(
-                state.selected_element.and_then(|i| state.layout_neighbor(i, false)).is_some(),
-                egui::Button::new("Up"),
-            )
-            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
-            .clicked()
-            && let Some(idx) = state.selected_element
-        {
-            action = Some(ElementAction::MoveUp(idx));
-        }
-
-        if ui
-            .add_enabled(
-                state.selected_element.and_then(|i| state.layout_neighbor(i, true)).is_some(),
-                egui::Button::new("Down"),
-            )
-            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
-            .clicked()
-            && let Some(idx) = state.selected_element
-        {
-            action = Some(ElementAction::MoveDown(idx));
-        }
-
-        if ui
-            .add_enabled(has_selection, egui::Button::new("Delete"))
-            .clicked()
-            && let Some(idx) = state.selected_element
-        {
-            action = Some(ElementAction::Delete(idx));
-        }
-    });
-
-    // Apply deferred action
-    if let Some(act) = action {
-        match act {
-            ElementAction::SwapPositions(index) => {
-                state.swap_positions(index, index - 1);
-            }
-            ElementAction::SwapContent(index) => {
-                state.swap_content(index, index - 1);
-            }
-            ElementAction::Duplicate(idx) => {
-                state.duplicate_element(idx);
-            }
-            ElementAction::MoveUp(idx) => {
-                if let Some(previous) = state.layout_neighbor(idx, false) {
-                    move_element(state, idx, previous);
-                }
-            }
-            ElementAction::MoveDown(idx) => {
-                if let Some(next) = state.layout_neighbor(idx, true) {
-                    move_element(state, idx, next);
-                }
-            }
-            ElementAction::MoveTo(from, to) => move_element(state, from, to),
-            ElementAction::Delete(idx) => {
-                state.delete_element(idx);
+            if ui.input(|i| i.pointer.primary_released()) {
+                action = Some(crate::editor::EditorAction::Move {
+                    from: drag.index,
+                    before: target,
+                });
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct ElementDrag(usize);
-
-fn move_element(state: &mut AppState, from: usize, to: usize) {
-    state.reorder_object(from, to);
-}
-
-/// Deferred actions for element list manipulation.
-enum ElementAction {
-    SwapPositions(usize),
-    SwapContent(usize),
-    Duplicate(usize),
-    MoveUp(usize),
-    MoveDown(usize),
-    MoveTo(usize, usize),
-    Delete(usize),
+    if let Some(action) = action {
+        crate::editor::apply_action(ui.ctx(), state, action);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::state::LabelElement;
+
+    fn frame(
+        ctx: &egui::Context,
+        state: &mut AppState,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Pos2> {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| show_elements_section(ui, state));
+            },
+        );
+        let handles = crate::widgets::icon_positions(ctx, crate::widgets::Icon::Grab);
+        output.textures_delta.clear();
+        handles
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn fixture() -> AppState {
+        AppState {
+            elements: [10, 20, 30]
+                .into_iter()
+                .map(|pixels| LabelElement::Padding { pixels })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_handles_move_elements_on_drop_and_keep_selection() {
+        let ctx = egui::Context::default();
+        let mut state = fixture();
+        frame(&ctx, &mut state, vec![]);
+        let handles = frame(&ctx, &mut state, vec![]);
+        assert_eq!(handles.len(), 3);
+        let source = handles[0];
+        let target = handles[2] + egui::vec2(0.0, 7.0);
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::PointerMoved(source), button(source, true)],
+        );
+        frame(&ctx, &mut state, vec![egui::Event::PointerMoved(target)]);
+        assert!(state.element_drag(&ctx).is_some());
+        assert_eq!(state.document_revision, 0);
+        frame(&ctx, &mut state, vec![button(target, false)]);
+        assert!(matches!(
+            state.elements[2],
+            LabelElement::Padding { pixels: 10 }
+        ));
+        assert_eq!(state.selected_element, Some(2));
+        assert_eq!(state.document_revision, 1);
+    }
+
+    #[test]
+    fn escape_does_not_restart_a_list_drag_on_the_next_frame() {
+        let ctx = egui::Context::default();
+        let mut state = fixture();
+        frame(&ctx, &mut state, vec![]);
+        let handles = frame(&ctx, &mut state, vec![]);
+        let source = handles[0];
+        let target = handles[2];
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::PointerMoved(source), button(source, true)],
+        );
+        frame(&ctx, &mut state, vec![egui::Event::PointerMoved(target)]);
+        assert!(state.element_drag(&ctx).is_some());
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::PointerMoved(target + egui::vec2(0.0, 5.0))],
+        );
+        assert!(state.element_drag(&ctx).is_none());
+        frame(&ctx, &mut state, vec![button(target, false)]);
+        assert_eq!(state.document_revision, 0);
+        assert!(matches!(
+            state.elements[0],
+            LabelElement::Padding { pixels: 10 }
+        ));
+    }
+
+    #[test]
+    fn list_accepts_a_shared_payload_from_the_preview() {
+        let ctx = egui::Context::default();
+        let mut state = fixture();
+        frame(&ctx, &mut state, vec![]);
+        let handles = frame(&ctx, &mut state, vec![]);
+        let target = handles[0] - egui::vec2(0.0, 4.0);
+        frame(
+            &ctx,
+            &mut state,
+            vec![egui::Event::PointerMoved(target), button(target, true)],
+        );
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            crate::preview::ElementDrag {
+                index: 2,
+                revision: 0,
+            },
+        );
+        frame(&ctx, &mut state, vec![button(target, false)]);
+        assert!(matches!(
+            state.elements[0],
+            LabelElement::Padding { pixels: 30 }
+        ));
+        assert_eq!(state.selected_element, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod free_layout_tests {
     use super::*;
     use ptouch_render::document::{LabelElement, LabelObject, PositionMode, TextBox};
 
@@ -677,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn row_selects_one_object_and_layout_is_an_explicit_context_action() {
+    fn row_click_and_context_menu_select_without_pinning() {
         let mut state = AppState {
             document_version: 3,
             elements: vec![LabelElement::Object(LabelObject::text(
@@ -687,9 +604,21 @@ mod tests {
             needs_rerender: false,
             ..AppState::default()
         };
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
         let before = state.document().to_toml_string().unwrap();
         let context = egui::Context::default();
+        list_frame(&context, &mut state, vec![]);
         let output = list_frame(&context, &mut state, vec![]);
+        assert_eq!(
+            state.selected_canvas_target(),
+            Some(CanvasTarget {
+                element: 0,
+                edit: CanvasEditTarget::Slot,
+            })
+        );
         let row = text_position(&output, "1. ");
         list_frame(
             &context,
@@ -705,11 +634,8 @@ mod tests {
             vec![pointer_event(row, egui::PointerButton::Primary, false)],
         );
         assert_eq!(
-            state.selected_canvas_target(),
-            Some(CanvasTarget {
-                element: 0,
-                edit: CanvasEditTarget::Content,
-            })
+            state.selected_canvas_target().unwrap().edit,
+            CanvasEditTarget::Content
         );
         list_frame(
             &context,
@@ -746,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn reordering_keeps_chain_anchor_with_interleaved_free_objects() {
+    fn reordering_preserves_chain_membership_across_independent_rows() {
         let mut state = AppState {
             elements: vec![
                 LabelElement::Object(LabelObject::text(
@@ -779,20 +705,25 @@ mod tests {
             element: 0,
             edit: CanvasEditTarget::Slot,
         }));
-        move_element(&mut state, 0, 1);
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Move { from: 0, before: 2 })
+        );
         assert_eq!(state.element_rect_mm(0).unwrap().0, 30.0);
         assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
         assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
         assert_eq!(state.flow_chain(0), Some(vec![0, 2]));
-        move_element(&mut state, 1, 0);
-        move_element(&mut state, 2, 1);
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Move { from: 1, before: 0 })
+        );
+        assert!(
+            state.apply_editor_action(crate::editor::EditorAction::Move { from: 2, before: 1 })
+        );
         assert_eq!(state.selected_element, Some(1));
         assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);
         assert_eq!(state.element_rect_mm(0).unwrap().0, 5.0);
         assert_eq!(state.element_rect_mm(1).unwrap().0, 30.0);
         assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
-        assert!(
-            matches!(&state.elements[1].as_object().unwrap().content, ptouch_render::document::ObjectContent::Text { content, .. } if content == "C")
-        );
+        assert!(matches!(&state.elements[1].as_object().unwrap().content,
+            ptouch_render::document::ObjectContent::Text { content, .. } if content == "C"));
     }
 }

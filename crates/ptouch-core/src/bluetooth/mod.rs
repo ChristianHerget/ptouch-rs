@@ -110,14 +110,18 @@ impl BluetoothDevice {
     /// Phase changes do not indicate completion; errors and timeouts fail the
     /// operation. A failed job is never automatically resubmitted.
     /// The PT-P300BT has a manual cutter.
-    pub fn print_raster(&mut self, lines: &[Vec<u8>]) -> Result<()> {
+    pub fn print_raster(
+        &mut self,
+        lines: &[Vec<u8>],
+        resolution: crate::PrintResolution,
+    ) -> Result<()> {
         if !self.session.is_initialized() {
             return Err(PtouchError::NotInitialized);
         }
         // Refresh readiness and media before constructing a new job.
         self.session.query_status()?;
         self.session
-            .print_raster(lines, false, false, PrintQuality::Standard)
+            .print_raster(lines, resolution, false, false, PrintQuality::Standard)
     }
     /// Close the RFCOMM channel and its exclusively owned baseband connection.
     ///

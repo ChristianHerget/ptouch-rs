@@ -111,4 +111,11 @@ pub enum PtouchError {
     /// The requested print quality is not supported by this device.
     #[error("Print quality not supported by {0}")]
     UnsupportedQuality(String),
+
+    /// Supplied pixels must already have the selected mode's resolution.
+    #[error("Raster resolution {actual:?} does not match selected mode {expected:?}")]
+    RasterResolution {
+        expected: crate::PrintResolution,
+        actual: crate::PrintResolution,
+    },
 }

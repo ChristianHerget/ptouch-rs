@@ -27,6 +27,32 @@ pub struct LabelBitmap {
 }
 
 impl LabelBitmap {
+    /// Reduce a render at twice the head DPI to the physical head height.
+    /// Feed columns remain distinct, preserving genuine horizontal detail.
+    pub fn halve_height(&self) -> Self {
+        let mut out = Self::new(self.width, self.height.div_ceil(2));
+        for y in 0..out.height {
+            for x in 0..out.width {
+                out.set_pixel(
+                    x,
+                    y,
+                    self.get_pixel(x, y * 2) || self.get_pixel(x, y * 2 + 1),
+                );
+            }
+        }
+        out
+    }
+    /// Draft output keeps every other feed column, including the last odd column.
+    pub fn halve_feed(&self) -> Self {
+        let mut out = Self::new(self.width.div_ceil(2), self.height);
+        for y in 0..self.height {
+            for x in 0..out.width {
+                out.set_pixel(x, y, self.get_pixel(x * 2, y));
+            }
+        }
+        out
+    }
+
     /// Number of bytes per row (each row is padded to whole bytes).
     #[inline]
     fn row_stride(width: u32) -> usize {
@@ -455,6 +481,15 @@ impl LabelBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_an_odd_source_height_preserves_the_last_row() {
+        let mut source = LabelBitmap::new(3, 3);
+        source.set_pixel(1, 2, true);
+        let sampled = source.halve_height();
+        assert_eq!((sampled.width(), sampled.height()), (3, 2));
+        assert!(sampled.get_pixel(1, 1));
+    }
 
     #[test]
     fn test_new_bitmap_is_white() {

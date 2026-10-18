@@ -71,13 +71,12 @@ pub fn load_image(path: &Path, options: &ImageLoadOptions) -> Result<LabelBitmap
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("svg") || ext.eq_ignore_ascii_case("svgz"));
 
-    let img = if is_svg {
-        load_svg_file(path, options.target_height)?
-    } else {
-        image::ImageReader::open(path)?
-            .with_guessed_format()?
-            .decode()?
-    };
+    if is_svg {
+        return load_image_from_reader(std::fs::File::open(path)?, options);
+    }
+    let img = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()?;
     Ok(convert_to_bitmap(img, options))
 }
 
@@ -86,12 +85,22 @@ pub fn load_image(path: &Path, options: &ImageLoadOptions) -> Result<LabelBitmap
 /// The reader contents are buffered for format detection. Raster magic is
 /// checked first; XML and gzip data are parsed as SVG/SVGZ without requiring
 /// the original path, so embedded layout images remain self-contained.
+/// SVGs with [`crate::symbol`] metadata use threshold conversion without
+/// automatic inversion, preserving the black artwork across all callers.
 pub fn load_image_from_reader<R: Read>(
     mut reader: R,
     options: &ImageLoadOptions,
 ) -> Result<LabelBitmap> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
+    let mut options = options.clone();
+    if crate::symbol::metadata(&buf).is_some() {
+        // A filled black pictogram is intentional artwork, not a photograph
+        // with a dark background. Keep this policy in the shared decoder so
+        // GUI history, saved layouts, CLI export, and printing agree.
+        options.binarize = BinarizeMode::Threshold;
+        options.auto_invert = false;
+    }
     let img = if let Ok(format) = image::guess_format(&buf) {
         // A recognized but corrupt raster must retain its decoder error; do
         // not hide that error by retrying it as a different image format.
@@ -111,7 +120,7 @@ pub fn load_image_from_reader<R: Read>(
             .with_guessed_format()?
             .decode()?
     };
-    Ok(convert_to_bitmap(img, options))
+    Ok(convert_to_bitmap(img, &options))
 }
 
 /// Load an image with its source transparency preserved as binary coverage.
@@ -219,16 +228,6 @@ pub fn load_png_from_reader<R: Read>(reader: R) -> Result<LabelBitmap> {
 // SVG rendering
 // ---------------------------------------------------------------------------
 
-/// Render an SVG file to a `DynamicImage`.
-///
-/// If `target_height` is set, the SVG is scaled so its height matches that
-/// value. Otherwise it is rendered at 180 DPI (matching Brother P-Touch
-/// printer resolution).
-fn load_svg_file(path: &Path, target_height: Option<u32>) -> Result<DynamicImage> {
-    let svg_data = std::fs::read(path)?;
-    render_svg_data(&svg_data, target_height)
-}
-
 /// Render SVG data bytes to a `DynamicImage`.
 fn render_svg_data(data: &[u8], target_height: Option<u32>) -> Result<DynamicImage> {
     render_svg_data_with_alpha(data, target_height, false)
@@ -247,8 +246,12 @@ fn render_svg_data_with_alpha(
         ..usvg::Options::default()
     };
 
-    let fontdb = std::sync::Arc::make_mut(&mut opt.fontdb);
-    fontdb.load_system_fonts();
+    // The bundled pictograms contain paths only. Avoid scanning installed
+    // fonts for each thumbnail; ordinary SVGs keep their text support.
+    if crate::symbol::metadata(data).is_none() {
+        let fontdb = std::sync::Arc::make_mut(&mut opt.fontdb);
+        fontdb.load_system_fonts();
+    }
 
     let tree = if preserve_alpha {
         // The alpha entry point already expanded SVGZ within its byte budget.
