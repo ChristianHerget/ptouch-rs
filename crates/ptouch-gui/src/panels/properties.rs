@@ -13,6 +13,7 @@ use ptouch_render::document::{
 use ptouch_render::image_loader;
 use ptouch_render::text::TextAlign;
 
+use crate::alignment::ContentAlignment;
 use crate::state::{AppState, CanvasEditTarget, CanvasTarget, LabelElement};
 
 /// Render the right-side properties panel.
@@ -51,10 +52,11 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
     let scene_font_before = state.uses_scene().then(|| state.font_name.clone());
     let mut element = state.elements[selected].clone();
     let mut changed = false;
+    let mut alignment = None;
 
     match &mut element {
         LabelElement::Object(object) => {
-            changed |= show_object_properties(ui, object, state);
+            changed |= show_object_properties(ui, object, state, &mut alignment);
         }
         LabelElement::Text {
             content,
@@ -117,7 +119,7 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
     if scene_font_before.is_some_and(|font| font != state.font_name) {
         return;
     }
-    if changed {
+    if changed || alignment.is_some() {
         if let (Some(before), Some(candidate)) = (
             state.elements[selected].as_object(),
             element.as_object_mut(),
@@ -150,6 +152,15 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
                     ),
                 }
             }
+        }
+        if let (Some(alignment), Some(candidate)) = (alignment, element.as_object_mut())
+            && let Err(message) = state.align_candidate(selected, candidate, alignment)
+        {
+            state.status_message = message;
+            return;
+        }
+        if alignment.is_some() && element == state.elements[selected] {
+            return;
         }
         if element
             .as_object()
@@ -735,12 +746,7 @@ fn show_layout_properties(
     changed | edited
 }
 
-fn show_allocation_alignment(
-    ui: &mut egui::Ui,
-    object: &mut LabelObject,
-    resolved: &ContentBox,
-) -> bool {
-    let mut changed = false;
+fn show_allocation_alignment(ui: &mut egui::Ui, alignment: &mut Option<ContentAlignment>) {
     ui.label("Align within allocation");
     for (horizontal, labels) in [
         (true, ["Left", "Center", "Right"]),
@@ -749,17 +755,14 @@ fn show_allocation_alignment(
         ui.horizontal(|ui| {
             for (fraction, label) in [0.0, 0.5, 1.0].into_iter().zip(labels) {
                 if ui.button(label).clicked() {
-                    changed |= crate::alignment::align_content(
-                        object,
-                        resolved,
-                        horizontal.then_some(fraction),
-                        (!horizontal).then_some(fraction),
-                    );
+                    *alignment = Some(ContentAlignment {
+                        horizontal: horizontal.then_some(fraction),
+                        vertical: (!horizontal).then_some(fraction),
+                    });
                 }
             }
         });
     }
-    changed
 }
 
 fn show_content_box(
@@ -767,6 +770,7 @@ fn show_content_box(
     object: &mut LabelObject,
     resolved: &ContentBox,
     state: &AppState,
+    alignment: &mut Option<ContentAlignment>,
 ) -> bool {
     let mut changed = false;
     let free = object
@@ -878,15 +882,19 @@ fn show_content_box(
                         continue;
                     }
                     ui.label(label);
-                    changed |= ui
-                        .add(
-                            crate::widgets::decimal_drag(value)
-                                .speed(0.1)
-                                .clamp_existing_to_range(false)
-                                .range(min..=10_000.0)
-                                .suffix(" mm"),
-                        )
-                        .changed();
+                    let response = ui.add(
+                        crate::widgets::decimal_drag(value)
+                            .speed(0.1)
+                            .clamp_existing_to_range(false)
+                            .range(min..=10_000.0)
+                            .suffix(" mm"),
+                    );
+                    changed |= response.changed();
+                    if response.lost_focus() {
+                        // Automatic sizing can immediately replace this value.
+                        // Do not replay the consumed text on the next blur frame.
+                        ui.data_mut(|data| data.remove_temp::<String>(response.id));
+                    }
                     ui.end_row();
                 }
             });
@@ -913,7 +921,7 @@ fn show_content_box(
         "Content transforms keep the layout allocation fixed."
     });
     if !free {
-        changed |= show_allocation_alignment(ui, object, resolved);
+        show_allocation_alignment(ui, alignment);
     }
     if ui
         .button("Fit inside")
@@ -973,6 +981,7 @@ fn show_object_properties(
     ui: &mut egui::Ui,
     object: &mut LabelObject,
     state: &mut AppState,
+    alignment: &mut Option<ContentAlignment>,
 ) -> bool {
     // Resolve this before drawing any controls: the first transform of an old
     // auto-fit object must use the geometry from its previous angle.
@@ -1010,7 +1019,7 @@ fn show_object_properties(
     }
     let mut changed = match state.canvas_edit_target {
         CanvasEditTarget::Content => {
-            let mut changed = show_content_box(ui, object, &resolved, state);
+            let mut changed = show_content_box(ui, object, &resolved, state, alignment);
             if !matches!(
                 object.content,
                 ObjectContent::Line { .. } | ObjectContent::Shape { .. }
@@ -1534,6 +1543,144 @@ fn show_padding_properties(ui: &mut egui::Ui, pixels: &mut u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_width_then_clicking_center_does_not_replay_the_blurred_value() {
+        use ptouch_render::object_layout::{self, LayoutOptions, Placement, WidthSizing};
+
+        fn frame(
+            context: &egui::Context,
+            state: &mut AppState,
+            events: Vec<egui::Event>,
+        ) -> Vec<(String, egui::Rect)> {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(280.0, 1200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_properties(ui, state),
+            );
+            output.textures_delta.clear();
+            let mut resolved = state.document();
+            object_layout::resolve(
+                &mut resolved,
+                state.scene_measurement_renderer.as_mut().unwrap(),
+            )
+            .unwrap();
+            state.elements = resolved.elements;
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_owned(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+        let click = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for scene in [false, true] {
+            let mut state = AppState {
+                document_version: if scene { 12 } else { 7 },
+                selected_element: Some(0),
+                ..Default::default()
+            };
+            let mut object = LabelObject::text(
+                "PORT 01",
+                TextBox {
+                    x_mm: 1.0,
+                    height_mm: 10.0,
+                    ..Default::default()
+                },
+            );
+            object.layout = Some(LayoutOptions {
+                placement: Placement::Flow,
+                width: WidthSizing::Content,
+                constrain: false,
+                padding_mm: 0.0,
+            });
+            object.content_box = Some(ContentBox {
+                width_mm: 13.8,
+                height_mm: 4.0,
+                offset_x_mm: 0.0,
+                offset_y_mm: 0.0,
+            });
+            if scene {
+                object.scene = Some(Box::new(ptouch_render::scene::SceneOptions {
+                    id: 1,
+                    layer: 0,
+                    anchor: None,
+                }));
+            }
+            object_layout::resolve_object(
+                &mut object,
+                state.document_version,
+                state.design_dpi,
+                &state.font_name,
+                state
+                    .scene_measurement_renderer
+                    .get_or_insert_with(ptouch_render::text::TextRenderer::new),
+            )
+            .unwrap();
+            state.elements = vec![LabelElement::Object(object.clone())];
+            let context = egui::Context::default();
+            let shapes = frame(&context, &mut state, vec![]);
+            let width_label = shapes
+                .iter()
+                .find(|(text, _)| text == "Object width")
+                .unwrap()
+                .1;
+            let width = shapes
+                .iter()
+                .find(|(text, rect)| {
+                    text.ends_with(" mm")
+                        && rect.min.x > width_label.max.x
+                        && (rect.center().y - width_label.center().y).abs() < 3.0
+                })
+                .unwrap()
+                .1;
+            let center = shapes.iter().find(|(text, _)| text == "Center").unwrap().1;
+            frame(&context, &mut state, click(width.center()));
+            frame(&context, &mut state, vec![]);
+            frame(&context, &mut state, vec![egui::Event::Text("12.0".into())]);
+            assert_eq!(
+                state.elements[0].as_object().unwrap().content_box,
+                object.content_box
+            );
+            frame(&context, &mut state, click(center.center()));
+            for _ in 0..4 {
+                frame(&context, &mut state, vec![]);
+            }
+            let result = state.elements[0].as_object().unwrap();
+            let content = result.content_box.as_ref().unwrap();
+            assert_eq!(content.offset_x_mm, 0.0);
+            assert_eq!(result.frame.width_mm, content.width_mm);
+            // One proportional edit, with no second shrink from a stale buffer.
+            assert!((content.height_mm - 4.0 * 12.0 / object.frame.width_mm).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn attached_properties_normalize_a_stale_layout_target_without_editing_the_document() {

@@ -5,8 +5,56 @@
 
 use ptouch_render::{
     document::{ContentBox, LabelObject},
-    object_layout::Placement,
+    object_layout::{self, Placement},
 };
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContentAlignment {
+    pub horizontal: Option<f64>,
+    pub vertical: Option<f64>,
+}
+
+impl crate::state::AppState {
+    /// Apply the command after numeric transforms and automatic text sizing.
+    /// The candidate remains local until the complete edit passes validation.
+    pub(crate) fn align_candidate(
+        &mut self,
+        index: usize,
+        candidate: &mut LabelObject,
+        alignment: ContentAlignment,
+    ) -> Result<(), String> {
+        let resolved = self
+            .resolved_content_box(index)
+            .ok_or("Object geometry is unavailable")?;
+        candidate.content_box.get_or_insert(resolved);
+        // Measurement must precede alignment. An old offset may lie outside the
+        // resized allocation; check containment only after placing the content.
+        let constrain = candidate.layout.as_ref().map(|p| p.constrain);
+        if let Some(policy) = &mut candidate.layout {
+            policy.constrain = false;
+        }
+        let result = object_layout::resolve_object(
+            candidate,
+            self.document_version.max(4),
+            self.design_dpi,
+            &self.font_name,
+            self.scene_measurement_renderer
+                .get_or_insert_with(ptouch_render::text::TextRenderer::new),
+        );
+        if let Some(policy) = &mut candidate.layout {
+            policy.constrain = constrain.unwrap();
+        }
+        result.map_err(|error| error.to_string())?;
+        let resolved = candidate.content_box.as_ref().unwrap().clone();
+        align_content(
+            candidate,
+            &resolved,
+            alignment.horizontal,
+            alignment.vertical,
+        );
+        object_layout::check_allocation(candidate).map_err(|error| error.to_string())
+    }
+}
 
 /// Align one axis without resizing or moving the allocation. `None` keeps
 /// the other axis unchanged; 0, 0.5 and 1 select start, centre and end.
@@ -138,6 +186,118 @@ mod tests {
         let before = object.clone();
         assert!(!align_content(&mut object, &resolved, Some(1.0), Some(0.0)));
         assert_eq!(object, before);
+    }
+
+    #[test]
+    fn pending_auto_width_resize_is_resolved_before_all_six_alignment_commands() {
+        use ptouch_render::{
+            document::LabelElement, object_layout::WidthSizing, scene::SceneOptions,
+        };
+
+        for scene in [false, true] {
+            let mut state = crate::state::AppState {
+                document_version: if scene { 12 } else { 7 },
+                ..Default::default()
+            };
+            for rotation in [0.0, 25.0] {
+                for flip_h in [false, true] {
+                    for flip_v in [false, true] {
+                        let mut before = LabelObject::text(
+                            "PORT 01",
+                            TextBox {
+                                x_mm: 1.0,
+                                width_mm: 14.4,
+                                height_mm: 10.0,
+                                ..TextBox::default()
+                            },
+                        );
+                        before.rotation = rotation;
+                        before.flip_h = flip_h;
+                        before.flip_v = flip_v;
+                        before.content_box = Some(ContentBox {
+                            width_mm: 13.8,
+                            height_mm: 4.0,
+                            offset_x_mm: 0.0,
+                            offset_y_mm: 0.0,
+                        });
+                        before.layout = Some(LayoutOptions {
+                            placement: Placement::Flow,
+                            width: WidthSizing::Content,
+                            constrain: false,
+                            padding_mm: 0.0,
+                        });
+                        before.scene = scene.then(|| {
+                            Box::new(SceneOptions {
+                                id: 1,
+                                layer: 0,
+                                anchor: None,
+                            })
+                        });
+                        object_layout::resolve_object(
+                            &mut before,
+                            state.document_version,
+                            state.design_dpi,
+                            &state.font_name,
+                            state
+                                .scene_measurement_renderer
+                                .get_or_insert_with(ptouch_render::text::TextRenderer::new),
+                        )
+                        .unwrap();
+                        for horizontal in [false, true] {
+                            for fraction in [0.0, 0.5, 1.0] {
+                                state.elements = vec![LabelElement::Object(before.clone())];
+                                let mut candidate = before.clone();
+                                let content = candidate.content_box.as_mut().unwrap();
+                                content.height_mm *= 12.0 / content.width_mm;
+                                content.width_mm = 12.0;
+                                state
+                                    .constrain_transform(0, &before, &mut candidate)
+                                    .unwrap();
+                                assert!(
+                                    candidate.content_box.as_ref().unwrap().offset_x_mm.abs() > 1.0
+                                );
+                                state
+                                    .align_candidate(
+                                        0,
+                                        &mut candidate,
+                                        ContentAlignment {
+                                            horizontal: horizontal.then_some(fraction),
+                                            vertical: (!horizontal).then_some(fraction),
+                                        },
+                                    )
+                                    .unwrap();
+                                let aligned = candidate.clone();
+                                state.apply_object_edit(0, candidate).unwrap();
+                                let result = state.elements[0].as_object().unwrap();
+                                // A later scene transaction and render pass must not undo the command.
+                                assert_eq!(result.content_box, aligned.content_box);
+                                let mut rendered = result.clone();
+                                object_layout::resolve_object(
+                                    &mut rendered,
+                                    state.document_version,
+                                    state.design_dpi,
+                                    &state.font_name,
+                                    state.scene_measurement_renderer.as_mut().unwrap(),
+                                )
+                                .unwrap();
+                                assert_eq!(&rendered, result);
+                                let (x, y, w, h) = content_extent(result).unwrap();
+                                let (start, extent, available) = if horizontal {
+                                    (x, w, result.frame.width_mm)
+                                } else {
+                                    (y, h, result.frame.height_mm)
+                                };
+                                assert!(
+                                    (start - (-available / 2.0 + (available - extent) * fraction))
+                                        .abs()
+                                        < 1e-9
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
