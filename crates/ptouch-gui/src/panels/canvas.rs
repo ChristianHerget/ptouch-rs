@@ -50,7 +50,7 @@ struct CanvasDrag {
 
 #[derive(Clone)]
 struct ReorderDrag {
-    start: usize,
+    members: Vec<usize>,
     centers_mm: Vec<f64>,
     current: usize,
 }
@@ -281,10 +281,11 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         reorder: if !content_edit && hit.action == CanvasAction::Move {
                             state
                                 .flow_chain(index)
-                                .filter(|chain| chain.start() != chain.end())
+                                .filter(|chain| chain.len() > 1)
                                 .map(|chain| ReorderDrag {
-                                    start: *chain.start(),
+                                    members: chain.clone(),
                                     centers_mm: chain
+                                        .into_iter()
                                         .filter(|i| *i != index)
                                         .filter_map(|i| {
                                             state.element_rect_mm(i).map(|(x, _, w, _)| x + w / 2.0)
@@ -500,7 +501,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 {
                     let x_mm = f64::from(pos.x - label_rect.left()) / drag.pixels_per_mm;
                     let to =
-                        reorder.start + reorder.centers_mm.iter().filter(|x| x_mm > **x).count();
+                        reorder.members[reorder.centers_mm.iter().filter(|x| x_mm > **x).count()];
                     if to != reorder.current
                         && let Some(before) = &drag.before
                     {
@@ -701,11 +702,11 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                                         p.placement == ptouch_render::object_layout::Placement::Free
                                     }),
                                 );
-                                if object != before {
-                                    state.elements[drag.element] =
-                                        crate::state::LabelElement::Object(object);
-                                    state.document_version = state.document_version.max(4);
-                                    state.mark_dirty();
+                                if object != before
+                                    && let Err(message) =
+                                        state.apply_object_edit(drag.element, object)
+                                {
+                                    state.status_message = message;
                                 }
                             }
                         }
@@ -1192,10 +1193,10 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
                                 p.placement == ptouch_render::object_layout::Placement::Free
                             }),
                         );
-                        if candidate != before {
-                            state.elements[index] = crate::state::LabelElement::Object(candidate);
-                            state.document_version = state.document_version.max(4);
-                            state.mark_dirty();
+                        if candidate != before
+                            && let Err(message) = state.apply_object_edit(index, candidate)
+                        {
+                            state.status_message = message;
                         }
                     }
                 }
@@ -1230,8 +1231,11 @@ fn keyboard_move(ui: &egui::Ui, state: &mut AppState, dpi: u16) {
             true,
             25.4 / f64::from(dpi),
         );
-        state.elements[index].as_object_mut().unwrap().frame = frame;
-        state.mark_dirty();
+        let mut candidate = state.elements[index].as_object().unwrap().clone();
+        candidate.frame = frame;
+        if let Err(message) = state.apply_object_edit(index, candidate) {
+            state.status_message = message;
+        }
     }
 }
 

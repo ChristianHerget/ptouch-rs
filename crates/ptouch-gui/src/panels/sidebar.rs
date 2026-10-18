@@ -455,6 +455,18 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             } else {
                 response.rect.top()
             };
+            let hint = match (state.flow_chain(source.0), state.flow_chain(idx)) {
+                (Some(from), Some(to)) if from != to => "Move into sequence",
+                (Some(_), _) => "Reorder sequence",
+                _ => "List order · keep position",
+            };
+            ui.painter().text(
+                egui::pos2(response.rect.right(), y),
+                egui::Align2::RIGHT_BOTTOM,
+                hint,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(235, 160, 60),
+            );
             ui.painter().line_segment(
                 [
                     egui::pos2(response.rect.left(), y),
@@ -708,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn reordering_keeps_chain_anchor_and_rejects_crossing_free_objects() {
+    fn reordering_keeps_chain_anchor_with_interleaved_free_objects() {
         let mut state = AppState {
             elements: vec![
                 LabelElement::Object(LabelObject::text(
@@ -741,9 +753,12 @@ mod tests {
             element: 0,
             edit: CanvasEditTarget::Slot,
         }));
-        let before = state.document();
         move_element(&mut state, 0, 1);
-        assert_eq!(state.document(), before);
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 30.0);
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 43.0);
+        assert_eq!(state.flow_chain(0), Some(vec![0, 2]));
+        move_element(&mut state, 1, 0);
         move_element(&mut state, 2, 1);
         assert_eq!(state.selected_element, Some(1));
         assert_eq!(state.canvas_edit_target, CanvasEditTarget::Slot);

@@ -191,6 +191,7 @@ pub fn render_document(
     for object in doc.elements.iter().filter_map(LabelElement::as_object) {
         object.validate_features(doc.version)?;
     }
+    crate::sequence::validate(&doc.elements, doc.version)?;
     let mut resolved;
     let doc = if doc
         .elements
@@ -216,6 +217,7 @@ pub fn render_document(
         ));
     }
     let mut cursor_mm = 0.0;
+    let mut sequence_cursor = crate::sequence::LayoutCursor::default();
     let mut segments = Vec::new();
     let mut bounds = Vec::new();
     let mut content_bounds = Vec::new();
@@ -291,10 +293,9 @@ pub fn render_document(
                     index + 1
                 )));
             }
-            let x_mm = match frame.position {
-                PositionMode::Absolute => frame.x_mm,
-                PositionMode::Relative => cursor_mm + frame.gap_mm,
-            };
+            sequence_cursor.right_mm = cursor_mm;
+            let x_mm =
+                sequence_cursor.place(frame, element.as_object().and_then(|o| o.sequence))?;
             let right_mm = x_mm + frame.width_mm;
             let x = boundary(x_mm, target_dpi)?;
             let y = boundary(frame.y_mm, target_dpi)?;
@@ -512,9 +513,11 @@ pub fn convert_to_objects(
     let mut converted = doc.clone();
     converted.version = doc.version.max(3);
     let mut cursor_mm = 0.0;
+    let mut sequence_cursor = crate::sequence::LayoutCursor::default();
     let mut occupied_right_mm = 0.0_f64;
     let mut new_empty_frames = Vec::new();
     for (index, element) in converted.elements.iter_mut().enumerate() {
+        let sequence = element.as_object().and_then(|o| o.sequence);
         let physical_frame = match element {
             LabelElement::Object(object) => Some(&object.frame),
             LabelElement::Text { text_box, .. } => text_box.as_ref(),
@@ -526,10 +529,8 @@ pub fn convert_to_objects(
         let mut frame = if let Some(physical_frame) = physical_frame {
             // A v2/v3 frame already has exact physical geometry. Resolving its
             // relative X must not round through the current preview's pixels.
-            let x_mm = match physical_frame.position {
-                PositionMode::Absolute => physical_frame.x_mm,
-                PositionMode::Relative => cursor_mm + physical_frame.gap_mm,
-            };
+            sequence_cursor.right_mm = cursor_mm;
+            let x_mm = sequence_cursor.place(physical_frame, sequence)?;
             cursor_mm = x_mm + physical_frame.width_mm;
             TextBox {
                 position: PositionMode::Absolute,
@@ -594,6 +595,7 @@ pub fn convert_to_objects(
             LabelElement::Object(object) => {
                 frame.vertical_align = object.frame.vertical_align;
                 LabelObject {
+                    sequence: None,
                     frame,
                     ..object.clone()
                 }
@@ -616,6 +618,7 @@ pub fn convert_to_objects(
                     );
                 }
                 LabelObject {
+                    sequence: None,
                     border: None,
                     frame,
                     content_box: None,
@@ -652,6 +655,7 @@ pub fn convert_to_objects(
                     index + 1
                 );
                 LabelObject {
+                    sequence: None,
                     border: None,
                     frame,
                     content_box: None,
@@ -667,6 +671,7 @@ pub fn convert_to_objects(
                 }
             }
             LabelElement::CutMark | LabelElement::Padding { .. } => LabelObject {
+                sequence: None,
                 border: None,
                 frame,
                 content_box: None,
@@ -1739,6 +1744,7 @@ mod tests {
 
     fn object(content: ObjectContent, frame: TextBox) -> LabelElement {
         LabelElement::Object(LabelObject {
+            sequence: None,
             border: None,
             content,
             frame,

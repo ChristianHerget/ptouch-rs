@@ -303,30 +303,131 @@ impl AppState {
         policy.placement = Placement::Flow;
         policy.width = WidthSizing::Fixed;
     }
-    /// A flow chain starts at an absolute anchor and ends before the next one.
-    pub fn flow_chain(&self, index: usize) -> Option<std::ops::RangeInclusive<usize>> {
-        self.elements.get(index)?.as_object()?;
-        let mut start = index;
-        while start > 0
-            && slot_frame(&self.elements[start])?.position == PositionMode::Relative
-            && self.elements[start - 1].as_object().is_some()
-        {
-            start -= 1;
+    /// Sequence members may be separated by independent list rows.
+    pub fn flow_chain(&self, index: usize) -> Option<Vec<usize>> {
+        ptouch_render::sequence::members(&self.elements, index)
+    }
+
+    /// Commit positioning changes together with any affected sequence links.
+    pub fn apply_object_edit(
+        &mut self,
+        index: usize,
+        mut object: LabelObject,
+    ) -> Result<(), String> {
+        use ptouch_render::{object_layout::Placement, sequence};
+        let before = self
+            .elements
+            .get(index)
+            .and_then(LabelElement::as_object)
+            .ok_or("Select an object")?;
+        let placement = |o: &LabelObject| o.layout.as_ref().map(|p| p.placement);
+        let became_free = placement(&object) == Some(Placement::Free)
+            && (placement(before) != Some(Placement::Free) || self.flow_chain(index).is_some());
+        let became_flow = placement(&object) == Some(Placement::Flow)
+            && placement(before) != Some(Placement::Flow);
+        let mut elements = self.elements.clone();
+        if became_free {
+            sequence::detach(&mut elements, index).map_err(|e| e.to_string())?;
+            object.sequence = None;
+            object.frame.position = PositionMode::Absolute;
+        } else if became_flow {
+            sequence::materialize(&mut elements).map_err(|e| e.to_string())?;
+            let previous = index.checked_sub(1);
+            let target = previous
+                .and_then(|i| elements[i].as_object()?.sequence)
+                .or_else(|| {
+                    if index == 0 {
+                        elements[index].as_object()?.sequence
+                    } else {
+                        None
+                    }
+                });
+            let id = match target {
+                Some(id) => id,
+                None => elements
+                    .iter()
+                    .filter_map(|e| e.as_object()?.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("Sequence identifier limit reached")?,
+            };
+            if elements[index]
+                .as_object()
+                .unwrap()
+                .sequence
+                .is_some_and(|old| old != id)
+            {
+                sequence::detach(&mut elements, index).map_err(|e| e.to_string())?;
+            }
+            object.sequence = Some(id);
+            if let Some(previous) = previous {
+                let previous = elements[previous]
+                    .as_object_mut()
+                    .ok_or("Convert legacy elements before joining a sequence")?;
+                Self::use_flow_allocation(previous, self.printable_height_mm());
+                previous.sequence = Some(id);
+                object.frame.position = PositionMode::Relative;
+                object.frame.x_mm = 0.0;
+            } else {
+                object.frame.position = PositionMode::Absolute;
+                object.frame.x_mm = elements[index].as_object().unwrap().frame.x_mm;
+            }
         }
-        let end = self
-            .slot_followers(start)
-            .into_iter()
-            .take_while(|i| self.elements[*i].as_object().is_some())
-            .last()
-            .unwrap_or(start);
-        let object = self.elements[start].as_object()?;
-        (end > start
-            || object.frame.position == PositionMode::Relative
-            || object
-                .layout
-                .as_ref()
-                .is_some_and(|p| p.placement == ptouch_render::object_layout::Placement::Flow))
-        .then_some(start..=end)
+        if !became_free
+            && !became_flow
+            && before.sequence.is_some()
+            && before.frame.position != object.frame.position
+        {
+            let chain = sequence::members(&elements, index).unwrap();
+            if object.frame.position == PositionMode::Absolute {
+                let id = elements
+                    .iter()
+                    .filter_map(|e| e.as_object()?.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("Sequence identifier limit reached")?;
+                for i in chain.into_iter().filter(|i| *i >= index) {
+                    elements[i].as_object_mut().unwrap().sequence = Some(id);
+                }
+                object.sequence = Some(id);
+            } else {
+                let previous = index
+                    .checked_sub(1)
+                    .ok_or("The first sequence member needs an absolute origin")?;
+                let id = match elements[previous].as_object().and_then(|o| o.sequence) {
+                    Some(id) => id,
+                    None => elements
+                        .iter()
+                        .filter_map(|e| e.as_object()?.sequence)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or("Sequence identifier limit reached")?,
+                };
+                let previous = elements[previous]
+                    .as_object_mut()
+                    .ok_or("Convert legacy elements before joining a sequence")?;
+                Self::use_flow_allocation(previous, self.printable_height_mm());
+                previous.sequence = Some(id);
+                for i in chain {
+                    elements[i].as_object_mut().unwrap().sequence = Some(id);
+                }
+                object.sequence = Some(id);
+            }
+        }
+        elements[index] = LabelElement::Object(object);
+        sequence::validate(
+            &elements,
+            elements
+                .iter()
+                .fold(self.document_version, |v, e| v.max(e.minimum_version())),
+        )
+        .map_err(|e| e.to_string())?;
+        self.elements = elements;
+        self.mark_dirty();
+        Ok(())
     }
 
     pub fn can_swap_positions(&self, a: usize, b: usize) -> bool {
@@ -420,46 +521,21 @@ impl AppState {
     }
 
     /// Keep the chain anchor at its physical position while content order changes.
-    /// Free objects retain coordinates; crossing an anchor never changes bindings.
+    /// Free objects retain coordinates; sequence moves can adopt a destination chain.
     pub fn reorder_object(&mut self, from: usize, to: usize) -> bool {
         if from == to || from >= self.elements.len() || to >= self.elements.len() {
             return false;
         }
-        let chain = self.flow_chain(from);
-        if chain.as_ref().is_some_and(|r| !r.contains(&to))
-            || chain.is_none() && self.flow_chain(to).is_some()
-        {
-            self.status_message =
-                "Reorder within this sequence; change positioning to move between sequences".into();
-            return false;
-        }
-        let anchor = chain.as_ref().map(|r| {
-            let start = *r.start();
-            let f = self.elements[start].as_object().unwrap().frame.clone();
-            let gap = self
-                .elements
-                .get(start + 1)
-                .and_then(|e| e.as_object())
-                .map_or(3.0, |o| o.frame.gap_mm);
-            (start, *r.end(), f.x_mm, gap, f.position, f.gap_mm)
-        });
-        let element = self.elements.remove(from);
-        self.elements.insert(to, element);
-        if let Some((start, end, x, gap, position, first_gap)) = anchor {
-            for i in start..=end {
-                let object = self.elements[i].as_object_mut().unwrap();
-                if i == start {
-                    object.frame.position = position;
-                    object.frame.x_mm = x;
-                    object.frame.gap_mm = first_gap;
-                } else {
-                    if object.frame.position == PositionMode::Absolute {
-                        object.frame.gap_mm = gap;
-                    }
-                    object.frame.position = PositionMode::Relative;
-                    object.frame.x_mm = 0.0;
-                }
+        let source_chain = self.flow_chain(from);
+        let target_chain = self.flow_chain(to);
+        if self.is_free_layout() {
+            if let Err(error) = ptouch_render::sequence::reorder(&mut self.elements, from, to) {
+                self.status_message = error.to_string();
+                return false;
             }
+        } else {
+            let item = self.elements.remove(from);
+            self.elements.insert(to, item);
         }
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.select_canvas_target(Some(CanvasTarget {
@@ -468,6 +544,12 @@ impl AppState {
         }));
         self.canvas_hover_target = None;
         self.canvas_drag_target = None;
+        self.status_message = match (source_chain, target_chain) {
+            (Some(from), Some(to)) if from != to => "Moved into sequence; both origins preserved",
+            (Some(_), _) => "Sequence reordered",
+            _ => "List order changed; object positions preserved",
+        }
+        .into();
         self.mark_dirty();
         true
     }
@@ -561,7 +643,14 @@ impl AppState {
         let top = (-fh / 2.0 + pad).max(-y - fh / 2.0);
         let bottom = (fh / 2.0 - pad).min(tape_h - y - fh / 2.0);
         let c = candidate.content_box.as_mut().unwrap();
-        let adjusted_x = dx.clamp(left, fw / 2.0 - pad - w) - dx;
+        let right = fw / 2.0 - pad - w;
+        if right < left - 1e-7 {
+            return Err("Content exceeds the printable allocation — move or enlarge it");
+        }
+        let adjusted_x = dx.clamp(left, right.max(left)) - dx;
+        if bottom - h < top - 1e-7 {
+            return Err("Content exceeds the printable allocation — move or enlarge it");
+        }
         let adjusted_y = dy.clamp(top, (bottom - h).max(top)) - dy;
         c.offset_x_mm += adjusted_x * if candidate.flip_h { -1.0 } else { 1.0 };
         c.offset_y_mm += adjusted_y * if candidate.flip_v { -1.0 } else { 1.0 };
@@ -606,11 +695,22 @@ impl AppState {
         }
     }
 
-    /// Only the consecutive relative slots depend on this slot's right edge.
-    /// An absolute slot or an unboxed legacy element ends this chain.
+    /// Explicit followers skip independent rows. Legacy links remain adjacent
+    /// and end at an absolute slot, an explicit sequence or an unboxed element.
     pub fn slot_followers(&self, index: usize) -> Vec<usize> {
         if index >= self.elements.len() {
             return Vec::new();
+        }
+        if self.elements[index]
+            .as_object()
+            .is_some_and(|o| o.sequence.is_some())
+        {
+            return self
+                .flow_chain(index)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| *i > index)
+                .collect();
         }
         self.elements
             .iter()
@@ -618,6 +718,7 @@ impl AppState {
             .skip(index + 1)
             .take_while(|(_, element)| {
                 slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
+                    && element.as_object().is_none_or(|o| o.sequence.is_none())
             })
             .map(|(index, _)| index)
             .collect()
@@ -630,10 +731,17 @@ impl AppState {
             return Vec::new();
         };
         let mut related = Vec::new();
-        if index > 0
-            && slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative)
-        {
-            related.push(index - 1);
+        if slot_frame(element).is_some_and(|frame| frame.position == PositionMode::Relative) {
+            if let Some(chain) = self
+                .flow_chain(index)
+                .filter(|_| element.as_object().is_some_and(|o| o.sequence.is_some()))
+            {
+                if let Some(previous) = chain.into_iter().take_while(|i| *i < index).last() {
+                    related.push(previous);
+                }
+            } else if index > 0 {
+                related.push(index - 1);
+            }
         }
         related.extend(self.slot_followers(index));
         related
@@ -760,13 +868,14 @@ impl AppState {
     /// frames do not depend on the previous preview or raster rounding.
     pub fn element_rect_mm(&self, index: usize) -> Option<(f64, f64, f64, f64)> {
         let mut cursor = 0.0;
+        let mut sequence_cursor = ptouch_render::sequence::LayoutCursor::default();
         for (i, element) in self.elements.iter().enumerate().take(index + 1) {
             let frame = slot_frame(element);
             let rect = if let Some(frame) = frame {
-                let x = match frame.position {
-                    PositionMode::Absolute => frame.x_mm,
-                    PositionMode::Relative => cursor + frame.gap_mm,
-                };
+                sequence_cursor.right_mm = cursor;
+                let x = sequence_cursor
+                    .place(frame, element.as_object().and_then(|o| o.sequence))
+                    .ok()?;
                 Some((x, frame.y_mm, frame.width_mm, frame.height_mm))
             } else {
                 self.preview_bounds
@@ -840,12 +949,14 @@ impl AppState {
         if let Some(source) = insertion.and_then(|i| self.elements[i].as_object())
             && let Some(new) = element.as_object_mut()
         {
+            new.sequence = source.sequence;
             new.frame.position = PositionMode::Relative;
             new.frame.gap_mm = if source.frame.position == PositionMode::Relative {
                 source.frame.gap_mm
             } else {
                 insertion
-                    .and_then(|i| self.elements.get(i + 1))
+                    .and_then(|i| self.slot_followers(i).first().copied())
+                    .and_then(|i| self.elements.get(i))
                     .and_then(|e| e.as_object())
                     .filter(|o| o.frame.position == PositionMode::Relative)
                     .map_or(3.0, |o| o.frame.gap_mm)
@@ -919,7 +1030,12 @@ impl AppState {
                 frame.position = PositionMode::Relative;
                 frame.gap_mm = self
                     .elements
-                    .get(index + 1)
+                    .get(
+                        self.slot_followers(index)
+                            .first()
+                            .copied()
+                            .unwrap_or(self.elements.len()),
+                    )
                     .and_then(slot_frame)
                     .filter(|f| f.position == PositionMode::Relative)
                     .map_or(3.0, |f| f.gap_mm);
@@ -973,7 +1089,25 @@ impl AppState {
         let Some(element) = self.elements.get(index) else {
             return false;
         };
+        let explicit_successor = element.as_object().and_then(|o| o.sequence).and_then(|_| {
+            let chain = self.flow_chain(index)?;
+            (chain.first() == Some(&index))
+                .then(|| chain.get(1).copied())
+                .flatten()
+        });
         let anchor = slot_frame(element)
+            .filter(|_| {
+                explicit_successor.is_some()
+                    || self
+                        .elements
+                        .get(index + 1)
+                        .and_then(LabelElement::as_object)
+                        .is_none_or(|o| o.sequence.is_none())
+            })
+            .filter(|_| {
+                element.as_object().is_none_or(|o| o.sequence.is_none())
+                    || explicit_successor.is_some()
+            })
             .filter(|frame| {
                 frame.position == PositionMode::Absolute
                     || index == 0
@@ -982,7 +1116,10 @@ impl AppState {
             .cloned();
         self.elements.remove(index);
         if let Some(anchor) = anchor
-            && let Some(next) = self.elements.get_mut(index).and_then(slot_frame_mut)
+            && let Some(next) = self
+                .elements
+                .get_mut(explicit_successor.map_or(index, |i| i - 1))
+                .and_then(slot_frame_mut)
             && next.position == PositionMode::Relative
         {
             next.position = anchor.position;
@@ -1074,6 +1211,7 @@ impl AppState {
         let mut frame = self.default_object_frame(length, thickness);
         frame.y_mm = (self.printable_height_mm() - thickness).max(0.0) / 2.0;
         self.add_element(LabelElement::Object(LabelObject {
+            sequence: None,
             border: None,
             content_box: Some(content_box_for_frame(&frame)),
             layout: Some(ptouch_render::object_layout::LayoutOptions {
@@ -1094,6 +1232,7 @@ impl AppState {
         let element = if self.is_free_layout() {
             let frame = self.default_object_frame(1.27, self.printable_height_mm());
             LabelElement::Object(LabelObject {
+                sequence: None,
                 border: None,
                 content_box: Some(content_box_for_frame(&frame)),
                 layout: Some(ptouch_render::object_layout::LayoutOptions {
@@ -1232,6 +1371,270 @@ fn content_box_for_frame(frame: &TextBox) -> ContentBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_absolute_and_relative_switches_split_and_join_the_same_members() {
+        let mut state = AppState {
+            elements: (0..3)
+                .map(|i| {
+                    LabelElement::Object(LabelObject::text(
+                        "P",
+                        TextBox {
+                            position: if i == 0 {
+                                PositionMode::Absolute
+                            } else {
+                                PositionMode::Relative
+                            },
+                            gap_mm: 3.0,
+                            ..TextBox::default()
+                        },
+                    ))
+                })
+                .collect(),
+            ..Default::default()
+        };
+        ptouch_render::sequence::materialize(&mut state.elements).unwrap();
+        let positions: Vec<_> = (0..3).map(|i| state.element_rect_mm(i).unwrap()).collect();
+        let mut object = state.elements[1].as_object().unwrap().clone();
+        object.frame.position = PositionMode::Absolute;
+        object.frame.x_mm = positions[1].0;
+        state.apply_object_edit(1, object).unwrap();
+        assert_eq!(state.flow_chain(0), Some(vec![0]));
+        assert_eq!(state.flow_chain(1), Some(vec![1, 2]));
+        let mut object = state.elements[1].as_object().unwrap().clone();
+        object.frame.position = PositionMode::Relative;
+        state.apply_object_edit(1, object).unwrap();
+        assert_eq!(state.flow_chain(0), Some(vec![0, 1, 2]));
+        for (i, position) in positions.iter().enumerate() {
+            assert_eq!(state.element_rect_mm(i).unwrap(), *position);
+        }
+    }
+
+    #[test]
+    fn editing_an_old_free_anchor_unlinks_its_implicit_followers() {
+        let mut state = AppState {
+            elements: (0..3)
+                .map(|i| {
+                    LabelElement::Object(LabelObject::text(
+                        "P",
+                        TextBox {
+                            position: if i == 0 {
+                                PositionMode::Absolute
+                            } else {
+                                PositionMode::Relative
+                            },
+                            gap_mm: 3.0,
+                            ..TextBox::default()
+                        },
+                    ))
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let object = state.elements[0].as_object_mut().unwrap();
+        object.layout = Some(Default::default());
+        object.content_box = Some(content_box_for_frame(&object.frame));
+        let mut moved = object.clone();
+        moved.frame.x_mm = 2.0;
+        state.apply_object_edit(0, moved).unwrap();
+        assert!(state.slot_followers(0).is_empty());
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 13.0);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 26.0);
+    }
+
+    #[test]
+    fn interleaved_free_rows_do_not_capture_add_duplicate_delete_or_layout_hints() {
+        let mut state = AppState {
+            elements: (0..4)
+                .map(|i| {
+                    LabelElement::Object(LabelObject::text(
+                        format!("P{i}"),
+                        TextBox {
+                            position: if i == 0 || i == 3 {
+                                PositionMode::Absolute
+                            } else {
+                                PositionMode::Relative
+                            },
+                            x_mm: if i == 3 { 90.0 } else { 5.0 },
+                            gap_mm: 2.8,
+                            ..TextBox::default()
+                        },
+                    ))
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(state.reorder_object(3, 1));
+        assert!(state.slot_followers(1).is_empty());
+        assert_eq!(state.slot_related(2), vec![0, 3]);
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 17.8);
+        let doc = state.document();
+        assert!(state.duplicate_element(0));
+        let copy = state.elements[1].as_object().unwrap();
+        assert_eq!(copy.frame.gap_mm, 2.8);
+        state.restore_document(doc.clone());
+        assert!(state.delete_element(0));
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 5.0);
+        assert_eq!(state.element_rect_mm(0).unwrap().0, 90.0);
+        state.restore_document(doc.clone());
+        assert!(state.delete_element(1));
+        assert_eq!(state.element_rect_mm(1).unwrap().0, 17.8);
+        state.restore_document(doc);
+        state.selected_element = Some(1);
+        state.add_text();
+        assert_eq!(state.elements.len(), 5);
+        assert!(state.elements[4].as_object().unwrap().sequence.is_none());
+        assert_eq!(state.element_rect_mm(2).unwrap().0, 17.8);
+        assert_eq!(state.element_rect_mm(3).unwrap().0, 30.6);
+    }
+
+    #[test]
+    fn thin_rotated_lines_fit_exact_allocations_without_panicking() {
+        use ptouch_render::object_layout::{LayoutOptions, Placement, WidthSizing};
+        for angle in [0.0_f32, 90.0, 180.0, 270.0] {
+            for flip_h in [false, true] {
+                for flip_v in [false, true] {
+                    let vertical = angle == 90.0 || angle == 270.0;
+                    let mut line = LabelObject::text(
+                        "",
+                        TextBox {
+                            width_mm: if vertical { 2.0 } else { 8.7 },
+                            height_mm: 10.0,
+                            ..TextBox::default()
+                        },
+                    );
+                    line.content = ObjectContent::Line {
+                        pattern: Default::default(),
+                    };
+                    line.content_box = Some(ContentBox {
+                        width_mm: 8.7,
+                        height_mm: 0.3,
+                        offset_x_mm: 0.0,
+                        offset_y_mm: 0.0,
+                    });
+                    line.layout = Some(LayoutOptions {
+                        placement: Placement::Flow,
+                        width: WidthSizing::Fixed,
+                        constrain: true,
+                        padding_mm: 0.0,
+                    });
+                    line.rotation = angle;
+                    line.flip_h = flip_h;
+                    line.flip_v = flip_v;
+                    let state = AppState {
+                        elements: vec![LabelElement::Object(line.clone())],
+                        ..Default::default()
+                    };
+                    let mut candidate = line.clone();
+                    candidate.frame.width_mm = if vertical { 0.3 } else { 8.7 };
+                    candidate.frame.height_mm = if vertical { 8.7 } else { 0.3 };
+                    state.constrain_transform(0, &line, &mut candidate).unwrap();
+                    let mut doc = state.document();
+                    doc.elements[0] = LabelElement::Object(candidate.clone());
+                    ptouch_render::document::render_document(
+                        &doc,
+                        76,
+                        180,
+                        &mut TextRenderer::new(),
+                    )
+                    .unwrap();
+                    candidate.frame.width_mm -= 0.001;
+                    assert!(state.constrain_transform(0, &line, &mut candidate).is_err());
+                    assert_eq!(state.elements[0].as_object().unwrap(), &line);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn free_positioning_detaches_followers_and_undo_restores_membership() {
+        use ptouch_render::object_layout::{LayoutOptions, Placement, WidthSizing};
+        for index in 0..3 {
+            let mut state = AppState {
+                elements: (0..3)
+                    .map(|i| {
+                        let mut object = LabelObject::text(
+                            format!("P{i}"),
+                            TextBox {
+                                width_mm: 10.0,
+                                height_mm: 8.0,
+                                x_mm: 5.0,
+                                gap_mm: 3.0,
+                                position: if i == 0 {
+                                    PositionMode::Absolute
+                                } else {
+                                    PositionMode::Relative
+                                },
+                                ..TextBox::default()
+                            },
+                        );
+                        object.layout = Some(LayoutOptions {
+                            placement: Placement::Flow,
+                            width: WidthSizing::Fixed,
+                            constrain: true,
+                            padding_mm: 0.0,
+                        });
+                        object.content_box = Some(ContentBox {
+                            width_mm: 8.0,
+                            height_mm: 6.0,
+                            offset_x_mm: 0.0,
+                            offset_y_mm: 0.0,
+                        });
+                        LabelElement::Object(object)
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let before = state.document();
+            let positions: Vec<_> = (0..3)
+                .map(|i| state.element_rect_mm(i).unwrap().0)
+                .collect();
+            state
+                .history
+                .observe(before.clone(), Some(index), false, false, 0.0);
+            let original = state.elements[index].as_object().unwrap().clone();
+            let mut free = original.clone();
+            free.frame.x_mm = positions[index];
+            free.layout = Some(LayoutOptions::default());
+            let mut resolved_before = original;
+            resolved_before.frame.x_mm = positions[index];
+            state
+                .constrain_transform(index, &resolved_before, &mut free)
+                .unwrap();
+            state.apply_object_edit(index, free).unwrap();
+            for (i, position) in positions.iter().enumerate() {
+                if i != index {
+                    assert_eq!(state.element_rect_mm(i).unwrap().0, *position);
+                }
+            }
+            let mut moved = state.elements[index].as_object().unwrap().clone();
+            moved.frame.x_mm += 2.0;
+            state.apply_object_edit(index, moved).unwrap();
+            for (i, position) in positions.iter().enumerate() {
+                if i != index {
+                    assert_eq!(state.element_rect_mm(i).unwrap().0, *position);
+                }
+            }
+            state
+                .history
+                .observe(state.document(), Some(index), false, false, 1.0);
+            state.history_step(false);
+            assert_eq!(state.document(), before);
+            state.history_step(true);
+            assert!(
+                state.elements[index]
+                    .as_object()
+                    .unwrap()
+                    .sequence
+                    .is_none()
+            );
+            let doc = state.document();
+            assert_eq!(
+                LabelDocument::from_toml_str(&doc.to_toml_string().unwrap()).unwrap(),
+                doc
+            );
+        }
+    }
 
     #[test]
     fn new_printed_lines_duplicate_with_their_pattern_and_mirrors() {
@@ -1780,6 +2183,7 @@ mod tests {
             ObjectContent::Padding,
         ] {
             let object = LabelObject {
+                sequence: None,
                 border: None,
                 layout: None,
                 frame: TextBox {

@@ -28,7 +28,7 @@ pub use crate::layout::{
 };
 
 /// Newest supported on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 10;
+pub const DOCUMENT_VERSION: u32 = 11;
 /// Empty layouts start at v4; content features raise the version when needed.
 pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
@@ -87,6 +87,7 @@ impl LabelDocument {
         for object in doc.elements.iter().filter_map(LabelElement::as_object) {
             object.validate_features(doc.version)?;
         }
+        crate::sequence::validate(&doc.elements, doc.version)?;
         Ok(toml::to_string(&doc)?)
     }
 
@@ -150,6 +151,7 @@ impl LabelDocument {
                 content_box.validate()?;
             }
         }
+        crate::sequence::validate(&doc.elements, doc.version)?;
         doc.decode_image_caches()?;
         Ok(doc)
     }
@@ -400,6 +402,9 @@ pub enum LabelElement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabelObject {
+    /// Stable sequence membership (v11); independent objects may interleave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
     pub frame: TextBox,
     /// Explicit sizing/containment policy. Absent preserves v1–v6 geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +501,7 @@ impl LabelObject {
 
     pub fn text(content: impl Into<String>, frame: TextBox) -> Self {
         Self {
+            sequence: None,
             border: None,
             frame,
             layout: None,
@@ -520,6 +526,7 @@ impl LabelObject {
         )
         .ok();
         Self {
+            sequence: None,
             border: None,
             frame,
             layout: None,
@@ -541,7 +548,7 @@ impl LabelElement {
     pub fn minimum_version(&self) -> u32 {
         match self {
             Self::Object(object) => {
-                let mut required = 3;
+                let mut required = if object.sequence.is_some() { 11 } else { 3 };
                 if object.border.is_some() {
                     required = required.max(10);
                 }
@@ -1043,6 +1050,7 @@ mod tests {
                     frame.clone(),
                 )),
                 LabelElement::Object(LabelObject {
+                    sequence: None,
                     border: None,
                     frame: frame.clone(),
                     content_box: None,
@@ -1053,6 +1061,7 @@ mod tests {
                     content: ObjectContent::CutMark,
                 }),
                 LabelElement::Object(LabelObject {
+                    sequence: None,
                     border: None,
                     frame: frame.clone(),
                     content_box: None,

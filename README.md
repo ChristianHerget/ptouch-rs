@@ -241,7 +241,13 @@ Drag sequence rows in the element list to change their physical order. Free
 objects retain their coordinates when list order changes; their context menu
 provides **Swap positions with previous**. **Swap content with previous** exchanges
 content and its transforms between fixed allocations, retaining template positions.
-Reordering cannot silently cross a sequence anchor or detach a relative object.
+Moving a sequence row into another sequence adopts its spacing and preserves
+both sequence origins. The insertion preview identifies the move. Independent
+rows can appear between sequence members without changing their positions or
+links. Switching to **Free positioning** unlinks only that object and leaves
+its neighbours in place. These edits use layout format v11, which stores a
+`sequence` identifier on linked objects; older layouts retain their original
+format until a sequence edit needs the new links.
 Black pixels combine at overlaps; white pixels do not erase other objects.
 List order determines which overlapping object is selected first.
 

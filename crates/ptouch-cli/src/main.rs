@@ -1346,6 +1346,7 @@ mod tests {
                 LabelElement::Object(text),
                 LabelElement::Object(image),
                 LabelElement::Object(LabelObject {
+                    sequence: None,
                     border: None,
                     content_box: None,
                     layout: None,
@@ -1362,6 +1363,7 @@ mod tests {
                     content: ObjectContent::Padding,
                 }),
                 LabelElement::Object(LabelObject {
+                    sequence: None,
                     border: None,
                     content_box: None,
                     layout: None,

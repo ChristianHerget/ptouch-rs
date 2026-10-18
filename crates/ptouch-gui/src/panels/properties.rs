@@ -145,8 +145,14 @@ fn show_selected_properties(ui: &mut egui::Ui, state: &mut AppState) {
         {
             state.document_version = state.document_version.max(4);
         }
-        state.elements[selected] = element;
-        state.mark_dirty();
+        if let LabelElement::Object(object) = element {
+            if let Err(message) = state.apply_object_edit(selected, object) {
+                state.status_message = message;
+            }
+        } else {
+            state.elements[selected] = element;
+            state.mark_dirty();
+        }
     }
 }
 
@@ -429,10 +435,18 @@ fn show_text_box(
     show_alignment: bool,
 ) -> bool {
     let mut changed = false;
-    let previous_right = (0..state.selected_element.unwrap_or(0))
-        .rev()
-        .find_map(|index| state.element_rect_mm(index))
-        .map_or(0.0, |(x, _, width, _)| x + width);
+    let selected = state.selected_element.unwrap_or(0);
+    let linked_previous = state
+        .elements
+        .get(selected)
+        .and_then(|e| e.as_object())
+        .filter(|o| o.sequence.is_some() && o.frame.position == PositionMode::Relative)
+        .and_then(|_| state.flow_chain(selected))
+        .and_then(|chain| chain.into_iter().take_while(|i| *i < selected).last());
+    let previous_right = linked_previous
+        .and_then(|i| state.element_rect_mm(i))
+        .or_else(|| (0..selected).rev().find_map(|i| state.element_rect_mm(i)))
+        .map_or(0.0, |(x, _, w, _)| x + w);
     ui.horizontal(|ui| {
         for (mode, label) in [
             (PositionMode::Absolute, "Absolute"),
@@ -603,6 +617,9 @@ fn show_layout_properties(
             && (free || legacy)
         {
             let index = state.selected_element.unwrap();
+            let current_x = state
+                .element_rect_mm(index)
+                .map_or(object.frame.x_mm, |r| r.0);
             let height = state.printable_height_mm();
             object.content_box.get_or_insert_with(|| resolved.clone());
             object.layout.get_or_insert(LayoutOptions {
@@ -619,12 +636,9 @@ fn show_layout_properties(
                     .element_rect_mm(index - 1)
                     .map_or(0.0, |(x, _, w, _)| x + w);
                 object.frame.position = PositionMode::Relative;
-                object.frame.gap_mm = (object.frame.x_mm - previous_right).max(0.0);
+                object.frame.gap_mm = (current_x - previous_right).max(0.0);
                 // Promoting a free predecessor to a flow anchor freezes its
                 // allocation. Its content and visible location are unchanged.
-                if let Some(previous) = state.elements[index - 1].as_object_mut() {
-                    AppState::use_flow_allocation(previous, height);
-                }
             }
             changed = true;
         }
