@@ -460,13 +460,20 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 (Some(_), _) => "Reorder sequence",
                 _ => "List order · keep position",
             };
-            ui.painter().text(
-                egui::pos2(response.rect.right(), y),
-                egui::Align2::RIGHT_BOTTOM,
-                hint,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgb(235, 160, 60),
+            let color = egui::Color32::from_rgb(235, 160, 60);
+            let text =
+                ui.painter()
+                    .layout_no_wrap(hint.into(), egui::FontId::proportional(11.0), color);
+            let position = egui::pos2(
+                response.rect.right() - text.size().x - 2.0,
+                y - text.size().y - 2.0,
             );
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(position, text.size() + egui::vec2(2.0, 2.0)),
+                2.0,
+                ui.visuals().panel_fill,
+            );
+            ui.painter().galley(position, text, color);
             ui.painter().line_segment(
                 [
                     egui::pos2(response.rect.left(), y),
